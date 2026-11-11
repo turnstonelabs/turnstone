@@ -82,6 +82,11 @@ class TestAsking:
     def test_an_answer_that_is_not_json(self):
         with _server(VersionFault(200, "seven")) as server:
             assert ask(server.version_url) == (None, "the answer is not JSON")
+        # What the standard reader takes beside JSON is none either: it could
+        # not be written into a record.
+        for almost in ("NaN", '{"revision": Infinity}', "1e999"):
+            with _server(VersionFault(200, almost)) as server:
+                assert ask(server.version_url) == (None, "the answer is not JSON")
 
     def test_an_answer_too_large_to_be_a_version_is_not_read_to_its_end(self):
         with _server("x" * 200_000) as server:
@@ -347,6 +352,21 @@ class TestTheCommand:
         assert status == 0 and written["server_version"]["first"] == "w-3"
         assert written["server_version"]["same"] is True
         assert "server version:" in capsys.readouterr().out
+
+    def test_an_address_with_a_port_that_is_none_is_refused_before_anything_runs(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        out = tmp_path / "episode.json"
+        monkeypatch.setenv("ROLLOUT_TEST_KEY", "k1")
+        with ScriptedChatServer(SCRIPT) as server:
+            flags = ["--base-url", server.base_url, "--model", "scripted", "--prompt", "go"]
+            flags += ["--top-k", "20", "--top-p", "0.95", "--context-window", "200000"]
+            flags += ["--sampler-logprobs", "yes", "--out", str(out)]
+            flags += ["--api-key-env", "ROLLOUT_TEST_KEY"]
+            assert cli.main([*flags, "--server-version-url", "http://127.0.0.1:99999/x"]) == 3
+            assert server.requests == [] and server.version_requests == []
+        assert "'http://127.0.0.1:99999/x' is no such address" in capsys.readouterr().err
+        assert not out.exists()
 
     def test_a_changed_version_is_the_status_of_a_run_that_cannot_be_trained_on(
         self, monkeypatch, tmp_path, capsys

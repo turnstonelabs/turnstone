@@ -101,7 +101,10 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   never taken as an empty one. A
   sub-agent is a tool like any other for the sample: it acts in
   the same container, and its own conversation is kept apart and not trained
-  on. See [the rollout guide](docs/rollout.md).
+  on. The command's exit status is read off the record: text in its printed
+  summary that the output cannot encode is escaped, and an output or error
+  stream that takes no writes changes nothing, whoever wrote to it. See
+  [the rollout guide](docs/rollout.md).
 - **Rollouts: a check after the model has finished.** `run_episode(verifier=...)`
   stops the episode's container once the run is over and calls the given
   function with the stopped container, so that nothing the model left running
@@ -194,6 +197,33 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   stays what it was; without an answer before the run it does not start
   (`server_version_unknown`). See
   [the rollout guide](docs/rollout.md#one-version-of-the-server).
+- **`turnstone-rollout` takes a task file and a verifier command.** For a
+  caller that starts the command as a process, one per rollout. `--task FILE`
+  gives the whole task as one JSON object (prompt, files as text or base64,
+  limits and budgets, every container setting, before-run and after-run
+  commands, a sidecar); it is read strictly, so an unknown key, a key given
+  twice or a value of the wrong kind is refused by name, and a task flag beside
+  it is refused. `NaN` and the infinities are refused wherever the command
+  reads a number, and the record it writes is strict JSON. `--verifier-command` names a program of the operator's that is
+  started on this machine without a shell once the episode's container is
+  stopped, with `{container}`, `{sidecar}` and `{key}` in its arguments
+  replaced (never in the program's own name, and a key is one argument
+  whatever it holds); what it prints must be one JSON object with a `verdict`,
+  and no
+  verdict, a status other than 0 or the time limit (`--verifier-timeout`) means
+  no reward exists and the record is not trainable. `--probe-only` probes the
+  server and prints the verdict, which `--sampler-logprobs` then passes to each
+  rollout of a batch; written to `--out`, a new verdict takes the earlier
+  one's place in one step. The output limits, the read limit, the server stall time
+  and the API key's environment variable have flags. The exit status gains 3
+  for a command line, task file or configuration that was refused with nothing
+  run (a usage error included, which was 2), and `--out` is written under
+  another name and renamed, so the record is there whole or not at all. Where
+  it points is looked at before anything runs: a folder that is not there or
+  takes no file is refused, so is a place that holds a file the command reads
+  or anything but a file, and a file already there is removed, so that
+  afterwards the file is this run's record or is not there. See
+  [the rollout guide](docs/rollout.md#a-task-file).
 
 ### Fixed
 

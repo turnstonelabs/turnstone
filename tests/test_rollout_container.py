@@ -1905,6 +1905,24 @@ class TestAContainerThatCouldNotBe:
         ContainerSpec().validate()
         ContainerSpec(image=IMAGE, **ROOT_TASK).validate()
 
+    def test_a_task_with_such_a_container_or_sidecar_is_refused_as_a_whole(self):
+        """Whichever way a task is given, it goes through the same check before
+        anything runs; a task file is one of the ways."""
+        from turnstone.rollout.settings import SetupError
+        from turnstone.rollout.taskfile import task_from_data
+
+        with pytest.raises(SetupError, match="container: memory must be a size above zero"):
+            task_from_data({"prompt": "p", "container": {"memory": "junk"}})
+        with pytest.raises(SetupError, match="container: an environment variable needs a name"):
+            task_from_data({"prompt": "p", "container": {"environment": {"": "x"}}})
+        with pytest.raises(SetupError, match="container: user must be a name or a number"):
+            task_from_data({"prompt": "p", "container": {"user": "no such"}})
+        side = {"container": {"image": IMAGE, "user": "0:0", "pids_limit": 0}}
+        with pytest.raises(
+            SetupError, match="sidecar.container: pids_limit must be a whole number"
+        ):
+            task_from_data({"prompt": "p", "sidecar": side})
+
     @needs_container
     def test_a_user_name_the_image_does_not_hold_is_for_the_runtime_to_say(self):
         """A name is a name until the image is asked: the container is made,

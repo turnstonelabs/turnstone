@@ -39,7 +39,7 @@ from urllib.parse import urlsplit
 import httpx2
 
 from turnstone.core.log import get_logger
-from turnstone.rollout.settings import SetupError
+from turnstone.rollout.settings import SetupError, strict_json
 
 log = get_logger(__name__)
 
@@ -123,7 +123,7 @@ def _read(
         # that has no such address will not.
         raise _NoAnswerError(f"the server answered with status {status}", again=status >= 500)
     try:
-        answer = json.loads(bytes(body))
+        answer = strict_json(bytes(body))
     except (ValueError, RecursionError) as error:
         raise _NoAnswerError("the answer is not JSON", again=False) from error
     if field is not None:

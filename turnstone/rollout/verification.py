@@ -18,6 +18,11 @@ are here, from the simplest to the general:
   into memory; :meth:`VerificationContext.clean_container` starts a container
   the model never touched, with the same isolation, into which files are put
   and in which commands run.
+- a *verifier command*, for a caller that cannot hand over a function: a
+  program of the operator's, started on this machine without a shell once the
+  episode container is stopped (:func:`run_verifier_command`).  It is told the
+  container's name through a placeholder in its arguments, reads from it with
+  the runtime's own commands, and prints its verdict as one JSON object.
 
 The model never sees any of it.  Every container started through the context
 is removed by the harness, with the removal confirmed, when the function has
@@ -28,6 +33,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import posixpath
 import tarfile
 import threading
@@ -44,11 +50,14 @@ from turnstone.rollout.container import (
     ContainerSpec,
     run_captured,
 )
+from turnstone.rollout.settings import SetupError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 log = get_logger(__name__)
+
+_NL = chr(10)
 
 
 @dataclass
@@ -1043,6 +1052,144 @@ class VerificationContext:
         """Remove every container started through this context; ``True`` when
         every removal is confirmed.  Never raises."""
         return all([container.close() for container in self._started])
+
+
+# What a verifier command's arguments may hold in place of a name it cannot
+# know beforehand: the episode's stopped container, the task's stopped sidecar,
+# the task's key.
+PLACEHOLDERS = ("{container}", "{sidecar}", "{key}")
+# The most a verifier command may print as its verdict, and the most that is
+# kept of what it wrote where there is no verdict to keep.
+_MAX_VERDICT_BYTES = 4 * 1024 * 1024
+_KEPT_OUTPUT_BYTES = 8000
+
+
+def check_verifier_command(argv: list[str], *, has_sidecar: bool) -> None:
+    """Raise :class:`~turnstone.rollout.settings.SetupError` for a verifier
+    command that cannot be run as it is given.
+
+    The program's own name takes no placeholder.  A task's key is the task's
+    text and fills arguments; in the first place of the command it would
+    choose what is started on this machine.
+    """
+    if not argv or not argv[0]:
+        raise SetupError("the verifier command names no program")
+    if any(placeholder in argv[0] for placeholder in PLACEHOLDERS):
+        raise SetupError(
+            f"the verifier command holds a placeholder in the program's own name ({argv[0]}); "
+            "a task's key or a container's name would then choose what is started on this "
+            "machine. Placeholders go into the arguments"
+        )
+    if not has_sidecar and any("{sidecar}" in argument for argument in argv):
+        raise SetupError(
+            "the verifier command asks for the sidecar's name ({sidecar}) and the task has "
+            "no sidecar"
+        )
+
+
+def fill_verifier_command(
+    argv: list[str], *, container: str | None, sidecar: str | None, key: str
+) -> list[str]:
+    """*argv* with each placeholder in its arguments replaced by what it
+    stands for.
+
+    Replaced inside each argument, after the command was split into
+    arguments, so a name or a key never becomes more than one argument.  The
+    program's own name, the first of *argv*, is taken as it is: nothing is
+    filled in there, whatever it holds (:func:`check_verifier_command` refuses
+    a command that asks for it).
+    """
+    names = {"{container}": container or "", "{sidecar}": sidecar or "", "{key}": key}
+    filled = list(argv[:1])
+    for argument in argv[1:]:
+        for placeholder, name in names.items():
+            argument = argument.replace(placeholder, name)
+        filled.append(argument)
+    return filled
+
+
+def _kept(done: Completed, stream: str) -> str:
+    """The beginning and the end of what a program wrote to one stream, with
+    the bytes left out between them counted."""
+    if stream == "stdout":
+        head, tail, total = done.stdout, done.stdout_tail, done.stdout_total
+    else:
+        head, tail, total = done.stderr, done.stderr_tail, done.stderr_total
+    if not tail and total <= len(head) <= _KEPT_OUTPUT_BYTES:
+        return head.decode("utf-8", errors="replace")
+    half = _KEPT_OUTPUT_BYTES // 2
+    end = tail[-half:] if tail else head[-half:]
+    left_out = max(max(total, len(head)) - half - len(end), 0)
+    return (
+        head[:half].decode("utf-8", errors="replace")
+        + f"{_NL}[... {left_out} bytes left out ...]{_NL}"
+        + end.decode("utf-8", errors="replace")
+    )
+
+
+def run_verifier_command(
+    argv: list[str], timeout: float
+) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
+    """Run a verifier command; ``(result, None, program)`` or ``(None, why, program)``.
+
+    *argv* is started as it is, without a shell, in a session of its own.  Its
+    standard output must be one JSON object with a ``verdict`` that is not
+    null: that object is the result.  Anything else is a failure of the
+    machinery, because no verdict exists then: the program could not be
+    started, did not end within *timeout* (it is killed with everything in its
+    process group), ended with another status than 0, or printed something
+    else.  ``program`` says what happened, with the beginning and the end of
+    what it wrote to standard error and, where its output was no verdict, to
+    standard output.  Never raises.
+    """
+    started = time.monotonic()
+    program: dict[str, Any] = {
+        "argv": list(argv),
+        "exit_code": None,
+        "timed_out": False,
+    }
+    try:
+        done = run_captured(
+            argv,
+            timeout=timeout,
+            limit=_MAX_VERDICT_BYTES,
+            tail=_KEPT_OUTPUT_BYTES // 2,
+        )
+    except (OSError, ValueError) as error:
+        program["seconds"] = round(time.monotonic() - started, 2)
+        why = f"the verifier command could not be started ({type(error).__name__}: {error})"
+        return None, why, program
+    program.update(
+        exit_code=done.returncode,
+        timed_out=done.timed_out,
+        seconds=round(time.monotonic() - started, 2),
+        stdout_bytes=done.stdout_total,
+        stderr_bytes=done.stderr_total,
+        stderr=_kept(done, "stderr"),
+    )
+    result: dict[str, Any] | None = None
+    failure: str | None = None
+    if done.timed_out:
+        failure = f"the verifier command did not end within {timeout:g} s"
+    elif done.returncode != 0:
+        failure = f"the verifier command ended with exit code {done.returncode}"
+    elif done.dropped:
+        failure = f"the verifier command printed more than {_MAX_VERDICT_BYTES} bytes"
+    else:
+        try:
+            printed = json.loads(done.stdout)
+        except (ValueError, RecursionError):
+            printed = None
+        if not isinstance(printed, dict):
+            failure = "the verifier command did not print one JSON object"
+        elif printed.get("verdict") is None:
+            failure = "the JSON object the verifier command printed holds no verdict"
+        else:
+            result = printed
+    if failure is not None:
+        # No verdict to keep: what it printed instead, for whoever looks into it.
+        program["stdout"] = _kept(done, "stdout")
+    return result, failure, program
 
 
 def run_verifier(

@@ -31,13 +31,42 @@ turnstone-rollout --base-url http://127.0.0.1:8000/v1 --model NAME \
     --top-k 20 --top-p 0.95 --out episode.json
 ```
 
-Exit status: 0 for a trainable rollout, however the model ended it; 1 when the
-server, the harness or the runtime ended it; 2 when it ran to its own end but
-its token data cannot be trained on.
+The task is given by flags (`--prompt`, `--key`, `--file` and the container
+flags) or as a whole by a [task file](#a-task-file) (`--task`), never by both.
+The server's API key, where it wants one, is read from the environment variable
+that `--api-key-env` names.
 
-A configuration that cannot work is refused before anything runs, with a
-message and exit status 1: a context window that nothing names (name it with
-`--context-window`), or budgets that do not fit together.
+The flags that say what the task is:
+
+| Flag | What it says |
+|------|--------------|
+| `--prompt TEXT` | What the user asks (`Task.prompt`) |
+| `--key NAME` | The task's key in the record (`Task.key`); `cli` where it is left out |
+| `--system-prompt TEXT` | The system prompt (`Task.system_prompt`); left out, a short one for an agent in a sandbox |
+| `--file PATH=CONTENT` | A text file put into the container before the first turn (`Task.setup_files`); repeatable |
+| `--image NAME`, `--workdir PATH` | The container's image and its working directory ([the container](#the-container) has the defaults) |
+| `--user UID:GID` | The user the model's commands run as; `0:0` is the image's root |
+| `--writable-root` | Makes the image's whole file system writable (`read_only_root` false). What then bounds what is written is the root size, which a task file can name and a flag cannot; see [what bounds writes](#what-bounds-writes) |
+| `--cap NAME` | A capability the commands hold, of those the container allows; repeatable |
+| `--env NAME=VALUE` | An environment variable in the container; repeatable |
+| `--memory SIZE`, `--cpus NUMBER` | The container's memory limit and its share of processors |
+| `--max-turns`, `--timeout`, `--max-generated-tokens`, `--max-command-seconds` | The task's turns, its time limit and the [budgets](#budgets-of-the-models-own) of the model's own |
+
+Two more are the run's, not the task's, and stand beside a task file as well:
+`--max-subagents` is the most sub-agents one rollout may start (16), and
+`--keep-text` keeps each call's generated text in the record (`text`).
+
+Exit status: 0 for a trainable rollout, however the model ended it; 1 when the
+server, the harness or the runtime ended it, or the run did not start; 2 when it
+ran to its own end but cannot be trained on; 3 when nothing was run. The table
+under [started by another program](#started-by-another-program) says what a
+caller can rely on.
+
+A command line, a task file or a configuration that cannot work is refused
+before anything runs, with a message on standard error and exit status 3: a
+flag that is not known, a task file with a key that is not known, a rule file
+that cannot be read, a context window that nothing names (name it with
+`--context-window`), budgets that do not fit together.
 
 From Python:
 
@@ -78,6 +107,129 @@ the same request again, twice at most, and the turn is sampled again. Nothing
 of the broken attempt is in the token record or in `messages`; it is in
 `discarded_calls`, and that is the only place that shows it.
 
+### A task file
+
+`--task FILE` gives the whole task as one JSON object, for a caller that starts
+the command as a process and cannot build a `Task`:
+
+```json
+{
+  "prompt": "The test in tests/test_parse.py fails. Fix the code.",
+  "key": "task-0042",
+  "files": {"notes.txt": "plain text", "data.bin": {"base64": "AAEC"}},
+  "max_turns": 30,
+  "max_generated_tokens": 60000,
+  "max_command_seconds": 600,
+  "container": {"image": "tasks/task-0042:latest", "workdir": "/testbed", "user": "0:0",
+                "read_only_root": false, "writable": {}, "root_size": "8g"},
+  "before_run": [{"argv": ["pip", "cache", "purge"], "timeout": 120}],
+  "after_run": [{"argv": ["git", "status", "--short"], "timeout": 60}]
+}
+```
+
+Only `prompt` is required. The keys are the fields of `Task`. `container` takes
+those of `ContainerSpec`, the items of `before_run` and `after_run` those of
+`BeforeRunCommand` and `AfterRunCommand`, and `sidecar` those of `Sidecar`
+(`container`, `files`, `setup`, `setup_timeout`, `wait_ports`, `wait_timeout`,
+`mcp_servers`). The one difference is `files`, a single key for text and other
+content: a file's content is a string (text), `{"text": "..."}` or
+`{"base64": "..."}`. A relative path is in the working directory, an absolute
+one where it says; a sidecar's paths are absolute. `timeout` left out is 300
+seconds, or with `max_generated_tokens` worked out from the budgets, as on the
+command line; `null` asks for that.
+
+The file is read strictly, because a task that is not the one its author meant
+gives rollouts that look sound and are not. A key the classes do not have is
+refused with its name and the keys there are, a key given twice is refused, and
+so is a value of the wrong kind (`"5"` or `true` where a number belongs): a
+misspelt key must not become a default without a word. What is no number at
+all is refused as well, here and wherever the command reads a number (a flag,
+`--extra-body`, a verdict that is handed in, the request parameters of the
+configuration file): `NaN`, `Infinity` and a number too large to be one are
+not JSON, and a limit that is one of them is no limit. A flag that says
+something the task file holds (`--prompt`, `--key`, `--image`, `--timeout`,
+`--max-turns` and the other task flags) is refused beside `--task`, whatever
+its value: with two sources for one value it would be open which one counts.
+A task the flags describe gets the same check as one a file describes: a
+prompt that is empty, `--max-turns 0`, a file without a path or a container
+setting that can be seen to be wrong without asking the runtime
+([which ones](#the-container)) are refused before anything runs, whichever way
+they are said. So are the numbers only a file can say: a before-run or
+after-run command whose `timeout` is not above zero or whose
+`max_output_chars` is below zero, an after-run command whose
+`max_collect_bytes` is not above zero (at zero every file read out would count
+as more than is read), a sidecar whose `setup_timeout` is not above zero,
+whose `wait_timeout` is below zero or that waits for a port outside 1 to
+65535.
+
+A task file describes what happens inside containers. It cannot name a program
+to run on this machine; a [verifier command](#a-verifier-command) is given on
+the command line. What is not the task's but the run's (the model's endpoint,
+the sampling settings, the limits of the framework, the rules, the server's
+version) stays a flag beside `--task`.
+
+### Started by another program
+
+One rollout per process, so a caller that collects many starts the command many
+times. What it can rely on:
+
+| | |
+|---|---|
+| Exit status 0 | A trainable rollout, however the model ended it |
+| Exit status 1 | The server, the harness or the runtime ended it, or the run did not start (`finish_cause` is `machinery`); also a run whose record could not be written to `--out` when it was over (standard error says why, and no file is there) |
+| Exit status 2 | It ran to its own end and cannot be trained on: its token data, a server version that changed, a check that gave no verdict |
+| Exit status 3 | Nothing was run: the command line, the task file or the configuration was refused, and standard error says why |
+| `--out FILE` | Looked at before anything runs. Refused (status 3), with what is there left as it is: a folder that is not there or takes no file; a place that is a file the same command reads or starts (the task file, a verdict, a rule file, the configuration file whether `--config`, `TURNSTONE_CONFIG` or the default place names it, the verifier command's program and every file among its arguments), also where a symbolic link leads there; a place that holds anything but a file (a folder, a named pipe, a socket, a device). A file that is already there is removed, and so is a symbolic link: the link, not what it points to (with `--probe-only` it stays until the new verdict takes its place; see below). Then written for 0, 1 and 2, also for a run that did not start; never for 3. It is written under another name (`FILE.<process id>.part`) and renamed, so the file is there whole or not at all |
+| Anything else | A process that died leaves another status, or one of 0 to 2 without the file: there is no record |
+
+So after the command, whatever it did, the file at `--out` is this run's record
+or is not there: a record an earlier run left at the same place does not
+outlive a run that was refused or died. Two cases leave the place as it is. A
+command line that could not be read at all (a flag that is not known, a value
+that is no number) does not know its `--out`. And a place that is refused for
+what stands there (a file the command reads or starts, something that is no
+file) is not the command's to remove.
+
+A verdict takes its place in one step. The rollouts of a batch read the
+verdict's file while the batch runs, so `--probe-only --out FILE` leaves the
+verdict an earlier probe wrote where it is while it asks the server, and then
+puts the new one there by a rename: a reader finds the earlier verdict or the
+new one, never nothing. The rule above holds once the command has ended:
+where it has no verdict to put there (it was refused, it failed, the verdict
+could not be written) it removes the earlier file then. Only a probe that is
+killed leaves the earlier verdict behind.
+
+The file is strict JSON. A value that is no finite number can still reach a
+record from outside (a server can report one as a log-probability, a verifier
+can print one): it is written as `null`, and `warnings` says where it stood.
+
+The exit status is read off the record, before anything is printed. What the
+command prints to standard output is a summary for a reader and decides
+nothing: text the output's encoding cannot write is escaped (the model chooses
+the characters of its reply), and an output that is closed, such as a pipe
+whose reader has gone, is left alone.
+
+The same holds for standard error, and for whoever writes to either stream.
+The framework's logger writes to standard error, a line when the time limit
+passes while the model is writing for one. Text a stream did not take (its
+reader has gone, its disk is full, its descriptor is closed or was not opened
+for writing) is given up before the command returns, and the stream is then
+pointed at nothing, so that the interpreter's flush at exit cannot put a
+status of its own (120) in the record's place. One case is the framework's,
+not the command's: started with standard output closed altogether (`>&-`) and
+without `NO_COLOR` in its environment, a Turnstone command dies while it is
+being loaded, with status 1 and nothing run. Give it `/dev/null`.
+
+Everything a run sets is a flag or is in the task file. The model's definition
+(context window, reply limit, reasoning effort) comes from the configuration
+file (`--config`), which is read and never written.
+
+To probe the server once for a whole batch, `--probe-only` runs no rollout. It
+prints the [verdict](#which-log-probabilities) as one JSON object (exit status
+0 when the reported values are the sampling distribution's, 2 otherwise), and
+`--sampler-logprobs '<that object>'` or `--sampler-logprobs @FILE` hands it to
+each rollout, which then does not probe.
+
 ### Limits come from the framework
 
 A rollout has no limits of its own where the framework has a setting. Each of
@@ -91,18 +243,27 @@ setting's registered default:
 | Context window | `context_window`, `--context-window` | the model's `context_window`, else `[model] context_window`, else what the model's endpoint reports for that model | the rollout is refused |
 | Time one tool call may take | `tool_timeout`, `--tool-timeout` | `[tools] timeout` | 120 s |
 | Turns one sub-agent may take | `subagent_max_turns`, `--subagent-max-turns` | `[tools] agent_max_turns` | -1, no limit |
-| Characters of a command's output the model gets | `max_output_chars` | `[tools] truncation` | 0, the framework's automatic share of the remaining context |
+| Characters of a command's output the model gets | `max_output_chars`, `--max-output-chars` | `[tools] truncation` | 0, the framework's automatic share of the remaining context |
 
 The configuration file is the one every Turnstone command reads (`--config`,
 `TURNSTONE_CONFIG`). A server's database is not read: a rollout runs in its own
 process with throwaway storage. The record lists the value each limit had and
 where it came from (`limits`).
 
+A configuration file that cannot be used is refused before anything runs
+(exit status 3; `SetupError` from Python), never read as an empty one: a file
+that `--config` or `TURNSTONE_CONFIG` names and that is not there, and any
+configuration file that cannot be read or is no TOML. Read as empty it would
+cost the run its model definition without a word: the reasoning effort, the
+reply limit, the request parameters. Where neither names a file, the default
+one (`~/.config/turnstone/config.toml`) is read if it exists; only that one may
+be absent.
+
 Three rules keep a property of the configuration from being scored as the
 model's outcome:
 
 - **A number below the least it can be is refused** before anything runs
-  (`SetupError`; the command exits with a message that says which), whichever
+  (`SetupError`; the command exits with status 3 and says which), whichever
   way the task is given. A run started on one would say something about the
   number: with a context window of 0 every reply would be cut at one token,
   and the run would end as the model's `length`. The least a number given to
@@ -115,6 +276,7 @@ model's outcome:
   | `max_output_chars` | 0, which is the framework's automatic share |
   | `max_subagents` | 0, which lets a run start none |
   | `temperature` | 0 |
+  | `server_stall_seconds`, `min_tokens_per_second`, `min_prompt_tokens_per_second`; the task's `timeout`, `max_generated_tokens` and `max_command_seconds`; the verifier's time limit (`verifier_timeout`, `--verifier-timeout`) | anything above 0 |
 
   A value below its least in the configuration file is passed over, as the
   framework passes it over, and the next source in the order above decides.
@@ -346,8 +508,9 @@ The time limit can be used up by both sides: by the model, with slow commands
 and long replies, and by the server, by not answering. Without a token budget
 it is the model's budget like its turns, so reaching it is the model's outcome,
 with one exception that can be measured: a model request that had had nothing
-from the server for `server_stall_seconds` (60 by default) when the limit
-passed. A request the server has not yet answered with a first token is
+from the server for `server_stall_seconds` (`--server-stall-seconds`, 60 by
+default) when the limit passed. A request the server has not yet answered with
+a first token is
 allowed more: the time its prompt takes at the minimum prompt speed (1000
 tokens a second where none is configured), since the length of a prompt is the
 model's doing and a model could otherwise fill its context until the limit fell
@@ -495,7 +658,9 @@ the other positions said under `positions`). A setting the reported values are
 taken *before* is accepted only when it leaves the distribution as it is
 (temperature 1, top-p 1, top-k off). To probe once for a batch, call
 `turnstone.rollout.probe.sampler_logprobs_reported` and pass the verdict (or
-its `reflects`) as `RolloutConfig.sampler_logprobs`.
+its `reflects`) as `RolloutConfig.sampler_logprobs`; from the command line,
+`--probe-only` prints the verdict and `--sampler-logprobs` takes it (see
+[started by another program](#started-by-another-program)).
 
 What the probe cannot show: the temperature is measured at the position that
 decides (and at the first position besides, where a later one decides), so a
@@ -619,9 +784,9 @@ task (`Task.container`, a `ContainerSpec`); the defaults are the contained case:
 | `cpus`, `memory`, `pids_limit`, `shm_size` | 1, 2g, 256, 64m | other limits |
 
 A setting that can be seen to be wrong without asking the runtime is refused
-before anything is started, the task with it (`ValueError` from
-`ContainerSpec.validate`), for the episode's container and for a sidecar's
-alike:
+before anything is started, the task with it (status 3 from the command,
+`ValueError` from `ContainerSpec.validate`), for the episode's container and
+for a sidecar's alike:
 
 - an `image` that is empty, begins with `-` or holds a space;
 - a `workdir` that is not an absolute path;
@@ -666,10 +831,19 @@ It is stopped only once the container is known to be gone; after a removal that
 could not be confirmed it tries again within half a minute and keeps trying for
 five.
 
+That keeper is the one process meant to outlive a killed runner, and no other
+process of a run stays on the host for good. The process that listens to the
+runtime's events about the container ends with the runner, however the runner
+ends; on a machine whose kernel cannot arrange that, it ends when the container
+is removed. The runtime's client of a command that was still running ends with
+that command or with the container, and so does a sidecar's connection. A
+[verifier command](#a-verifier-command) that was running is not stopped: its
+time limit was the runner's, and it goes on to its own end.
+
 On the host the harness signals only process groups of children it started
-itself: the runtime's client of a command, and the keeper when another takes
-its place or it is no longer needed. Each such signal goes through the one
-function the framework's own
+itself: the runtime's client of a command, a verifier command with what it
+left in its group, the keeper when another takes its place or it is no longer
+needed. Each such signal goes through the one function the framework's own
 shell tools use (`signal_group` in `turnstone/core/background_shells.py`). It
 sends nothing unless the id is an integer above 1, is not the runner's own
 group, and is the id of a child that has not been collected yet: until then no
@@ -958,8 +1132,8 @@ task's [sidecar](#a-tasks-own-servers-the-sidecar).
 Two limits apply to what a tool returns. A command's output is cut when it is
 produced, head and tail kept, to the framework's truncation setting
 (`max_output_chars`). A file tool reads a
-file of up to `max_read_bytes` whole; a larger one is an error that says so,
-never a shortened text.
+file of up to `max_read_bytes` (`--max-read-bytes`, 256 KiB by default) whole;
+a larger one is an error that says so, never a shortened text.
 
 Not yet handled: the exit of a background shell is not announced to the model in
 a headless run, although the tool description says a notice follows. The model
@@ -1252,7 +1426,9 @@ A reward needs a check the model could not have prepared for. A model with root
 in a writable container can change everything a check inside that container
 relies on: the test script, the test runner, the shell, the interpreter.
 
-**The general form is a verifier**, a function the caller gives `run_episode`:
+**The general form is a verifier**, a function the caller gives `run_episode`
+(a caller that starts the command as a process names a program instead, a
+[verifier command](#a-verifier-command)):
 
 ```python
 from turnstone.rollout.verification import VerificationContext
@@ -1393,7 +1569,7 @@ Whose doing a result is:
 | Reading them out was cut short in any other container (its time ran out, or the archive program was ended, as when the container's memory is used up) and the container still answers at once: what the model decides there is how much stands at the paths | model | trainable; the command's `collected_summary.failed` says why |
 | A process left running could not be ended before an after-run command, in a container whose programs the model could change (root over a writable root) or whose commands can change their user (root with `SETUID`) | model | trainable; the command's `leftovers.still_running` lists it |
 | The model ended its container, during the run or with something it left behind for the check | model | trainable (`sandbox_destroyed`); `commands_not_run` says why the after-run commands did not run |
-| The verifier raised, ran past `verifier_timeout` or returned no `verdict` | machinery | not trainable: no reward exists |
+| The verifier raised, ran past `verifier_timeout` or returned no `verdict`; a verifier command printed no verdict, ended with another status than 0 or ran past its time | machinery | not trainable: no reward exists |
 | The container could not be stopped before the check, a clean container did not start, reading files out failed where the model could not have caused it (no archive program in the image, one that fails or writes no archive, a container that no longer answers), what was left running could not be listed, it could not be ended in any other container than the two above, or the container was held still for that and the runtime did not let it run again | machinery | not trainable |
 
 Three things for the author of a verifier:
@@ -1418,6 +1594,79 @@ Three things for the author of a verifier:
   unnoticed.
 - The times a clean container and the stopped containers are kept for follow
   the verifier's time limit, not the run's.
+
+### A verifier command
+
+A caller that starts the command as a process has no function to give. It names
+a program instead (`run_episode(verifier_command=[...])` from Python):
+
+```
+turnstone-rollout ... --task task.json \
+    --verifier-command 'python3 grade.py tasks.jsonl -- {key} {container}' \
+    --verifier-timeout 1800 --out episode.json
+```
+
+Once the run is over and the episode's container is stopped, the program is
+started on this machine, without a shell: the text is split into arguments by
+shell quoting rules, and nothing else of a shell applies. In each argument
+`{container}` becomes the stopped container's name, `{sidecar}` the stopped
+sidecar's and `{key}` the task's key. The program reads from the stopped
+containers with the runtime's own commands, tests what it read wherever it
+likes, and prints its result.
+
+A value is put in after the text was split, so a key is one argument whatever
+it holds: spaces, quotes, a line break, a dollar sign, the text of another
+placeholder (the key goes in last and is not filled in a second time). It is
+still the task's text. A key that begins with a dash is read as an option by
+a program that takes options, so the command puts `--` before it, as above.
+And the program's own name takes no placeholder: a command whose first
+argument holds one is refused, from the command line and from Python alike
+(`SetupError`), and nothing is filled in there, because a task's key must not
+choose what is started on this machine.
+
+| What the program does | The record |
+|-----------------------|------------|
+| Prints one JSON object whose `verdict` is not null, and ends with status 0 | `verification.result` is that object. The rollout stays trainable whatever the verdict says: a check that ran and failed is the model's outcome |
+| Prints anything else: nothing, text, two objects, an object without a `verdict` or with a null one | No verdict exists. `verification.failure` says so and the record is not trainable |
+| Ends with another status than 0 | The same, whatever it printed |
+| Does not end within `--verifier-timeout` (3600 s by default) | The same; it is killed with everything in its process group |
+| Cannot be started | The same |
+
+The time limit bounds the whole call. When the program has ended, whatever it
+left running in its process group is ended too, and its output is not waited
+for beyond that: the verdict is what the program itself printed. A process the
+program moved into a session of its own is the program's to end.
+
+**What the model did is a verdict of failure, never a missing verdict.** The
+program reads what a model left behind, and whatever the model did to it is
+the model's outcome, as it is for a verifier function
+([above](#checking-a-rollout-afterwards)): a working directory that was moved
+or removed, a file that is not there, cannot be read or is a link, more than
+the program will read, a test that does not end on the model's code. Each of
+them is a verdict (`"verdict": "fail"`, with the reason beside it). A program
+that printed no verdict for them would let a model take a rollout out of
+training by renaming a directory.
+
+No verdict is only for a failure of the program's own: an image it needs is
+missing, the runtime does not answer, its list of tasks has no such task. It
+says so by printing no verdict, by printing `"verdict": null`, or by ending
+with a status other than 0. The rollout is then left out of training, where a
+verdict of failure would score the model for something it did not do.
+
+`verification.program` says what happened: `argv` as it was started,
+`exit_code`, `timed_out`, `seconds`, and the beginning and the end of what the
+program wrote to standard error (`stderr`) and, where its output was no
+verdict, to standard output (`stdout`), with the bytes left out between them
+counted.
+
+Afterwards everything is removed as with a verifier function: the episode's
+container and the sidecar, with the removal confirmed. Containers the program
+starts are its own to remove, also when it is killed at its time limit.
+
+The program runs with the rights of the process that started the rollout. It is
+the operator's: it is given on the command line and never comes from a task
+file. A function and a command are not both given. A run that did not start is
+not checked.
 
 ---
 
@@ -1590,7 +1839,8 @@ Where the run did not start, only the first three keys are there.
 | `commands` | One result per after-run command that ran: `argv`, `exit_code`, `timed_out`, `output`, `output_dropped`, `seconds`, `leftovers` (what was running in the container besides its main process before the command: `found`, how many, all of them ended; `still_running`, those that could not be ended, each with its `uid` (the number of the user it runs as, `null` where the runtime's list gave none) and `command` (its name as the runtime lists it, `""` where it gave none), empty outside a container whose programs are the model's or whose commands can change their user; `frozen`, whether the runtime could hold the container still meanwhile), and where it names files `collected` (path to text: a relative path under the name the task gave it, an absolute one without its first slash) and `collected_summary` (`entries` by kind, `bytes`, `too_large`, and where they apply `skipped`, `failed`) |
 | `commands_not_run` | Only where the after-run commands could not run: why |
 | `container_stopped` | Whether the container was stopped before the verifier was called |
-| `result` | What the verifier returned; it holds `verdict` |
+| `result` | What the verifier returned, or the verifier command printed; it holds `verdict` |
+| `program` | With a [verifier command](#a-verifier-command) only: `argv` as it was started, `exit_code`, `timed_out`, `seconds`, `stdout_bytes`, `stderr_bytes`, `stderr` (the beginning and the end of what it wrote there), and `stdout` where its output was no verdict |
 | `failure` | A failure of the machinery of the check, in words; the record is then not trainable |
 | `helpers_removed` | Whether every container the verifier started was confirmed removed |
 | `seconds` | The time the check took, which is not part of `seconds` above |
@@ -1727,8 +1977,9 @@ What a user of the harness has to know, in one place:
 
 The container tests (`tests/test_rollout_container.py`,
 `tests/test_rollout_verification.py`, `tests/test_rollout_sidecar.py`, one
-class of `tests/test_rollout_rules.py` and two of
-`tests/test_rollout_preparation.py`) need a container runtime and an image,
+class of `tests/test_rollout_rules.py`, two of
+`tests/test_rollout_preparation.py` and one of
+`tests/test_rollout_verifier_command.py`) need a container runtime and an image,
 so they skip where they are missing. CI runs those files in their own lane
 (`test-rollout-container`), which pulls the image by digest and sets
 `TURNSTONE_ROLLOUT_REQUIRE_CONTAINER=1`, so that a missing runtime or image
@@ -1769,8 +2020,8 @@ process object's `kill`, `terminate` and `send_signal` send through.
   (`--cap-add`, `--security-opt`, `--network`, `--pid`, `--ulimit`,
   `--oom-score-adj`, `--storage-opt`, `--pull`) only with the values the
   package gives them, or with a subcommand that only reads; a program the
-  test itself wrote under its temporary directory; or the package's own
-  keeper, in exactly the shape
+  test itself wrote under its temporary directory, which is what a verifier
+  command is in a test; or the package's own keeper, in exactly the shape
   the package starts it, removing a container of the harness's with the
   runtime. A privileged `exec` and a subcommand the guard does not know are
   refused. The program is judged as the file the system would start, not as

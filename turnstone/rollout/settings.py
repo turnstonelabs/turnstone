@@ -38,6 +38,8 @@ the reasoning effort, the reply limit, the request parameters.
 from __future__ import annotations
 
 import copy
+import json
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -87,13 +89,55 @@ class Setting:
     source: str
 
 
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"{name} is no number in JSON")
+
+
+def _finite(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"{text} is too large to be a number")
+    return value
+
+
+def strict_json(text: str | bytes, **hooks: Any) -> Any:
+    """*text* read as JSON and as nothing more.
+
+    The standard reader also takes ``NaN``, ``Infinity`` and ``-Infinity``,
+    and reads a number too large for a float as an infinity.  None of them is
+    JSON, none is a number a rollout can work with, and one that got into a
+    record would make it a file a strict reader refuses.  Here each is a
+    ``ValueError``, like any other text that is no JSON.
+    """
+    return json.loads(text, parse_constant=_no_constant, parse_float=_finite, **hooks)
+
+
+def not_finite(value: Any, where: str = "") -> str | None:
+    """Where *value* holds a number that is not finite (``NaN``, an infinity),
+    ``None`` when it holds none."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return where or "the value itself"
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = not_finite(item, f"{where}.{key}" if where else str(key))
+            if found is not None:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            found = not_finite(item, f"{where}[{index}]")
+            if found is not None:
+                return found
+    return None
+
+
 def _positive(value: Any, *, least: int = 1) -> int | None:
     """*value* as a usable setting: an integer at or above *least*, else ``None``."""
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return None
     try:
         number = int(value)
-    except ValueError:
+    except (ValueError, OverflowError):
+        # A text that is no number; a NaN or an infinity, which TOML can write.
         return None
     return number if number >= least else None
 
@@ -298,6 +342,8 @@ def resolve_sampling(
 
     chosen: Setting | None = None
     if temperature is not None:
+        if not_finite(float(temperature)) is not None:
+            raise SetupError(f"the temperature must be a finite number, not {temperature}")
         if temperature < 0:
             raise SetupError(
                 f"the temperature must be zero or above, not {temperature}: no sampler has one "
@@ -342,5 +388,13 @@ def resolve_sampling(
     else:
         settings["extra_body"] = Setting(
             copy.deepcopy(extra_body), OVERRIDE if extra_body else "nothing sets any"
+        )
+    # A request parameter that is no finite number (a configuration file can
+    # write one) could be sent to no server and written into no record.
+    found = not_finite(settings["extra_body"].value)
+    if found is not None:
+        raise SetupError(
+            f"the request parameters hold a number that is not finite ({found}; "
+            f"{settings['extra_body'].source})"
         )
     return settings
