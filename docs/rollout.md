@@ -306,20 +306,31 @@ penalised for it.
 | `timeout` | The time limit passed while the model was generating or one of its commands was running; with a token budget, although the server kept its minimum speed | model | yes |
 | `token_budget` | The budget of generated tokens was used up | model | yes |
 | `command_time` | The time the model's commands may run was used up | model | yes |
-| `sandbox_destroyed` | The model ended its own container from inside, where the task's settings let its commands do that (see [the main process](#the-main-process)), or a writable root outgrew its size or could no longer be measured (see [what bounds writes](#what-bounds-writes)) | model | yes |
+| `sandbox_destroyed` | After a turn of the model's had come back: the model ended its own container from inside, where the task's settings let its commands do that (see [the main process](#the-main-process)), or a writable root outgrew its size or could no longer be measured (see [what bounds writes](#what-bounds-writes)) | model | yes |
 | `request_refused` | After a request of the session had been answered: the server refused a later one for what the conversation held (HTTP status 400 or 422); see [a conversation the server refuses](#a-conversation-the-server-refuses) | model | yes |
 | `server_stalled` | Without a token budget: the time limit passed while a model request had had nothing from the server for longer than it is allowed | machinery | no |
 | `backstop` | With a token budget: the time limit passed and the server was slower than its minimum speed, or the harness itself took the time | machinery | no |
 | `error` | A request of the session failed (after the client's own retries; the first request refused by the server, and a prompt the server finds too long, included), or the harness raised (a stable-prefix error included) | machinery | no |
 | `sandbox_failed` | The container could not be started | machinery | no |
-| `sandbox_lost` | The container stopped and nothing the model could do explains it, or the runtime stopped answering | machinery | no |
+| `sandbox_lost` | The container stopped and nothing the model could do explains it, or it stopped before the first turn of the model's had come back or was found gone before the first of the model's tool calls could run, or the runtime stopped answering | machinery | no |
 | `sidecar_failed` | The task's [sidecar](#a-tasks-own-servers-the-sidecar) could not be brought up | machinery | no |
 | `sidecar_lost` | The task's sidecar stopped during the run | machinery | no |
 | `subagent_failed` | A sub-agent failed for a reason that is not its work | machinery | no |
 | `no_model_call`, `abnormal_reply` | The run ended before any model call, or on a finish reason the harness does not know, which only the server gives (a filter of its own, for one) | machinery | no |
 
-Where several apply, a lost container decides first, then a lost sidecar, then
-a failed sub-agent, then the others.
+Where several apply, a run that did not start keeps its own ending
+(`sandbox_failed`, `sidecar_failed`); otherwise a lost container decides first,
+then a lost sidecar, then a failed sub-agent, then the others.
+
+One exception keeps a run the machinery cut short from being recorded as the
+model's outcome. A container the model ended (`sandbox_destroyed`) gives way
+to a failure of the machinery that came before it: a sidecar that stopped
+(never the model's doing), a sub-agent's failure (counted only while the
+session has not been told to stop, so one that is counted came before the
+loss was found), and a failed request or a time limit the server ran into
+(`error`, `server_stalled`, `backstop`) where the container was not yet known
+to be gone when the session's run ended. What fails once the container is
+known to be gone does not change the ending: it may follow from the loss.
 
 `context_full` is decided before each request, from the server's own count of
 the previous call's tokens and the size in bytes of what was added since (a
@@ -370,6 +381,15 @@ was too long, the last row of the table, which servers say in a handful of
 known phrases. A server that says it in other words is taken to have refused
 the conversation for what it holds, and the run ends as the model's
 `request_refused` where it should be `error`.
+
+An ending is the model's only once the model has done something. A sandbox that
+goes away while it is being brought up ends the run as `sandbox_failed`, and one
+that goes away before the first model turn has come back as `sandbox_lost`,
+whatever the container's settings say about who could have ended it. So does
+one that is found gone when the first of the model's tool calls is about to
+run: the container is asked whether it is running right before that call,
+because one that went away while the model was writing its first reply was
+not ended by anything the model ran.
 
 ### Which log-probabilities
 
@@ -689,8 +709,9 @@ end the main process after all, without the runtime seeing why:
   commands can hold at that moment.
 
 In such a container an end of the main process that nothing outside explains is
-taken to be the model's doing: the rollout ends as `sandbox_destroyed`, the
-model's own outcome, trainable, for the task to score. So does an
+taken to be the model's doing, once a turn of the model's has come back: the
+rollout ends as `sandbox_destroyed`, the model's own outcome, trainable, for
+the task to score. So does an
 out-of-memory kill of the main process where the commands could make it a
 candidate again (the first two cases, or root with `DAC_OVERRIDE`). Everywhere
 else the end of the main process is the machinery's (`sandbox_lost`), and so is
@@ -1496,7 +1517,11 @@ What a user of the harness has to know, in one place:
   a root task shares them with the host's own root. A runtime set up to map
   users gives each its own.
 - **`sandbox_destroyed` follows the task's settings**, not what the model did:
-  see [the main process](#the-main-process).
+  see [the main process](#the-main-process). Only a container found gone
+  before the model's first tool call is known not to be the model's doing.
+  From then on, and in a run whose model made no tool call at all once its
+  first turn has come back, an end nothing outside explains is the model's
+  wherever the settings let a command bring it about.
 - **The probe measures the temperature at one position**: the one that
   decides, and the first token besides where a later one decides; see
   [which log-probabilities](#which-log-probabilities).

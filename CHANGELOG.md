@@ -223,6 +223,17 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   used to leave an empty script file in the temporary directory. The file is
   now removed when writing it fails, as it already was when the shell could not
   be started.
+- **Rollouts: a sandbox that goes away before the model has taken a turn is not
+  the model's outcome.** In a container whose settings let its commands end it,
+  an end that nothing outside explains is taken to be the model's doing
+  (`sandbox_destroyed`, trainable). That also held for a container that went
+  away while it was being brought up, or before the first model turn had come
+  back, so a run the model never took part in was handed to a reward. A run
+  that did not start now keeps its own ending (`sandbox_failed`,
+  `sidecar_failed`), and a sandbox lost with no model turn behind it is
+  `sandbox_lost`, the machinery's. So is one found gone when the first of the
+  model's tool calls is about to run; and where the machinery had failed
+  first, while the sandbox was still there, that failure is the run's ending.
 
 ## [2026-11-10]
 

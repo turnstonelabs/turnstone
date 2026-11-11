@@ -915,6 +915,43 @@ class TestEndings:
         assert record["error"] == "RuntimeError: no room at the inn"
         assert box.closed == 1
 
+    def test_a_sandbox_lost_while_it_starts_is_never_the_models_outcome(self):
+        """A container whose settings let its commands end it reports an unexplained
+        end as the model's doing.  While it is being brought up the model has done
+        nothing: such a run did not start, and is not a record to score."""
+
+        class LostWhileStarting(_DirSandbox):
+            lost_cause: str | None = None
+
+            def start(self) -> ExecutionEnvironment:
+                self.lost, self.lost_cause = "its main process ended", "model"
+                raise OSError("the sandbox has stopped")
+
+        with ScriptedChatServer(SCRIPT) as server:
+            record, box = _run(server, sandbox=LostWhileStarting())
+            assert server.requests == []
+        assert record["finish_state"] == "sandbox_failed"
+        assert record["finish_cause"] == "machinery" and record["trainable"] is False
+        assert record["turns"] == 0 and box.closed == 1
+
+    def test_a_sandbox_lost_before_the_first_model_turn_is_not_the_models_doing(self):
+        """The same once the run is under way: with no turn of the model's behind
+        it, an end of the sandbox is the machinery's whatever the sandbox says."""
+
+        class LostBeforeTheFirstTurn(_DirSandbox):
+            lost_cause: str | None = None
+
+            def put_files(self, files: dict[str, str]) -> None:
+                super().put_files(files)
+                self.lost, self.lost_cause = "its main process ended", "model"
+
+        # Every request fails, so no turn of the model's is ever accepted.
+        with ScriptedChatServer(SCRIPT, faults=dict.fromkeys(range(40), "http_500")) as server:
+            record, _box = _run(server, sandbox=LostBeforeTheFirstTurn())
+        assert record["turns"] == 0
+        assert record["finish_state"] == "sandbox_lost"
+        assert record["finish_cause"] == "machinery" and record["trainable"] is False
+
     def test_a_sandbox_that_cannot_be_removed_does_not_lose_the_record(self):
         with ScriptedChatServer(SCRIPT) as server:
             record, _box = _run(server, sandbox=_DirSandbox(close_result=False))
@@ -963,6 +1000,163 @@ class TestEndings:
 
 CUT_CALL = {"name": "bash", "arguments": {"command": "echo cut"}}
 SPAWN = {"name": "task_agent", "arguments": {"prompt": "Write the note."}}
+
+
+class _EndableSandbox(_DirSandbox):
+    """A directory sandbox that says of itself what a container says whose
+    settings let the task's commands end its main process: an end nothing
+    outside explains is the model's doing (``lost_cause`` of ``"model"``).
+
+    *ends_after* commands it is gone, as if that command had ended it;
+    *gone_when_asked* makes it found gone when it is asked whether it runs,
+    which a rollout asks before the first of the model's tool calls; and
+    *found_gone_afterwards* makes it found gone once the run is over, when the
+    record is built.  *sidecar_stopped* is what its sidecar says.
+    """
+
+    def __init__(
+        self,
+        *,
+        ends_after: int | None = None,
+        gone_when_asked: bool = False,
+        found_gone_afterwards: bool = False,
+        sidecar_stopped: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.lost_cause: str | None = None
+        self.ends_after = ends_after
+        self.gone_when_asked = gone_when_asked
+        self.found_gone_afterwards = found_gone_afterwards
+        self.sidecar_stopped = sidecar_stopped
+        self.commands = 0
+        self.asked = 0
+
+    def end(self) -> None:
+        if self.lost is None:
+            self.lost, self.lost_cause = "its main process ended", "model"
+            if self.lost_callback is not None:
+                self.lost_callback()
+
+    def confirm_running(self) -> bool:
+        self.asked += 1
+        if self.gone_when_asked:
+            self.end()
+        return self.lost is None
+
+    def sidecar_lost(self) -> str | None:
+        # Asked when the record is built, after the run.
+        if self.found_gone_afterwards:
+            self.end()
+        return self.sidecar_stopped
+
+    def start(self) -> ExecutionEnvironment:
+        environment = super().start()
+        real_spawn = environment.spawn
+
+        def spawn(command: str, **kwargs: Any) -> Any:
+            result = real_spawn(command, **kwargs)
+            self.commands += 1
+            if self.ends_after is not None and self.commands >= self.ends_after:
+                self.end()
+            return result
+
+        environment.spawn = spawn  # type: ignore[method-assign]
+        return environment
+
+
+class TestASandboxTheModelCouldEnd:
+    """Where a task's settings let its commands end the container, an end nothing
+    outside explains is taken to be the model's doing.  These pin when that is
+    the ending of the run and when something else is."""
+
+    ECHOES: list[dict[str, Any]] = [
+        {"tool_calls": [{"name": "bash", "arguments": {"command": "echo one"}}]},
+        {"tool_calls": [{"name": "bash", "arguments": {"command": "echo two"}}]},
+        {"content": "never reached"},
+    ]
+
+    def test_ended_by_a_command_of_the_models_it_is_the_models_outcome(self):
+        box = _EndableSandbox(ends_after=1)
+        with ScriptedChatServer(self.ECHOES) as server:
+            record, _box = _run(server, task=Task(prompt="go"), sandbox=box)
+            requests = len(server.requests)
+        assert box.asked == 1  # once, before the first of the model's tool calls
+        assert record["finish_state"] == "sandbox_destroyed" and record["finish_cause"] == "model"
+        assert record["trainable"] is True and record["turns"] == 1 and requests == 1
+
+    def test_found_gone_at_the_models_first_command_it_is_not_the_models_doing(self):
+        """A turn of the model's has come back, and the sandbox went away while
+        the model was writing it: nothing of the model's had run.  The settings
+        would have let a command end it; no command had the chance."""
+        box = _EndableSandbox(gone_when_asked=True)
+        with ScriptedChatServer(self.ECHOES) as server:
+            record, _box = _run(server, task=Task(prompt="go"), sandbox=box)
+            requests = len(server.requests)
+        assert record["turns"] == 1 and requests == 1 and box.asked == 1
+        assert record["finish_state"] == "sandbox_lost" and record["finish_cause"] == "machinery"
+        assert record["trainable"] is False
+        assert record["problems"] == [
+            "the sandbox was lost during the run (its main process ended)"
+        ]
+
+    def test_a_request_that_failed_while_the_sandbox_was_there_stands(self):
+        """The session's second request fails for the server's own reasons, and
+        the sandbox is found gone only afterwards.  The machinery cut the run
+        short: that the model's sandbox ended as well does not make the record
+        one to train on."""
+        box = _EndableSandbox(found_gone_afterwards=True)
+        failing = dict.fromkeys(range(1, 40), "http_500")
+        with ScriptedChatServer(self.ECHOES, faults=failing) as server:
+            record, _box = _run(server, task=Task(prompt="go"), sandbox=box)
+        assert box.lost_cause == "model" and record["turns"] == 1
+        assert record["finish_state"] == "error" and record["finish_cause"] == "machinery"
+        assert record["trainable"] is False
+
+    def test_a_sub_agents_failed_request_before_the_sandbox_ended_stands(self):
+        box = _EndableSandbox(found_gone_afterwards=True)
+        parent = [{"tool_calls": [SPAWN]}, {"content": "never reached"}]
+        with ScriptedChatServer(
+            parent, agent_script=[{"content": "x"}], agent_status=500
+        ) as server:
+            record, _box = _run(server, task=Task(prompt="go"), sandbox=box)
+        assert box.lost_cause == "model"
+        assert record["finish_state"] == "subagent_failed" and record["trainable"] is False
+
+    def test_a_sidecar_that_stopped_stands(self):
+        """A sidecar never stops by the model's doing."""
+        box = _EndableSandbox(ends_after=1, sidecar_stopped="the sidecar's main process ended")
+        with ScriptedChatServer(self.ECHOES) as server:
+            record, _box = _run(server, task=Task(prompt="go"), sandbox=box)
+        assert record["finish_state"] == "sidecar_lost" and record["finish_cause"] == "machinery"
+        assert record["trainable"] is False
+
+    def test_what_fails_after_the_model_ended_its_sandbox_does_not_change_the_ending(self):
+        """The sandbox ends during the model's command, and the request that
+        follows from the command's result is never made.  Had the machinery
+        failed after that, the ending would still be the model's: whatever it
+        can follow from, the loss came first."""
+        from turnstone.rollout.episode import _finish_state
+
+        calls = [{"finish_reason": "tool_calls"}]
+        messages = [{"role": "assistant", "tool_calls": [{"id": "a"}]}, {"role": "tool"}]
+
+        def ending(forced: str | None, **more: Any) -> str:
+            return _finish_state(calls, messages, forced, "ended", "model", False, **more)
+
+        # Known to be gone when the run ended: the loss decides, whatever failed.
+        for forced in (None, "error", "server_stalled", "backstop", "timeout", "token_budget"):
+            assert ending(forced) == "sandbox_destroyed"
+        # Found gone only after the machinery had ended the run.
+        for forced in ("error", "server_stalled", "backstop"):
+            assert ending(forced, lost_when_the_run_ended=False) == forced
+        # The model's own endings never outrank what it did to its sandbox.
+        for forced in (None, "timeout", "token_budget", "command_time", "request_refused"):
+            assert ending(forced, lost_when_the_run_ended=False) == "sandbox_destroyed"
+        # The machinery's loss, and a loss with no turn of the model's behind it.
+        assert _finish_state(calls, messages, None, "ended", "machinery", False) == "sandbox_lost"
+        assert _finish_state([], [], "error", "ended", "model", False) == "sandbox_lost"
+        # A run that did not start keeps its own ending.
+        assert _finish_state([], [], "sandbox_failed", "ended", "model", False) == "sandbox_failed"
 
 
 class TestSubAgents:
@@ -1736,6 +1930,22 @@ class TestWhatEndedTheRunInWords:
         )
         assert cut["finish_state"] == "length"
         assert cut["error"] == "the last reply reached the reply limit of 32,768 tokens"
+
+    def test_a_sandbox_that_is_gone(self):
+        class Gone(_DirSandbox):
+            def put_files(self, files: dict[str, str]) -> None:
+                super().put_files(files)
+                self.lost = "the runtime did not answer"
+
+        record = self._ended(self.LOOP, sandbox=Gone())
+        assert record["finish_state"] == "sandbox_lost"
+        assert record["error"] == "the runtime did not answer"
+        ended = self._ended(self.LOOP, sandbox=_EndableSandbox(ends_after=1))
+        assert ended["finish_state"] == "sandbox_destroyed"
+        assert ended["error"] == "its main process ended"
+        stopped = "the sidecar stopped during the run (exit code 137)"
+        sidecar = self._ended(self.LOOP, sandbox=_EndableSandbox(sidecar_stopped=stopped))
+        assert sidecar["finish_state"] == "sidecar_lost" and sidecar["error"] == stopped
 
     def test_a_sub_agent_the_machinery_failed(self):
         record = self._ended(

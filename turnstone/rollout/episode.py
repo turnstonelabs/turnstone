@@ -387,6 +387,15 @@ class ContainerSandbox:
     def state(self) -> dict[str, Any]:
         return self.container.state()
 
+    def confirm_running(self) -> bool:
+        """Ask the runtime whether the container is running now.  One found
+        gone is marked lost, as by a command that finds it gone."""
+        try:
+            self.container.ensure_running()
+        except ContainerLostError:
+            return False
+        return True
+
     def close(self) -> bool:
         if self.environment is not None:
             self.environment.settle(5.0)
@@ -535,6 +544,7 @@ class RolloutSession(HeadlessSession):
         rules: RuleSet | None = None,
         allow_host_execution: bool = False,
         meter: Meter | None = None,
+        before_acting: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> None:
         if kwargs.get("judge_config") is not None:
@@ -552,6 +562,8 @@ class RolloutSession(HeadlessSession):
             t["function"]["name"] for t in (own_servers.get_tools() if own_servers else [])
         )
         super().__init__(**kwargs)
+        # Called once, before the first of the model's tool calls runs.
+        self._before_acting = before_acting
         # Counts the run's tokens and time (:mod:`turnstone.rollout.budget`).
         self._meter = meter
         self._rules = rules
@@ -738,6 +750,10 @@ class RolloutSession(HeadlessSession):
             return item
 
     def _execute_tools(self, *args: Any, **kwargs: Any) -> Any:
+        if self._before_acting is not None:
+            # The model is about to act for the first time.
+            first, self._before_acting = self._before_acting, None
+            first()
         # The time of a batch of tool calls is the commands' time.
         batch = self._meter.tool_batch() if self._meter is not None else contextlib.nullcontext()
         with batch:
@@ -803,6 +819,22 @@ class RolloutSession(HeadlessSession):
             # which only a failure after it explains.
             self._machinery_failed(f"after the sub-agent returned: {str(result)[:300]}")
         return call_id, result
+
+
+def _whose_loss(sandbox: Sandbox, state: dict[str, Any]) -> str | None:
+    """Whose doing a lost sandbox is, for this run.
+
+    The sandbox's own verdict follows from its settings: an end that nothing
+    outside explains is the model's wherever the task lets its commands end the
+    main process.  One case it cannot see: a sandbox found gone when the first
+    of the model's tool calls was about to run.  The model had done nothing in
+    it yet, so that loss is the machinery's whatever the settings would have
+    let a command do.
+    """
+    cause: str | None = getattr(sandbox, "lost_cause", None)
+    if cause == "model" and state.get("gone_before_the_model_acted"):
+        return "machinery"
+    return cause
 
 
 def _plain_task(task: Task) -> dict[str, Any]:
@@ -906,6 +938,9 @@ MACHINERY_FAILURES = {
     "no_model_call": "the run ended before any model call",
     "abnormal_reply": "the last reply ended in a way the harness does not know",
 }
+# The endings of a run that did not start: no model call was made, so nothing
+# that happened to the sandbox meanwhile is the model's doing.
+_DID_NOT_START = frozenset({"sandbox_failed", "sidecar_failed"})
 
 
 def _finish_state(
@@ -917,9 +952,39 @@ def _finish_state(
     subagent_failed: bool,
     sidecar_lost: str | None = None,
     cut_by_budget: bool = False,
+    *,
+    lost_when_the_run_ended: bool = True,
 ) -> str:
+    """How the run ended.  Where several endings apply, the order here decides.
+
+    *lost* and *lost_cause* are the sandbox's: why it is gone, and whose doing
+    that is (:func:`_whose_loss`).  *lost_when_the_run_ended* says whether it
+    was already known to be gone when the session's run ended.
+    """
+    if forced in _DID_NOT_START:
+        # Whatever became of the sandbox while it was being brought up.
+        return forced
     if lost:
-        return "sandbox_destroyed" if lost_cause == "model" else "sandbox_lost"
+        # The model's doing only once the model has done something: a sandbox
+        # that went away before the first model turn was not ended by it.
+        if lost_cause != "model" or not calls:
+            return "sandbox_lost"
+        # The model ended its own sandbox.  That is how the run ended, unless
+        # the machinery had failed first, while the sandbox was still there: a
+        # run the machinery cut short is not the model's outcome, whatever the
+        # model did to its sandbox besides.  A sidecar never stops by the
+        # model's doing; a sub-agent's failure is counted only while the
+        # session has not been told to stop, so one that is counted came before
+        # the loss was found; and a failed request or a time limit the server
+        # ran into came first where the sandbox was not known to be gone when
+        # the run ended.
+        if sidecar_lost:
+            return "sidecar_lost"
+        if subagent_failed:
+            return "subagent_failed"
+        if forced in MACHINERY_FAILURES and not lost_when_the_run_ended:
+            return forced
+        return "sandbox_destroyed"
     if sidecar_lost and forced != "sidecar_failed":
         return "sidecar_lost"
     if subagent_failed:
@@ -1323,9 +1388,10 @@ def _build_record(
         messages,
         forced_state,
         sandbox.lost,
-        getattr(sandbox, "lost_cause", None),
+        _whose_loss(sandbox, state),
         bool(failures),
         sidecar_lost,
+        lost_when_the_run_ended=bool(state.get("lost_when_the_run_ended", True)),
         # The last reply was cut at what the token budget had left for it.
         cut_by_budget=bool(
             last is not None
@@ -1488,6 +1554,7 @@ def _verify(
     record: dict[str, Any],
     verifier: Callable[[VerificationContext], dict[str, Any] | None] | None,
     verifier_timeout: float,
+    whose_loss: Callable[[], str | None] | None = None,
 ) -> dict[str, Any] | None:
     """Check the rollout once the model has finished.  Never raises.
 
@@ -1522,10 +1589,8 @@ def _verify(
             for command in task.after_run:
                 out["commands"].append(sandbox.after_run(command))  # type: ignore[attr-defined]
         except Exception as error:
-            lost_by_model = (
-                isinstance(error, ContainerLostError)
-                and getattr(sandbox, "lost_cause", None) == "model"
-            )
+            cause = whose_loss() if whose_loss else getattr(sandbox, "lost_cause", None)
+            lost_by_model = isinstance(error, ContainerLostError) and cause == "model"
             if lost_by_model:
                 # Something the model left behind ended the container before
                 # the check could run in it: its outcome, like ending it
@@ -1558,6 +1623,18 @@ def _verify(
         out["helpers_removed"] = context.remove_started()
     out["seconds"] = round(time.monotonic() - started, 2)
     return out
+
+
+def _confirmed_running(sandbox: Sandbox) -> bool:
+    """Whether *sandbox* is running now, asked of the sandbox where it can be
+    asked.  Never raises: one that cannot say is taken at what it knows."""
+    confirm = getattr(sandbox, "confirm_running", None)
+    if callable(confirm):
+        try:
+            return bool(confirm())
+        except Exception as error:
+            log.warning("rollout.confirm_running_failed", error=str(error)[:200])
+    return sandbox.lost is None
 
 
 def _keep(sandbox: Sandbox, seconds: float) -> None:
@@ -1807,6 +1884,11 @@ def run_episode(
             def build_session(run_client: Any) -> tuple[Any, Callable[[], list[dict[str, Any]]]]:
                 recorder: RecordingClient = run_client
 
+                def before_acting() -> None:
+                    # The first of the model's tool calls is about to run.  A
+                    # sandbox found gone now went away without the model.
+                    state["gone_before_the_model_acted"] = not _confirmed_running(sandbox)
+
                 def last_call_tokens() -> int | None:
                     call = recorder.last_parent_call()
                     usage = call.usage if call is not None and call.complete else None
@@ -1839,6 +1921,7 @@ def run_episode(
                     rules=state["rules"],
                     allow_host_execution=allow_host_execution,
                     meter=meter,
+                    before_acting=before_acting,
                 )
                 state["session"] = session
                 # A sandbox that is gone ends the run at the next turn: nothing
@@ -1887,18 +1970,26 @@ def run_episode(
                         session.cancel()
                     state["worker_stopped"] = worker_done.wait(_CANCEL_SECONDS)
 
+            def run_the_session() -> None:
+                try:
+                    run_with_lifecycle(
+                        workdir_prefix="turnstone_rollout_",
+                        setup=setup,
+                        build_client=build_client,
+                        build_session=build_session,
+                        finish=finish,
+                        test_timeout=remaining,
+                        teardown_reset=reset_storage,
+                        on_cwd_restore_failed=lambda _cwd: None,
+                        attempts=1,
+                    )
+                finally:
+                    # Whether the sandbox was already known to be gone when the
+                    # run ended: what failed while it was still there came first.
+                    state["lost_when_the_run_ended"] = sandbox.lost is not None
+
             try:
-                run_with_lifecycle(
-                    workdir_prefix="turnstone_rollout_",
-                    setup=setup,
-                    build_client=build_client,
-                    build_session=build_session,
-                    finish=finish,
-                    test_timeout=remaining,
-                    teardown_reset=reset_storage,
-                    on_cwd_restore_failed=lambda _cwd: None,
-                    attempts=1,
-                )
+                run_the_session()
             except TimeoutError:
                 now = time.monotonic()
                 if meter.ended is not None:
@@ -1942,7 +2033,7 @@ def run_episode(
         record["verification"] = _verify(task, sandbox, record, verifier, verifier_timeout)
         if (
             sandbox.lost
-            and getattr(sandbox, "lost_cause", None) == "model"
+            and _whose_loss(sandbox, state) == "model"
             and record["finish_state"] != "sandbox_destroyed"
             and record["finish_cause"] == "model"
         ):
