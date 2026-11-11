@@ -54,6 +54,7 @@ from turnstone.eval.core import HeadlessSession, run_with_lifecycle
 from turnstone.rollout.container import (
     Container,
     ContainerEnvironment,
+    ContainerError,
     ContainerLostError,
     ContainerSpec,
 )
@@ -68,11 +69,13 @@ from turnstone.rollout.settings import (
     resolve_limits,
     resolve_sampling,
 )
+from turnstone.rollout.sidecar import RunningSidecar, Sidecar, SidecarError
 from turnstone.rollout.tokens import build_token_record, describe_break, verify_record
 from turnstone.rollout.toolset import ROLLOUT_TOOL_NAMES
 from turnstone.rollout.verification import (
     AfterRunCommand,
     VerificationContext,
+    build_archive,
     run_after,
     run_verifier,
 )
@@ -94,7 +97,7 @@ DEFAULT_SYSTEM_PROMPT = (
 # step may take, and this many seconds on top.
 _KEEP_MARGIN = 600
 # How long bringing a sandbox up may take: the container, its checks and the
-# task's files.
+# task's files.  A sidecar's own time limits come on top.
 _STARTUP_SECONDS = 900
 # What one after-run command takes besides its own time limit, when every part
 # takes as long as it may: waiting for the ends of commands still under way
@@ -115,11 +118,13 @@ class Task:
     prompt: str
     key: str = ""
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
-    # Files written into the sandbox's working directory before the first turn.
+    # Files written into the sandbox's working directory before the first turn:
+    # text, and any content as bytes.
     setup_files: dict[str, str] = field(default_factory=dict)
+    files: dict[str, bytes] = field(default_factory=dict)
     max_turns: int = 15
-    # Wall-clock limit in seconds for the sandbox start and the whole session
-    # run, sub-agents included.  Teardown (removing the sandbox) comes after it.
+    # Wall-clock limit in seconds for the whole session run, sub-agents
+    # included.  Bringing the sandbox up comes before it and removing it after.
     timeout: int = 300
     # The task's container: image, working directory, the user its commands run
     # as, what is writable, capabilities, environment, limits.
@@ -128,6 +133,9 @@ class Task:
     # container is stopped; their results go in the record's ``verification``.
     # See :mod:`turnstone.rollout.verification` for when that is enough.
     after_run: list[AfterRunCommand] = field(default_factory=list)
+    # A second container with the task's own servers, reached as MCP tools
+    # (:mod:`turnstone.rollout.sidecar`).
+    sidecar: Sidecar | None = None
 
 
 @dataclass
@@ -243,7 +251,7 @@ class Sandbox(Protocol):
 
     def start(self) -> ExecutionEnvironment: ...
 
-    def put_files(self, files: dict[str, str]) -> None: ...
+    def put_files(self, files: dict[str, str | bytes]) -> None: ...
 
     def close(self) -> bool:
         """Remove the sandbox; ``True`` once its absence is confirmed.  Never raises."""
@@ -259,13 +267,21 @@ class ContainerSandbox:
         self._config = config
         # Kept from outside for as long as bringing the sandbox up may take;
         # ``keep_for`` sets the time again for each step that follows.
-        self.container = Container(task.container, max_lifetime=_STARTUP_SECONDS + _KEEP_MARGIN)
+        lifetime = _STARTUP_SECONDS + _KEEP_MARGIN
+        if task.sidecar is not None:
+            lifetime += task.sidecar.setup_timeout + task.sidecar.wait_timeout
+        self.container = Container(task.container, max_lifetime=lifetime)
+        self.sidecar: RunningSidecar | None = None
+        if task.sidecar is not None:
+            self.sidecar = RunningSidecar(task.sidecar, max_lifetime=lifetime)
         self.environment: ContainerEnvironment | None = None
 
     def keep_for(self, seconds: float) -> None:
-        """Have the container removed from outside *seconds* from now if the
+        """Have the containers removed from outside *seconds* from now if the
         runner is gone by then: the step now starting may take that long."""
         self.container.keep_for(seconds)
+        if self.sidecar is not None:
+            self.sidecar.keep_for(seconds)
 
     @property
     def lost(self) -> str | None:
@@ -285,11 +301,32 @@ class ContainerSandbox:
             op_timeout=min(self._config.tool_timeout or 120, 60),
             max_file_bytes=self._config.max_read_bytes,
         )
+        if self.sidecar is not None:
+            self.sidecar.start()
         return self.environment
 
-    def put_files(self, files: dict[str, str]) -> None:
+    @property
+    def mcp_client(self) -> Any:
+        """The MCP client for this rollout's sidecar, ``None`` without one."""
+        return self.sidecar.mcp_client if self.sidecar is not None else None
+
+    def sidecar_lost(self) -> str | None:
+        return self.sidecar.lost() if self.sidecar is not None else None
+
+    def put_files(self, files: dict[str, str | bytes]) -> None:
         assert self.environment is not None
-        self.environment.put_files(files)
+        text = {path: content for path, content in files.items() if isinstance(content, str)}
+        self.environment.put_files(text)
+        data = {path: content for path, content in files.items() if isinstance(content, bytes)}
+        if data:
+            # Unpacked in the working directory as the model's user, who owns them.
+            done = self.container.exec(
+                ["tar", "-x", "-f", "-"], stdin_data=build_archive(data), timeout=300
+            )
+            if done.returncode != 0:
+                raise ContainerError(
+                    f"the task's files could not be put in: {done.stderr_text[:300]}"
+                )
 
     @property
     def name(self) -> str:
@@ -309,10 +346,14 @@ class ContainerSandbox:
         return run_after(self.container, command)
 
     def stop(self) -> bool:
-        """End everything in the container and keep it, to be read from."""
+        """End everything in the container, and in the sidecar, and keep both
+        to be read from."""
         if self.environment is not None:
             self.environment.settle(5.0)
-        return self.container.stop()
+        stopped = self.container.stop()
+        if self.sidecar is not None:
+            stopped = self.sidecar.stop() and stopped
+        return stopped
 
     def state(self) -> dict[str, Any]:
         return self.container.state()
@@ -320,10 +361,18 @@ class ContainerSandbox:
     def close(self) -> bool:
         if self.environment is not None:
             self.environment.settle(5.0)
-        return self.container.close()
+        removed = self.container.close()
+        if self.sidecar is not None:
+            removed = self.sidecar.close() and removed
+        return removed
 
     def describe(self) -> dict[str, Any]:
-        return self.container.describe()
+        described = self.container.describe()
+        if self.sidecar is not None:
+            described["sidecar"] = self.sidecar.describe()
+            # ``removed`` speaks for both.
+            described["removed"] = described["removed"] and described["sidecar"]["removed"]
+        return described
 
 
 # What a sub-agent can do to itself.  Any other exception out of a sub-agent is
@@ -459,6 +508,12 @@ class RolloutSession(HeadlessSession):
         if _acts_on_host(kwargs.get("exec_env")) and not allow_host_execution:
             # The model is not a caller to be trusted with this machine.
             raise HostExecutionError(_HOST_REFUSAL)
+        # The tools of the task's own servers, by name.  Set before the base
+        # class builds its tool lists, which asks ``_apply_persona_visibility``.
+        own_servers = kwargs.get("mcp_client")
+        self._own_server_tools: frozenset[str] = frozenset(
+            t["function"]["name"] for t in (own_servers.get_tools() if own_servers else [])
+        )
         super().__init__(**kwargs)
         self._max_subagents = max_subagents
         self._last_call_tokens = last_call_tokens
@@ -499,6 +554,20 @@ class RolloutSession(HeadlessSession):
             )
 
     # -- sub-agents ----------------------------------------------------------
+
+    def _apply_persona_visibility(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Keep the tools of the task's own servers out of a sub-agent's list.
+
+        They act on the task's state, which is what a rollout is scored on.
+        Called by the session, each such call is in the tool log and is a
+        generated, recorded turn.  A sub-agent's conversation is neither
+        logged nor trained on, so it would act on that state unseen.
+        """
+        visible = super()._apply_persona_visibility(tools)
+        own: frozenset[str] = getattr(self, "_own_server_tools", frozenset())
+        if not own or tools is not getattr(self, "_task_tools", None):
+            return visible
+        return [t for t in visible if t.get("function", {}).get("name") not in own]
 
     def _machinery_failed(self, what: str) -> None:
         with self._delegation_lock:
@@ -603,6 +672,22 @@ class RolloutSession(HeadlessSession):
         return call_id, result
 
 
+def _plain_task(task: Task) -> dict[str, Any]:
+    """The task for the record; content held as bytes is named by its size."""
+
+    def sized(value: Any) -> Any:
+        if isinstance(value, bytes):
+            return {"bytes": len(value)}
+        if isinstance(value, dict):
+            return {key: sized(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [sized(item) for item in value]
+        return value
+
+    plain: dict[str, Any] = sized(asdict(task))
+    return plain
+
+
 def _plain(value: Any) -> Any:
     """A JSON-safe copy of session data."""
     return json.loads(json.dumps(value, default=str))
@@ -676,6 +761,8 @@ MACHINERY_FAILURES = {
     "error": "a request of the session failed, or the harness raised",
     "server_stalled": "the time limit passed while the model server was giving nothing",
     "sandbox_failed": "the sandbox could not be started",
+    "sidecar_failed": "the task's sidecar could not be brought up",
+    "sidecar_lost": "the task's sidecar stopped during the run",
     "sandbox_lost": "the sandbox stopped by itself during the run",
     "subagent_failed": "a sub-agent failed for a reason that is not its work",
     "no_model_call": "the run ended before any model call",
@@ -690,9 +777,12 @@ def _finish_state(
     lost: str | None,
     lost_cause: str | None,
     subagent_failed: bool,
+    sidecar_lost: str | None = None,
 ) -> str:
     if lost:
         return "sandbox_destroyed" if lost_cause == "model" else "sandbox_lost"
+    if sidecar_lost and forced != "sidecar_failed":
+        return "sidecar_lost"
     if subagent_failed:
         return "subagent_failed"
     if forced:
@@ -938,6 +1028,8 @@ def _build_record(
     # the model as a failed tool result.
     troubles: list[dict[str, str]] = snapshot["subagent_failures"]
     failures = [t["what"] for t in troubles if t["whose"] == "machinery"]
+    lost_sidecar = getattr(sandbox, "sidecar_lost", None)
+    sidecar_lost: str | None = lost_sidecar() if callable(lost_sidecar) else None
     last = accepted[-1] if accepted else None
     finish = _finish_state(
         call_dicts,
@@ -946,6 +1038,7 @@ def _build_record(
         sandbox.lost,
         getattr(sandbox, "lost_cause", None),
         bool(failures),
+        sidecar_lost,
     )
     # What makes a record untrainable is never something the model chose: the
     # token data above, and the machinery failing.
@@ -955,6 +1048,8 @@ def _build_record(
     elif finish == "subagent_failed":
         problems += [f"a sub-agent failed for a reason that is not its work: {f}" for f in failures]
     elif finish in MACHINERY_FAILURES:
+        if finish == "sidecar_lost":
+            error = sidecar_lost
         problems.append(
             f"{MACHINERY_FAILURES[finish]}"
             + (f": {error}" if error else "")
@@ -971,6 +1066,8 @@ def _build_record(
     # before that one, has its own words.
     if finish in ("sandbox_destroyed", "sandbox_lost"):
         error = sandbox.lost
+    elif finish == "sidecar_lost":
+        error = sidecar_lost
     elif finish == "subagent_failed":
         error = "; ".join(failures)
     elif finish == "completed":
@@ -987,7 +1084,7 @@ def _build_record(
     sampling: dict[str, Setting] = state.get("sampling") or {}
     record: dict[str, Any] = {
         "key": task.key,
-        "task": asdict(task),
+        "task": _plain_task(task),
         "model": config.model,
         "endpoint": config.base_url,
         "sampling": {
@@ -1011,7 +1108,9 @@ def _build_record(
         "finish_cause": "model" if finish in MODEL_OUTCOMES else "machinery",
         "error": error,
         "timeout": state.get("timeout"),
+        # The whole of it, of which bringing the sandbox up took this much.
         "seconds": round(total, 2),
+        "startup_seconds": state.get("startup_seconds"),
         "time": _time_spent(recorder, total, now),
         "turns": len(accepted),
         # The length of the rollout for any length rule: what the session itself
@@ -1132,6 +1231,7 @@ def _verify(
         context = VerificationContext(
             task=task,
             container_name=getattr(sandbox, "name", None),
+            sidecar_name=getattr(getattr(sandbox, "sidecar", None), "name", None),
             container_stopped=bool(out["container_stopped"]),
             container_state=state() if callable(state) else {},
             after_run=list(out["commands"]),
@@ -1308,7 +1408,6 @@ def run_episode(
     state: dict[str, Any] = {"limits": limits, "sampling": sampling}
     state["logprobs"] = _logprob_verdict(config)
     state["t0"] = time.monotonic()
-    deadline = state["t0"] + task.timeout
     sandbox: Sandbox = (sandbox_factory or ContainerSandbox)(task, config)
     forced: str | None = None
     error: str | None = None
@@ -1335,13 +1434,23 @@ def run_episode(
             state["acts_on_host"] = _acts_on_host(environment)
             if state["acts_on_host"] and not allow_host_execution:
                 raise HostExecutionError(_HOST_REFUSAL)
-            sandbox.put_files(task.setup_files)
+            sandbox.put_files({**task.setup_files, **task.files})
         except HostExecutionError:
             raise
+        except SidecarError as sidecar_error:
+            forced, error = "sidecar_failed", str(sidecar_error)
         except Exception as start_error:
             forced = "sandbox_failed"
             error = f"{type(start_error).__name__}: {start_error}"
         else:
+            state["startup_seconds"] = round(time.monotonic() - state["t0"], 2)
+            # This rollout's own MCP servers, if its task brings any.
+            mcp_client = getattr(sandbox, "mcp_client", None)
+            offered = config.tool_names if config.tool_names is not None else ROLLOUT_TOOL_NAMES
+            if mcp_client is not None:
+                offered = frozenset(offered) | {
+                    t["function"]["name"] for t in mcp_client.get_tools()
+                }
 
             def build_session(run_client: Any) -> tuple[Any, Callable[[], list[dict[str, Any]]]]:
                 recorder: RecordingClient = run_client
@@ -1369,9 +1478,9 @@ def run_episode(
                     raw_arguments=RecordedArguments(recorder)
                     if config.argument_text == "parameter_blocks"
                     else None,
-                    tool_names=config.tool_names
-                    if config.tool_names is not None
-                    else ROLLOUT_TOOL_NAMES,
+                    tool_names=offered,
+                    mcp_client=mcp_client,
+                    mcp_tools=mcp_client is not None,
                     exec_env=environment,
                     max_subagents=config.max_subagents,
                     last_call_tokens=last_call_tokens,
@@ -1394,14 +1503,11 @@ def run_episode(
                 state["snapshot"] = _snapshot(session)
                 return {}
 
-            # What is left of the task's limit after the sandbox came up, to the
-            # next whole second.
-            remaining = math.ceil(deadline - time.monotonic())
-            if remaining < 1:
-                forced = "sandbox_failed"
-                error = "the time limit passed while the sandbox was starting"
-            else:
-                _keep(sandbox, remaining + _KEEP_MARGIN)
+            # The task's limit is the model's time: it starts now, with the
+            # sandbox up.
+            remaining = math.ceil(task.timeout)
+            _keep(sandbox, remaining + _KEEP_MARGIN)
+            if remaining >= 1:
                 # The earliest moment the time limit can end the run.
                 cut_at = time.monotonic() + remaining - 0.25
                 try:

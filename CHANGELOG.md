@@ -119,6 +119,22 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   read, a path that cannot be read. A check that raises, runs out of time or
   returns no verdict leaves no reward, and the record is then not trainable.
   Every container is removed afterwards.
+- **Rollouts: a task's own servers in a sidecar, reached as MCP tools.** A task
+  may bring a second container (`Task.sidecar`) with files, a setup command and
+  MCP servers. It has no network, like the episode's container; the session
+  reaches its servers through the runtime's own channel into it, by way of a
+  loopback listener that carries only connections naming a secret made for
+  the rollout, and the model uses them as tools, each call in the tool log.
+  The secret is taken out of a request before it goes on, and what other
+  connections can hold of the runner is bounded in time and in number.
+  The MCP client is built from
+  the servers the task names and no others, its tool list is fixed for the run,
+  and it is shut down with the rollout. A sub-agent is not offered these tools:
+  its calls are in neither the tool log nor the token record. A sidecar that
+  does not come up or stops during the run makes the record not trainable; a
+  call the model gets wrong is an ordinary result. Both containers are removed
+  afterwards, and a verifier is given the stopped sidecar to read its state
+  from.
 
 ### Fixed
 

@@ -19,12 +19,13 @@ A caller may still offer a host-side tool on purpose
 (``RolloutConfig.tool_names``); it then runs outside the container, with
 whatever reach the reason below describes.
 
-MCP tools are not in either set: they are not built-in tools, and a rollout
-session is built without an MCP client, so none exists in it and no configured
-server can be reached.  A rollout that brings its own servers would build a
-client from those servers only and hand it to the session with
-``mcp_tools=True`` (see ``HeadlessSession``); the tool list is still read once
-and fixed for the run.  The harness does not start such servers yet.
+MCP tools are not in either set: they are not built-in tools.  The only MCP
+client a rollout session ever has is the one built for its task's sidecar
+(:mod:`turnstone.rollout.sidecar`), from the servers the task names and from
+nothing else, so no server configured on this machine can be reached.  Its
+tools are offered beside the ones here (``mcp_tools=True``, see
+``HeadlessSession``); the list is read once and fixed for the run.  They are
+the session's own to call: a sub-agent is not offered them.
 """
 
 from __future__ import annotations

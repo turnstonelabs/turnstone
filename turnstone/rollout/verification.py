@@ -1003,6 +1003,9 @@ class VerificationContext:
     after_run: list[dict[str, Any]]
     # The episode record so far.  To read; the verdict goes in the return value.
     record: dict[str, Any]
+    # The task's stopped sidecar, if it has one: its state is what the model's
+    # tool calls made of it.
+    sidecar_name: str | None = None
     runtime: str = "docker"
     # Seconds a container started through this context is kept at most, for a
     # runner that is killed before it removes it: the verifier's own time

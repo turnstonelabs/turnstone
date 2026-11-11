@@ -156,11 +156,14 @@ Three limits are the rollout's own, because they are the task's: the number of
 turns (`Task.max_turns`, 15), the time (`Task.timeout`, 300 s) and the number
 of sub-agents (`RolloutConfig.max_subagents`, 16).
 
-`Task.timeout` bounds the start of the sandbox and the session run, sub-agents
-included, to the next whole second. It does not bound what comes after:
-removing the container takes up to 60 seconds for the removal and 30 to confirm
-it, and the record reports that time apart (`teardown_seconds`). At the limit
-the session is cancelled and given ten seconds to stop.
+`Task.timeout` bounds the session run, sub-agents included, to the next whole
+second. It starts when the sandbox is up: bringing it up, a sidecar's setup
+included, is not the model's time, and the record says how long it took
+(`startup_seconds`). It does not bound what comes after either: the check after
+the run has time limits of its own, and removing a container takes up to 60
+seconds for the removal and 30 to confirm it, which the record reports apart
+(`teardown_seconds`). At the limit the session is cancelled and given ten
+seconds to stop.
 
 ---
 
@@ -235,11 +238,13 @@ penalised for it.
 | `error` | A request of the session failed (after the client's own retries; the first request refused by the server, and a prompt the server finds too long, included), or the harness raised (a stable-prefix error included) | machinery | no |
 | `sandbox_failed` | The container could not be started | machinery | no |
 | `sandbox_lost` | The container stopped and nothing the model could do explains it, or the runtime stopped answering | machinery | no |
+| `sidecar_failed` | The task's [sidecar](#a-tasks-own-servers-the-sidecar) could not be brought up | machinery | no |
+| `sidecar_lost` | The task's sidecar stopped during the run | machinery | no |
 | `subagent_failed` | A sub-agent failed for a reason that is not its work | machinery | no |
 | `no_model_call`, `abnormal_reply` | The run ended before any model call, or on a finish reason the harness does not know, which only the server gives (a filter of its own, for one) | machinery | no |
 
-Where several apply, a lost container decides first, then a failed sub-agent,
-then the others.
+Where several apply, a lost container decides first, then a lost sidecar, then
+a failed sub-agent, then the others.
 
 `context_full` is decided before each request, from the server's own count of
 the previous call's tokens and the size in bytes of what was added since (a
@@ -469,7 +474,8 @@ task (`Task.container`, a `ContainerSpec`); the defaults are the contained case:
 
 A setting that can be seen to be wrong without asking the runtime is refused
 before anything is started, the task with it (`ValueError` from
-`ContainerSpec.validate`):
+`ContainerSpec.validate`), for the episode's container and for a sidecar's
+alike:
 
 - an `image` that is empty, begins with `-` or holds a space;
 - a `workdir` that is not an absolute path;
@@ -507,8 +513,8 @@ teardown.
 If the runner is killed, the container is removed by a small process of its own
 on the host, out of the container's reach. Its time is set anew for each step,
 to as long as that step may take and ten minutes on top: bringing the sandbox
-up (15 minutes), the run (the task's time limit), the commands after the run
-(their time limits), the verifier (its time limit).
+up (15 minutes, and a sidecar's own limits), the run (the task's time limit),
+the commands after the run (their time limits), the verifier (its time limit).
 It is stopped only once the container is known to be gone; after a removal that
 could not be confirmed it tries again within half a minute and keeps trying for
 five.
@@ -534,7 +540,8 @@ ends as `sandbox_failed`: a `writable` that leaves `/tmp` read-only over a
 read-only root, a `/tmp` the commands' user cannot write, an `sh` that does not
 know `set -o pipefail` in an image without `bash`. Started all the same, every
 shell call of the model's would fail there and be scored as its own.
-`tar` is needed where a command after the run names files to read out.
+`tar` is needed where a task's files are bytes, where a command after the run
+names files to read out, and in a sidecar that is given files.
 
 ### The main process
 
@@ -677,7 +684,8 @@ look from inside), each a start of the runtime's client: three where the
 storage driver enforces the size. Measured on the runner's side that is about
 0.05 processor-seconds per second and container, the runtime's own work not
 counted. Sixty such containers on one machine are about three processor
-cores and 150 process starts a second. A read-only root with memory-backed
+cores and 150 process starts a second, and twice that where each task's
+sidecar has a writable root too. A read-only root with memory-backed
 directories costs none of it.
 
 The watched bound is not a hard bound:
@@ -752,10 +760,9 @@ when a tool is in neither list):
 `RolloutConfig.tool_names` overrides the set; a host-side tool named there runs
 outside the container.
 
-A rollout session has no MCP client, so no MCP tool exists in it and no
-configured server can be reached. A run that brings its own servers can be
-given a client built from those servers only (`HeadlessSession(mcp_client=...,
-mcp_tools=True)`); the harness does not start such servers itself yet.
+A rollout offers no MCP tool of a server configured on this machine, and none
+can be reached: the only MCP client a rollout ever has is the one built for its
+task's [sidecar](#a-tasks-own-servers-the-sidecar).
 
 Two limits apply to what a tool returns. A command's output is cut when it is
 produced, head and tail kept, to the framework's truncation setting
@@ -781,7 +788,7 @@ environment. The sub-agent's own conversation is not part of the sample.
 | | |
 |---|---|
 | Where it acts | In the same container, through the same environment |
-| Its tools | The environment tools only; it cannot start another sub-agent |
+| Its tools | The environment tools only; it cannot start another sub-agent, and it is not offered the tools of the task's sidecar (a call it makes to one anyway is refused) |
 | The parent's prompt | Unchanged by starting one: the system prompt and tool list are fixed for the run |
 | Its model calls | Kept out of the token record and the prefix check. The side record under `subagents` is marked `not_for_training` and `token_data_kept: false`: it holds counts and a summary per call, no token IDs or log-probabilities, and none of the checks behind `trainable` is made on them |
 | Its time | Counts toward the task's time limit |
@@ -792,6 +799,11 @@ What bounds the work sub-agents can do is therefore the number of sub-agents
 times the turn limit times the reply limit, and the task's time limit. With the
 framework's default of no turn limit, the time limit is the bound. The tokens
 sub-agents generate are counted in the record (a measurement, not a limit).
+
+A sub-agent is not offered the tools of the task's own servers. Those act on
+the task's state, which is what the rollout is scored on. Called by the
+session, each such call is a generated, recorded turn and is in the tool log; a
+sub-agent's calls are in neither, so it would act on that state unseen.
 
 A sub-agent that does its task badly is an ordinary result: the model delegated
 and has to deal with what came back. That includes one whose model returns
@@ -826,6 +838,78 @@ went away), what fails around a sub-agent follows from the stop: at the time
 limit the session's client is closed, and a sub-agent's model call under way
 dies with it. Such a failure is not counted, and the ending stays what the
 stop made it; the call that died is still in `subagents.calls`.
+
+---
+
+## A task's own servers: the sidecar
+
+Some tasks come with systems of their own, mock services with their state,
+served as MCP servers. `Task.sidecar` describes a second container for them:
+
+```python
+from turnstone.rollout.container import ContainerSpec
+from turnstone.rollout.sidecar import Sidecar
+
+Task(
+    prompt="...",
+    sidecar=Sidecar(
+        container=ContainerSpec(image="...", user="0:0", read_only_root=False, writable={}),
+        files={"/srv/server.py": b"..."},  # put in before the setup command
+        setup=["sh", "-c", "start-the-servers"],  # must return; what it starts stays
+        wait_ports=[39101],  # must be listening before the run
+        mcp_servers={"ledger": "http://127.0.0.1:39101/mcp"},  # as seen inside
+    ),
+)
+```
+
+What reaches what:
+
+| From | To the sidecar's servers | How |
+|------|--------------------------|-----|
+| The session (outside both containers) | yes, and it is the only client | A listener on this machine's loopback interface hands each connection to a small relay started inside the sidecar through the runtime, which connects to the server's port there. The listener carries a connection only when its first request names a secret made for this rollout, which the session's own client sends with every request (the header `x-turnstone-forward`). That header is taken out before the request goes on, and each connection carries one request (the client is told so, and the request goes on with `Connection: close`), so the task's own server is never sent the secret |
+| Another user of this machine | no | A loopback port is open to every user of the machine, but a connection that does not name the rollout's secret is closed before anything is started for it. What such connections can hold of the runner is bounded: the head of a request has 20 seconds to arrive, all of it together, and at most 16 connections are read for their head at a time; the others wait in the listener's queue. Connections that keep every place taken delay the session's own client, which waits its turn, but are not carried |
+| The model's container | no | Neither container has a network; they do not share one |
+| The sidecar | nothing outside itself | No network: no route to this machine, to other rollouts or to the model's container |
+
+The model uses the servers as tools, through the session, and every call is in
+the tool log like any other tool's. It is not given a way to connect to them
+itself: it would then act on them unseen, and could reach whatever else the
+sidecar serves, such as a task's own health or grading endpoint. A task format
+that ships a bridge for programs in the model's container does not need it
+here. A sub-agent is not offered these tools, for the same reason
+(see [sub-agents](#sub-agents)).
+
+The MCP client is built from the servers the task names and from nothing else.
+Its tool list is read once, when the session is built, and is the same with
+every request, so the prompt still extends. It is shut down when the rollout
+ends.
+
+The relay needs one of `python3`, `socat` or `nc` in the sidecar's image.
+
+What a model can do to a sidecar is call its tools, with any arguments. That
+changes the task's state, which is the task. It cannot start a process there or
+stop the container. So:
+
+| What happened | Whose doing | `finish_state` |
+|---------------|-------------|----------------|
+| A tool call the model got wrong; the server answered with an error | model | an ordinary tool result |
+| The sidecar's container, setup command, ports or servers did not come up | machinery | `sidecar_failed`, not trainable |
+| The sidecar stopped during the run | machinery | `sidecar_lost`, not trainable |
+
+A sidecar is a container like the episode's: its main process is kept the same
+way, it is removed afterwards with the removal confirmed, and the process that
+removes it when the runner is killed is given the same times. The record
+describes it under `sandbox.sidecar`.
+
+After the run the sidecar is stopped together with the episode's container, and
+a verifier is given its name (`context.sidecar_name`), to read from it what the
+model's calls made of the task's state. Both containers are removed afterwards.
+
+Bringing the sandbox up, a sidecar's setup included, is not the model's time:
+the task's time limit starts when it is up, and the record says how long it
+took (`startup_seconds`).
+
+A task's files can be bytes as well as text (`Task.files`).
 
 ---
 
@@ -1009,7 +1093,7 @@ whose value does not apply is `null`.
 | Key | Value |
 |-----|-------|
 | `key` | `Task.key` |
-| `task` | The task as it was given: `prompt`, `key`, `system_prompt`, `setup_files`, `max_turns`, `timeout`, `container` (the `ContainerSpec`), `after_run` |
+| `task` | The task as it was given: `prompt`, `key`, `system_prompt`, `setup_files`, `files`, `max_turns`, `timeout`, `container` (the `ContainerSpec`), `after_run`, `sidecar`. Content held as bytes is replaced by `{"bytes": N}` |
 | `model`, `endpoint` | The model's name and the API root the requests went to |
 | `finish_state`, `finish_cause` | How the rollout ended, and whether that is the model's outcome (`model`) or a failure of the server, the harness or the runtime (`machinery`); see [how a rollout ends](#how-a-rollout-ends) |
 | `error` | `null` where the model ended its turn by itself (`completed`). For every other ending, what happened, in words: the limit that was reached and where the last reply was cut, the request that failed or was refused, why the sandbox is gone or did not start, a sub-agent's failure |
@@ -1033,7 +1117,7 @@ whose value does not apply is `null`.
 | `logprobs` | Which log-probabilities the server reports: `sampler_logprobs` (`true`, `false` or `null`), `reflects` (the same per setting: `temperature`, `top_k`, `top_p`), `reason`, and from a probe `tried` and `positions` |
 | `token_id_check` | `"required"` or `"not required"` |
 | `timeout` | `null` unless the time limit was reached; then what the run was waiting on, below |
-| `seconds`, `teardown_seconds` | The time from the start of the sandbox to the end of the run, and the time removing the sandbox took, which comes on top |
+| `seconds`, `startup_seconds`, `teardown_seconds` | The time from the start of the sandbox to the end of the run; of that, the time bringing the sandbox up took; and the time removing it took, which comes on top |
 | `time` | Where the time went, below |
 | `subagents` | The side record of sub-agent calls, below |
 | `sandbox` | The container, below |
@@ -1109,6 +1193,7 @@ from 0, as `tool_log[].turn` does:
 | `removed`, `removal_error` | Whether the removal was confirmed, and why not |
 | `lost`, `lost_cause` | Why the container stopped while the run needed it, and whose doing that is (`model` or `machinery`); `null` when it did not |
 | `oom_kills`, `exit_code` | Out-of-memory kills inside the container, as a rule of a command of the model's, and the main process's exit code if it ended |
+| `sidecar` | With a sidecar only: the same keys for its container, and `mcp_servers`. `removed` then speaks for both containers |
 
 `verification`:
 
@@ -1202,6 +1287,11 @@ What a user of the harness has to know, in one place:
   first. A model certain of all of them gets no verdict, and at sampler
   settings that reshape the distribution its records are then not trainable;
   see [which log-probabilities](#which-log-probabilities).
+- **A sidecar that outgrows its file system ends the run as the machinery's.**
+  A sidecar over a writable root that writes more than its root may hold is
+  stopped; the run then ends as `sidecar_lost` and is not trainable. Where a task's server writes what the model asks for, the model
+  can bring that about. Give such a sidecar a read-only root with writable
+  directories of a size, or a server that bounds what it stores.
 - **A conversation the server refuses is taken to be the model's doing**, for
   a sub-agent's request and for every request of the session after its first
   (status 400 or 422). A refusal that is the harness's fault, a message the
@@ -1220,8 +1310,9 @@ What a user of the harness has to know, in one place:
 ## Tests
 
 The container tests (`tests/test_rollout_container.py`,
-`tests/test_rollout_verification.py`) need a container runtime and an image, so
-they skip where they are missing. CI runs them in their own lane
+`tests/test_rollout_verification.py`, `tests/test_rollout_sidecar.py`) need a
+container runtime and an image, so they skip where they are missing. CI runs
+them in their own lane
 (`test-rollout-container`), which pulls the image by digest and sets
 `TURNSTONE_ROLLOUT_REQUIRE_CONTAINER=1`, so that a missing runtime or image
 fails the lane instead of skipping the tests. The other rollout tests need no
@@ -1326,5 +1417,6 @@ machine into one.
 
 Not covered by a test: a size bound enforced by the storage driver (it needs a
 host whose driver offers one),
+the `socat` and `nc` relays of a sidecar,
 and three of the four ways to start `sleep` as the main process (`bash` and
 the fallback shell are).
