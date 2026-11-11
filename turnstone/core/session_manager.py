@@ -1595,13 +1595,16 @@ class SessionManager:
                     self._retire_rehydrate_slot(ws)
                     raise WorkstreamLeaseLostError(ws_id)
 
-                # No DB state-flip on resurrect. The in-memory session
-                # is IDLE; the DB row may still say 'closed' from the
-                # last close(). The next set_state() call syncs it
-                # naturally; writing 'idle' here could race a concurrent
-                # close() that writes 'closed' under self._lock. The lease
-                # taken above keeps the orphan reaper off this row however
-                # old its ``updated``, which opening leaves alone.
+                if current_row is not None and current_row.get("state") == "closed":
+                    # A reopened row still reads ``closed`` from its last close. Record the
+                    # slot's live state now instead of at its first transition: an open that
+                    # refuses closed rows (the events resume after a restart) would otherwise
+                    # take a workstream that was reopened and not yet used for a closed one.
+                    # Every close of this id runs on the lane this open holds and discards the
+                    # state writer's pending record, so this write cannot land after a close's;
+                    # the lease taken above keeps other processes and the orphan reaper off
+                    # the row.
+                    self._persist_reopened_state(ws)
                 if not refuse_closed:
                     # A deliberate open of an id unloaded without a durable record: from here
                     # the slot is the record again, and a later close or delete writes its own.
@@ -2551,6 +2554,26 @@ class SessionManager:
                 ws.id[:8],
                 exc_info=True,
             )
+
+    def _persist_reopened_state(self, ws: Workstream) -> None:
+        """Record the live state of a slot whose row still read ``closed``, on its state lane.
+
+        The slot is reachable while its open is still running, so a transition can be admitted
+        beside this write. The state is read inside the lane every tail persists under: one
+        admitted earlier is the state recorded here, and one admitted later records after it.
+        Nothing is published; the open announces the slot itself.
+        """
+        if not self._retain_current_state_tail(ws):
+            return
+        try:
+            with ws._state_tail_lock:
+                with ws._lock:
+                    if ws._closed:
+                        return
+                    state = ws.state
+                self._persist_state(ws, state)
+        finally:
+            self._release_state_tail(ws)
 
     def _run_state_tail(
         self,
