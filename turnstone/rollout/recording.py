@@ -27,16 +27,22 @@ A call is only as good as its checks:
 A session's sub-agents call through the same client.  Their calls are recorded
 with ``scope`` ``"sub_agent"`` and kept apart: they are not the run's own
 turns.
+
+A *gate* (``RecordingClient(gate=...)``) is asked before every request, with
+the call's record and the request as it is about to go out.  It may change the
+request or refuse it by raising; the rollout's budgets are kept there
+(:mod:`turnstone.rollout.budget`).  The client itself decides nothing.
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from turnstone.core.log import get_logger
 from turnstone.core.session import inside_task_agent
@@ -87,6 +93,18 @@ class CallRecord:
     last_heard_at: float = 0.0
     ended_at: float | None = None
     longest_silence: float = 0.0
+    # When the first generated token arrived: until then the server was
+    # working on the prompt.  ``None`` while it has not, and for a reply that
+    # came in one piece.
+    first_token_at: float | None = None
+    # The size of the request's messages and tools in bytes.  A token is at
+    # least one byte, so this bounds the prompt's tokens before the server
+    # has counted them.
+    prompt_bytes: int = 0
+    # The reply limit a gate granted this call, and whether that was less
+    # than the request asked for.
+    token_grant: int | None = None
+    token_grant_cut: bool = False
 
     @property
     def raw_text(self) -> str:
@@ -305,9 +323,12 @@ class _RecordingStream:
         record = self._record
         try:
             for chunk in self._stream:
-                record.heard(time.monotonic())
+                now = time.monotonic()
+                record.heard(now)
                 record.chunks += 1
                 _take(record, chunk)
+                if record.first_token_at is None and record.token_ids:
+                    record.first_token_at = now
                 yield chunk
             record.complete = record.finish_reason is not None
         except BaseException as error:
@@ -350,35 +371,39 @@ class _Completions:
         kwargs["extra_body"] = extra_body
         streamed = bool(kwargs.get("stream"))
         messages = kwargs.get("messages") or []
-        request: dict[str, Any] = {
-            "model": kwargs.get("model"),
-            "messages": len(messages),
-            "roles": [m.get("role") for m in messages if isinstance(m, dict)],
-            "tools": [t.get("function", {}).get("name") for t in kwargs.get("tools") or []],
-            "sampling": {
-                k: kwargs[k]
-                for k in (
-                    "temperature",
-                    "top_p",
-                    "max_tokens",
-                    "max_completion_tokens",
-                    "reasoning_effort",
-                )
-                if k in kwargs
-            },
-            "extra_body": dict(extra_body),
-        }
         with owner._lock:
             record = CallRecord(
                 index=len(owner.calls),
                 streamed=streamed,
-                request=request,
+                request={},
                 scope=SUB_AGENT if inside_task_agent() else PARENT,
+                prompt_bytes=_size(messages) + _size(kwargs.get("tools") or []),
             )
             owner.calls.append(record)
         started = time.monotonic()
         record.started_at = record.last_heard_at = started
         try:
+            if owner.gate is not None:
+                # May cut the reply limit, or refuse the request by raising.
+                owner.gate.admit(record, kwargs)
+            record.request = {
+                "model": kwargs.get("model"),
+                "messages": len(messages),
+                "roles": [m.get("role") for m in messages if isinstance(m, dict)],
+                "tools": [t.get("function", {}).get("name") for t in kwargs.get("tools") or []],
+                "sampling": {
+                    k: kwargs[k]
+                    for k in (
+                        "temperature",
+                        "top_p",
+                        "max_tokens",
+                        "max_completion_tokens",
+                        "reasoning_effort",
+                    )
+                    if k in kwargs
+                },
+                "extra_body": dict(extra_body),
+            }
             response = self._inner.create(**kwargs)
         except BaseException as error:
             record.error = f"{type(error).__name__}: {str(error)[:300]}"
@@ -397,6 +422,22 @@ class _Completions:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
+
+
+def _size(value: Any) -> int:
+    """The size of a request part in bytes.  Never raises."""
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8", "replace"))
+    except (TypeError, ValueError, RecursionError):
+        return len(repr(value).encode("utf-8", "replace"))
+
+
+class Gate(Protocol):
+    """What is asked before every request of a recording client."""
+
+    def admit(self, call: CallRecord, request: dict[str, Any]) -> None:
+        """Change *request* in place, or raise to refuse it."""
+        ...
 
 
 class _Chat:
@@ -421,20 +462,24 @@ class RecordingClient:
         inner: Any,
         *,
         extra_body: dict[str, Any] | None = None,
+        gate: Gate | None = None,
         _shared: RecordingClient | None = None,
     ) -> None:
         self._inner = inner
         self.calls: list[CallRecord]
         self._lock: threading.Lock
+        self.gate: Gate | None
         if _shared is not None:
             # A per-call copy made by ``with_options``: same records, same settings.
             self.calls = _shared.calls
             self._lock = _shared._lock
             self.extra_body: dict[str, Any] = _shared.extra_body
+            self.gate = _shared.gate
         else:
             self.calls = []
             self._lock = threading.Lock()
             self.extra_body = dict(extra_body or {})
+            self.gate = gate
         self.chat = _Chat(self, inner.chat)
 
     def scoped(self, scope: str) -> list[CallRecord]:

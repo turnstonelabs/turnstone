@@ -778,7 +778,11 @@ class TestEndings:
     def test_the_time_limit_passing_on_a_silent_server_is_not_the_models_outcome(self):
         with ScriptedChatServer(SCRIPT, delay=3.0) as server:
             record, _box = _run(
-                server, task=Task(prompt="slow", timeout=1), server_stall_seconds=0.5
+                server,
+                task=Task(prompt="slow", timeout=1),
+                server_stall_seconds=0.5,
+                # A server that takes no time over a prompt worth speaking of.
+                min_prompt_tokens_per_second=1e9,
             )
         assert record["finish_state"] == "server_stalled"
         assert record["finish_cause"] == "machinery" and record["trainable"] is False
@@ -797,7 +801,7 @@ class TestEndings:
         assert record["finish_state"] == "timeout" and record["finish_cause"] == "model"
         assert record["timeout"] == {"waiting_on": "tools"}
         assert record["trainable"] is True and record["turns"] == 1
-        assert record["time"]["other_seconds"] > record["time"]["model_seconds"]
+        assert record["time"]["command_seconds"] > record["time"]["model_seconds"]
         assert box.closed == 1
 
     def test_a_failed_request_of_the_session_is_not_the_models_outcome(self):
@@ -1222,6 +1226,45 @@ class TestSubAgents:
         assert long == "x" * 300 + "..."
         detail = {"detail": [{"loc": ["body", "messages"], "msg": "field required"}]}
         assert _server_words(_status_error(422, body=detail)) == json.dumps(detail)
+
+    def test_a_sub_agents_call_that_dies_with_the_time_limit_does_not_hide_the_timeout(
+        self, monkeypatch
+    ):
+        """At the time limit the session is told to stop and its client is closed;
+        only then is the session cancelled.  A sub-agent's model call under way
+        dies with the client, and its thread can get to that before the cancel
+        does: here the thread that closes the client is held up for a while.  The
+        failed call follows from the stop.  It is not a failure of the machinery
+        that ended the run, and the model's own ``timeout`` stands."""
+        import time
+
+        from turnstone.rollout import recording
+
+        real = recording.RecordingClient.close
+        closes: list[float] = []
+
+        def close_and_dawdle(self: Any) -> None:
+            real(self)
+            closes.append(time.monotonic())
+            if len(closes) == 1:
+                time.sleep(3.0)
+
+        monkeypatch.setattr(recording.RecordingClient, "close", close_and_dawdle)
+        # A report long enough to be still on its way when the limit passes.
+        agent = [{"content": "one more line of the report. " * 300}]
+        with ScriptedChatServer(self.PARENT, agent_script=agent, chunk_delay=0.05) as server:
+            record, _box = _run(server, task=Task(prompt="delegate", timeout=2))
+            agent_requests = len(server.agent_requests)
+
+        assert agent_requests == 1 and len(closes) >= 1
+        assert record["finish_state"] == "timeout" and record["finish_cause"] == "model"
+        assert record["trainable"] is True and record["problems"] == []
+        assert record["subagents"]["failures"] == []
+        # The call that died is there to see (and the attempt to issue it again on
+        # the closed client); no model call of the session followed.
+        died = record["subagents"]["calls"]
+        assert died and all(call["complete"] is False for call in died)
+        assert record["turns"] == 1
 
     def test_a_failure_around_a_finished_sub_agent_is_the_machinerys(self, monkeypatch):
         """The session catches what goes wrong around a sub-agent and hands the model

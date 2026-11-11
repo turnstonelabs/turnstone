@@ -156,6 +156,22 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   session runs on is not asked inside a rollout's container, and the
   model-based judge never runs in a rollout. Interactive and other headless
   sessions are unchanged.
+- **Rollouts: budgets of the model's own, and the time limit as a backstop.** A
+  task can give the model a budget of generated tokens (`max_generated_tokens`,
+  the session's and its sub-agents' together) and of time its commands may run
+  (`max_command_seconds`); running out of either ends the rollout as the
+  model's own outcome (`token_budget`, `command_time`). With a token budget the
+  time limit stops being the model's and becomes a backstop for the machinery.
+  A run that reaches it is judged by what the server was asked to do and a
+  configured minimum speed (`min_tokens_per_second`): a server slower than
+  that, or a harness that took the time itself, ends the rollout as `backstop`,
+  not trainable; a server that kept its speed leaves it the model's `timeout`.
+  Without a token budget the time limit is the model's as before, and a request
+  whose prompt the server is still working on is given the time that prompt
+  takes before its silence counts as a stalled server. The record splits the
+  run's time into the server's, the commands' and the harness's, holds the
+  server's measured speeds (`time`) and lists the budgets with what was spent
+  (`budgets`).
 
 ### Fixed
 

@@ -52,6 +52,7 @@ from turnstone.core.storage import init_storage, reset_storage
 from turnstone.core.tools import apply_null_spellings, salvage_tool_arguments
 from turnstone.core.trajectory import final_assistant_text
 from turnstone.eval.core import HeadlessSession, run_with_lifecycle
+from turnstone.rollout.budget import Budgets, Meter, TokenBudgetError, backstop_seconds
 from turnstone.rollout.container import (
     Container,
     ContainerEnvironment,
@@ -107,6 +108,11 @@ _STARTUP_SECONDS = 900
 # helper, letting the container run again, and reading out the files it names.
 _AFTER_RUN_OVERHEAD = 330
 
+# Seconds a session is given to stop once it was told to.
+_CANCEL_SECONDS = 10.0
+# Tokens a second a server is taken to process of a prompt where nothing says.
+_DEFAULT_PROMPT_SPEED = 1000.0
+
 # Request-body keys that are not sampler settings.
 _NOT_SAMPLER_KEYS = frozenset(
     {"chat_template_kwargs", "return_token_ids", "return_tokens_as_token_ids"}
@@ -127,7 +133,16 @@ class Task:
     max_turns: int = 15
     # Wall-clock limit in seconds for the whole session run, sub-agents
     # included.  Bringing the sandbox up comes before it and removing it after.
-    timeout: int = 300
+    # Without a token budget it is the model's time.  With one it is a backstop
+    # for the machinery, and ``None`` then derives it from the budgets and the
+    # server's minimum speed (:func:`turnstone.rollout.budget.backstop_seconds`).
+    timeout: int | None = 300
+    # The model's own budgets (:mod:`turnstone.rollout.budget`), in units a slow
+    # server does not use up: the tokens the session and its sub-agents may
+    # generate together, and the seconds the model's commands may run.  Running
+    # out of either is the model's outcome.
+    max_generated_tokens: int | None = None
+    max_command_seconds: float | None = None
     # The task's container: image, working directory, the user its commands run
     # as, what is writable, capabilities, environment, limits.
     container: ContainerSpec = field(default_factory=ContainerSpec)
@@ -205,7 +220,15 @@ class RolloutConfig:
     rules: RuleSet | str | None = "shipped"
     # A run that reaches its time limit while a model request has had nothing
     # from the server for this long ended on the server, not on the model.
+    # A request whose prompt the server is still working on is given the time
+    # that takes at the minimum prompt speed on top.
     server_stall_seconds: float = 60.0
+    # Tokens a second the server must at least generate, and process of a
+    # prompt (``None``: a hundred times the generation speed, or 1000 where
+    # neither is named).  With a token budget the time limit is a backstop for
+    # the machinery, and these say when the machinery was too slow.
+    min_tokens_per_second: float | None = None
+    min_prompt_tokens_per_second: float | None = None
     # Largest file a file tool reads whole, and the longest text an edit may make.
     max_read_bytes: int = 256 * 1024
     # Keep the generated text of every call in the record.
@@ -383,7 +406,7 @@ class ContainerSandbox:
 
 # What a sub-agent can do to itself.  Any other exception out of a sub-agent is
 # the machinery's: a failed request, a harness error.
-_SUBAGENT_OWN_DOING = (EmptyCompletionError, ModelContextLimitError)
+_SUBAGENT_OWN_DOING = (EmptyCompletionError, ModelContextLimitError, TokenBudgetError)
 
 # The statuses a server answers with when it refuses a request for what the
 # request holds: a conversation its template will not render, a body it cannot
@@ -414,7 +437,8 @@ def _causes(error: BaseException) -> list[BaseException]:
 
 def _sub_agents_own_doing(error: BaseException) -> bool:
     """Whether what a sub-agent raised is something it did to itself: its model
-    returned nothing, or it filled its own context window.
+    returned nothing, it filled its own context window, or the episode's token
+    budget was used up when it asked for more.
 
     Read from the whole chain of causes.
     """
@@ -510,6 +534,7 @@ class RolloutSession(HeadlessSession):
         last_call_tokens: Callable[[], int | None],
         rules: RuleSet | None = None,
         allow_host_execution: bool = False,
+        meter: Meter | None = None,
         **kwargs: Any,
     ) -> None:
         if kwargs.get("judge_config") is not None:
@@ -527,6 +552,8 @@ class RolloutSession(HeadlessSession):
             t["function"]["name"] for t in (own_servers.get_tools() if own_servers else [])
         )
         super().__init__(**kwargs)
+        # Counts the run's tokens and time (:mod:`turnstone.rollout.budget`).
+        self._meter = meter
         self._rules = rules
         # Every call a rule matched: which rule, what it said, whose call.
         self.rule_events: list[dict[str, Any]] = []
@@ -550,6 +577,13 @@ class RolloutSession(HeadlessSession):
 
     def _check_stable_prefix(self, wire: list[dict[str, Any]], lane: Any) -> None:
         super()._check_stable_prefix(wire, lane)
+        if self._meter is not None and self._meter.left() == 0:
+            # Nothing of the episode's token budget is left for a reply.
+            self._meter.end("token_budget")
+            raise TokenBudgetError(
+                "the episode's budget of generated tokens is used up: "
+                f"{self._meter.generated():,} generated by the session and its sub-agents"
+            )
         used = self._last_call_tokens()
         if used is None:
             return  # the first request: what the task itself asks for
@@ -704,14 +738,17 @@ class RolloutSession(HeadlessSession):
             return item
 
     def _execute_tools(self, *args: Any, **kwargs: Any) -> Any:
-        try:
-            return super()._execute_tools(*args, **kwargs)
-        finally:
-            # Let the environment finish stopping what the batch left behind,
-            # so a sandbox lost during it is known before the next model call.
-            settle = getattr(self._exec_env, "settle", None)
-            if callable(settle):
-                settle()
+        # The time of a batch of tool calls is the commands' time.
+        batch = self._meter.tool_batch() if self._meter is not None else contextlib.nullcontext()
+        with batch:
+            try:
+                return super()._execute_tools(*args, **kwargs)
+            finally:
+                # Let the environment finish stopping what the batch left behind,
+                # so a sandbox lost during it is known before the next model call.
+                settle = getattr(self._exec_env, "settle", None)
+                if callable(settle):
+                    settle()
 
     def _run_agent(self, *args: Any, **kwargs: Any) -> str:
         call = self._agent_call
@@ -850,6 +887,8 @@ MODEL_OUTCOMES = {
     "length": "a reply reached the reply limit",
     "context_full": "the conversation filled the context window",
     "timeout": "the time limit passed while the model was generating or its tools were running",
+    "token_budget": "the episode's budget of generated tokens was used up",
+    "command_time": "the time the model's commands may run was used up",
     "sandbox_destroyed": "the model ended its own sandbox from inside",
     "request_refused": (
         "the server refused a later request of the session for what the conversation held"
@@ -858,6 +897,7 @@ MODEL_OUTCOMES = {
 MACHINERY_FAILURES = {
     "error": "a request of the session failed, or the harness raised",
     "server_stalled": "the time limit passed while the model server was giving nothing",
+    "backstop": "the time limit passed with the model's budgets not used up",
     "sandbox_failed": "the sandbox could not be started",
     "sidecar_failed": "the task's sidecar could not be brought up",
     "sidecar_lost": "the task's sidecar stopped during the run",
@@ -876,6 +916,7 @@ def _finish_state(
     lost_cause: str | None,
     subagent_failed: bool,
     sidecar_lost: str | None = None,
+    cut_by_budget: bool = False,
 ) -> str:
     if lost:
         return "sandbox_destroyed" if lost_cause == "model" else "sandbox_lost"
@@ -893,13 +934,16 @@ def _finish_state(
     reason = calls[-1].get("finish_reason")
     if reason == "stop":
         return "completed"
+    if reason == "length":
+        # Cut at the reply limit, or at what the token budget had left for it.
+        return "token_budget" if cut_by_budget else "length"
     if reason == "tool_calls" and messages and not messages[-1].get("tool_calls"):
         # The server said the reply holds tool calls and handed over none: the
         # model began a call that the server's reader could make nothing of.
         # No tool ran and the turn was the last, as after any reply without a
         # call.  What a model can write must not end a run as the machinery's.
         return "completed"
-    return "length" if reason == "length" else "abnormal_reply"
+    return "abnormal_reply"
 
 
 def _ending_in_words(finish: str, task: Task, config: RolloutConfig, last: Any) -> str:
@@ -910,6 +954,11 @@ def _ending_in_words(finish: str, task: Task, config: RolloutConfig, last: Any) 
         return f"the model used all {task.max_turns} of its turns"
     if finish == "length":
         return f"the last reply reached the reply limit of {config.max_tokens:,} tokens"
+    if finish == "token_budget" and last is not None and last.token_grant is not None:
+        return (
+            f"the last reply was cut at the {last.token_grant:,} tokens the budget of "
+            "generated tokens had left"
+        )
     if finish == "abnormal_reply" and last is not None:
         return f"{MACHINERY_FAILURES[finish]} (finish reason {last.finish_reason!r})"
     return MODEL_OUTCOMES.get(finish) or MACHINERY_FAILURES[finish]
@@ -991,8 +1040,15 @@ def sampling_problems(
     return problems
 
 
-def _time_spent(recorder: RecordingClient | None, total: float, now: float) -> dict[str, Any]:
-    """Where the run's time went: waiting on the model server, and the rest."""
+def _time_spent(
+    recorder: RecordingClient | None, meter: Meter | None, since: float | None, now: float
+) -> dict[str, Any]:
+    """Where the run's time went, and how fast the server was.
+
+    Every instant from the start of the session's run is one of three: a model
+    call was under way (``model_seconds``), or else a tool call was
+    (``command_seconds``), or else neither (``harness_seconds``).
+    """
     calls = list(recorder.calls) if recorder is not None else []
 
     def spent(scope: str) -> float:
@@ -1002,13 +1058,10 @@ def _time_spent(recorder: RecordingClient | None, total: float, now: float) -> d
             if c.scope == scope and c.started_at
         )
 
-    own, side = spent(PARENT), spent(SUB_AGENT)
-    return {
-        # The session's own model calls, and its sub-agents'.
-        "model_seconds": round(own, 2),
-        "subagent_model_seconds": round(side, 2),
-        # Tools (a sub-agent's included) and the harness itself.
-        "other_seconds": round(max(total - own - side, 0.0), 2),
+    said: dict[str, Any] = {
+        # The time inside the session's own model calls, and its sub-agents'.
+        "own_model_seconds": round(spent(PARENT), 2),
+        "subagent_model_seconds": round(spent(SUB_AGENT), 2),
         # The longest any call waited for the server's next part.
         "longest_server_silence": round(
             max(
@@ -1020,18 +1073,36 @@ def _time_spent(recorder: RecordingClient | None, total: float, now: float) -> d
             2,
         ),
     }
+    if meter is not None and since is not None:
+        split = meter.split(since, now)
+        said["model_seconds"] = round(split["model"], 2)
+        said["command_seconds"] = round(split["commands"], 2)
+        said["harness_seconds"] = round(split["harness"], 2)
+        said.update(meter.work(now))
+    return said
 
 
 def _classify_timeout(
-    recorder: RecordingClient | None, cut_at: float, now: float, stall_seconds: float
+    recorder: RecordingClient | None,
+    cut_at: float,
+    now: float,
+    stall_seconds: float,
+    budgets: Budgets,
 ) -> tuple[str, dict[str, Any]]:
-    """What a run that reached its time limit was waiting on.
+    """What a run that reached its time limit was waiting on, where the time
+    limit is the model's.
 
     Both the model and the server can use up the time: the model by slow
     commands and long replies, the server by not answering.  The time limit is
     the model's budget like its turns, so reaching it is the model's outcome,
     unless at that moment a model request had had nothing from the server for
     *stall_seconds*: then the run ended on the server.
+
+    A request whose prompt the server is still working on has been silent for
+    a reason the model can lengthen: the prompt.  It counts as stalled only
+    once the silence is longer than *stall_seconds* and the time such a prompt
+    takes at the minimum prompt speed.  Otherwise a model could fill its
+    context until the limit fell into that silence.
 
     *cut_at* is when the limit passed.  A model call that was still open then,
     or was broken off from then on, is the one the run was waiting on.
@@ -1044,9 +1115,79 @@ def _classify_timeout(
     ]
     if not under_way:
         return "timeout", {"waiting_on": "tools"}
-    silence = max(min(c.ended_at or now, now) - c.last_heard_at for c in under_way)
-    detail = {"waiting_on": "model", "server_silence_seconds": round(silence, 2)}
-    return ("server_stalled" if silence >= stall_seconds else "timeout"), detail
+    speed = budgets.prompt_speed or _DEFAULT_PROMPT_SPEED
+    window = budgets.context_window
+
+    def allowed(call: Any) -> float:
+        if call.first_token_at is not None:
+            return stall_seconds
+        prompt = min(call.prompt_bytes, window) if window else call.prompt_bytes
+        return float(stall_seconds + prompt / speed)
+
+    waits = [(min(c.ended_at or now, now) - c.last_heard_at, allowed(c)) for c in under_way]
+    silence, most = max(waits, key=lambda wait: wait[0] - wait[1])
+    detail = {
+        "waiting_on": "model",
+        "server_silence_seconds": round(silence, 2),
+        "server_silence_allowed": round(most, 2),
+    }
+    return ("server_stalled" if silence >= most else "timeout"), detail
+
+
+def effective_budgets(task: Task, config: RolloutConfig) -> Budgets:
+    """The budgets *task* runs under on the server *config* names, with the
+    wall-clock limit worked out where the task leaves it open.
+
+    Raises :class:`~turnstone.rollout.settings.SetupError` for budgets that
+    cannot work.
+    """
+    assert config.context_window is not None
+    speed, prompt_speed = config.min_tokens_per_second, config.min_prompt_tokens_per_second
+    for name, value in (
+        ("max_generated_tokens", task.max_generated_tokens),
+        ("max_command_seconds", task.max_command_seconds),
+        ("min_tokens_per_second", speed),
+        ("min_prompt_tokens_per_second", prompt_speed),
+        ("timeout", task.timeout),
+    ):
+        if value is not None and value <= 0:
+            raise SetupError(f"{name} must be above zero, not {value}")
+    wall = task.timeout
+    if task.max_generated_tokens is None:
+        if wall is None:
+            raise SetupError(
+                "the task has no time limit: name one (timeout), or give the model a token "
+                "budget (max_generated_tokens) and the time limit is worked out"
+            )
+    else:
+        if speed is None:
+            raise SetupError(
+                "with a token budget the time limit is a backstop for the machinery, and a "
+                "run that reaches it is judged by the server's speed: say how many tokens "
+                "a second the server must at least generate (min_tokens_per_second)"
+            )
+        if wall is None:
+            if task.max_command_seconds is None:
+                raise SetupError(
+                    "the time limit can be worked out from the budgets only when the time "
+                    "the model's commands may run has one too (max_command_seconds)"
+                )
+            wall = backstop_seconds(
+                max_generated_tokens=task.max_generated_tokens,
+                min_tokens_per_second=speed,
+                max_command_seconds=task.max_command_seconds,
+                requests=task.max_turns + config.max_subagents,
+                context_window=config.context_window,
+                min_prompt_tokens_per_second=prompt_speed,
+            )
+    return Budgets(
+        wall_seconds=math.ceil(wall),
+        max_generated_tokens=task.max_generated_tokens,
+        max_command_seconds=task.max_command_seconds,
+        min_tokens_per_second=speed,
+        min_prompt_tokens_per_second=prompt_speed,
+        context_window=config.context_window,
+    )
 
 
 def _refused_for_the_models_part(refused: APIStatusError, recorder: RecordingClient | None) -> bool:
@@ -1068,6 +1209,54 @@ def _refused_for_the_models_part(refused: APIStatusError, recorder: RecordingCli
     if recorder is None or is_context_overflow(refused):
         return False
     return any(c.complete and not c.error and c.prompt_token_ids for c in recorder.scoped(PARENT))
+
+
+class _AbandonedError(Exception):
+    """A used-up budget ended the run and the session did not stop in time."""
+
+
+def _supervised(
+    run: Callable[[], list[dict[str, Any]]],
+    meter: Meter,
+    stop: Callable[[], None],
+) -> list[dict[str, Any]]:
+    """Run the session and watch the time its commands take.
+
+    The session works on a thread of its own.  Once its commands have run for
+    longer than they may, the run is ended as the model's outcome
+    (``command_time``): the session is told to stop, and is left behind if it
+    has not within the time a cancelled session is given.
+    """
+    box: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            box["result"] = run()
+        except BaseException as error:  # handed to the caller below
+            box["error"] = error
+
+    since = time.monotonic()
+    worker = threading.Thread(target=work, daemon=True, name="rollout-session")
+    worker.start()
+    told = False
+    while worker.is_alive():
+        worker.join(0.1)
+        now = time.monotonic()
+        if meter.ended is None and meter.over_command_time(since, now):
+            meter.end("command_time")
+        if meter.ended is not None and not told:
+            told = True
+            stop()
+        if (
+            meter.ended_at is not None
+            and now - meter.ended_at > _CANCEL_SECONDS
+            and worker.is_alive()
+        ):
+            raise _AbandonedError(meter.ended)
+    if "error" in box:
+        raise box["error"]
+    result: list[dict[str, Any]] = box["result"]
+    return result
 
 
 def _build_record(
@@ -1137,6 +1326,13 @@ def _build_record(
         getattr(sandbox, "lost_cause", None),
         bool(failures),
         sidecar_lost,
+        # The last reply was cut at what the token budget had left for it.
+        cut_by_budget=bool(
+            last is not None
+            and last.token_grant_cut
+            and last.token_grant is not None
+            and len(last.token_ids) >= last.token_grant
+        ),
     )
     # What makes a record untrainable is never something the model chose: the
     # token data above, and the machinery failing.
@@ -1178,6 +1374,8 @@ def _build_record(
     if not trainable:
         log.error("rollout.not_trainable", key=task.key, problems=problems)
     total = now - state["t0"]
+    meter: Meter | None = state.get("meter")
+    budgets: Budgets | None = state.get("budgets")
     limits: dict[str, Limit] = state.get("limits") or {}
     sampling: dict[str, Setting] = state.get("sampling") or {}
     record: dict[str, Any] = {
@@ -1209,7 +1407,21 @@ def _build_record(
         # The whole of it, of which bringing the sandbox up took this much.
         "seconds": round(total, 2),
         "startup_seconds": state.get("startup_seconds"),
-        "time": _time_spent(recorder, total, now),
+        "time": _time_spent(recorder, meter, state.get("run_started"), now),
+        # The budgets the run was under, whose the time limit was, and what
+        # was spent of each.
+        "budgets": None
+        if budgets is None
+        else {
+            **budgets.describe(),
+            "generated_tokens": meter.generated() if meter is not None else 0,
+            "command_seconds": round(
+                meter.command_seconds(state["run_started"], now)
+                if meter is not None and state.get("run_started") is not None
+                else 0.0,
+                2,
+            ),
+        },
         "turns": len(accepted),
         # The length of the rollout for any length rule: what the session itself
         # generated.  Sub-agent tokens are under ``subagents`` and never added in.
@@ -1539,7 +1751,12 @@ def run_episode(
     assert config.max_tokens is not None and config.tool_timeout is not None
     assert config.context_window is not None and config.subagent_max_turns is not None
     assert config.max_output_chars is not None
-    state: dict[str, Any] = {"limits": limits, "sampling": sampling}
+    budgets = effective_budgets(task, config)
+    state: dict[str, Any] = {"limits": limits, "sampling": sampling, "budgets": budgets}
+    # Counts the run's tokens and time; the recording client asks it before
+    # every request.
+    meter = Meter(budgets, lambda: list(state["recorder"].calls) if "recorder" in state else [])
+    state["meter"] = meter
     state["logprobs"] = _logprob_verdict(config)
     state["rules"] = _resolve_rules(config)
     state["t0"] = time.monotonic()
@@ -1557,10 +1774,10 @@ def run_episode(
         inner = OpenAI(
             base_url=config.base_url,
             api_key=config.api_key,
-            timeout=float(task.timeout),
+            timeout=float(budgets.wall_seconds),
             http_client=shutdown_on_close(DefaultHttpxClient()),
         )
-        state["recorder"] = RecordingClient(inner, extra_body=config.extra_body)
+        state["recorder"] = RecordingClient(inner, extra_body=config.extra_body, gate=meter)
         return state["recorder"]
 
     try:
@@ -1621,17 +1838,30 @@ def run_episode(
                     last_call_tokens=last_call_tokens,
                     rules=state["rules"],
                     allow_host_execution=allow_host_execution,
+                    meter=meter,
                 )
                 state["session"] = session
                 # A sandbox that is gone ends the run at the next turn: nothing
                 # the model asks for could be done.
                 sandbox.notify_lost(session._cancelled.set)
 
-                def drive() -> list[dict[str, Any]]:
+                def run() -> list[dict[str, Any]]:
                     try:
                         return session.send_headless(task.prompt, max_turns=task.max_turns)
                     finally:
                         worker_done.set()
+
+                def stop() -> None:
+                    # A budget of the model's is used up: nothing more is asked
+                    # of it, and what it has running is ended.
+                    session._cancelled.set()
+                    with contextlib.suppress(Exception):
+                        session.cancel()
+
+                def drive() -> list[dict[str, Any]]:
+                    if budgets.max_command_seconds is None:
+                        return run()
+                    return _supervised(run, meter, stop)
 
                 return session, drive
 
@@ -1639,50 +1869,75 @@ def run_episode(
                 state["snapshot"] = _snapshot(session)
                 return {}
 
-            # The task's limit is the model's time: it starts now, with the
-            # sandbox up.
-            remaining = math.ceil(task.timeout)
+            # The time limit starts now, with the sandbox up: the model's time,
+            # or with a token budget the machinery's backstop.
+            remaining = budgets.wall_seconds
             _keep(sandbox, remaining + _KEEP_MARGIN)
-            if remaining >= 1:
-                # The earliest moment the time limit can end the run.
-                cut_at = time.monotonic() + remaining - 0.25
-                try:
-                    run_with_lifecycle(
-                        workdir_prefix="turnstone_rollout_",
-                        setup=setup,
-                        build_client=build_client,
-                        build_session=build_session,
-                        finish=finish,
-                        test_timeout=remaining,
-                        teardown_reset=reset_storage,
-                        on_cwd_restore_failed=lambda _cwd: None,
-                        attempts=1,
-                    )
-                except TimeoutError:
+            state["run_started"] = time.monotonic()
+            # The earliest moment the time limit can end the run.
+            cut_at = state["run_started"] + remaining - 0.25
+
+            def leave_behind() -> None:
+                # The session is left to itself.  Stop what it is doing, so
+                # that nothing of the model's is still acting while the record
+                # is read.
+                session = state.get("session")
+                if session is not None:
+                    with contextlib.suppress(Exception):
+                        session.cancel()
+                    state["worker_stopped"] = worker_done.wait(_CANCEL_SECONDS)
+
+            try:
+                run_with_lifecycle(
+                    workdir_prefix="turnstone_rollout_",
+                    setup=setup,
+                    build_client=build_client,
+                    build_session=build_session,
+                    finish=finish,
+                    test_timeout=remaining,
+                    teardown_reset=reset_storage,
+                    on_cwd_restore_failed=lambda _cwd: None,
+                    attempts=1,
+                )
+            except TimeoutError:
+                now = time.monotonic()
+                if meter.ended is not None:
+                    # A budget of the model's had run out; the session had not
+                    # stopped yet.
+                    forced = meter.ended
+                elif budgets.backstop:
+                    forced, state["timeout"] = meter.at_the_backstop(state["run_started"], now)
+                else:
                     forced, state["timeout"] = _classify_timeout(
-                        state.get("recorder"), cut_at, time.monotonic(), config.server_stall_seconds
+                        state.get("recorder"), cut_at, now, config.server_stall_seconds, budgets
                     )
-                    error = f"the rollout did not finish within {task.timeout} s"
-                    # The lifecycle leaves a timed-out session to itself.  Stop
-                    # what it is doing, so that nothing of the model's is still
-                    # acting while the record is read.
-                    session = state.get("session")
-                    if session is not None:
-                        with contextlib.suppress(Exception):
-                            session.cancel()
-                        state["worker_stopped"] = worker_done.wait(10.0)
-                except ContextFullError as full:
-                    forced, error = "context_full", str(full)
-                except Exception as run_error:
-                    refused = _refusal(run_error)
-                    if refused is not None and _refused_for_the_models_part(
-                        refused, state.get("recorder")
-                    ):
-                        forced = "request_refused"
-                        error = _refused_text("the session's", refused)
-                    else:
-                        forced = "error"
-                        error = f"{type(run_error).__name__}: {str(run_error)[:500]}"
+                error = f"the rollout did not finish within {remaining} s"
+                leave_behind()
+            except ContextFullError as full:
+                forced, error = "context_full", str(full)
+            except TokenBudgetError as spent:
+                forced, error = "token_budget", str(spent)
+            except _AbandonedError:
+                forced = meter.ended
+                leave_behind()
+            except Exception as run_error:
+                refused = _refusal(run_error)
+                if meter.ended is not None:
+                    # What the session raised when it was stopped.
+                    forced = meter.ended
+                elif refused is not None and _refused_for_the_models_part(
+                    refused, state.get("recorder")
+                ):
+                    forced = "request_refused"
+                    error = _refused_text("the session's", refused)
+                else:
+                    forced = "error"
+                    error = f"{type(run_error).__name__}: {str(run_error)[:500]}"
+            else:
+                # Stopped by a used-up budget, the session ended in an orderly way.
+                forced = meter.ended
+            if forced in ("token_budget", "command_time") and error is None:
+                error = MODEL_OUTCOMES[forced]
         record = _build_record(task, config, state, sandbox, forced_state=forced, error=error)
         record["verification"] = _verify(task, sandbox, record, verifier, verifier_timeout)
         if (
@@ -1712,7 +1967,8 @@ def run_episode(
     record["teardown_seconds"] = round(time.monotonic() - teardown_started, 2)
     if state.get("worker_stopped") is False:
         record["warnings"].append(
-            "the session was still working 10 s after the time limit; removing the sandbox ends it"
+            "the session was still working 10 s after it was told to stop; removing the "
+            "sandbox ends it"
         )
     if not removed:
         record["warnings"].append("the sandbox could not be confirmed removed")

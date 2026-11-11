@@ -67,7 +67,35 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpus", type=float, default=ContainerSpec.cpus)
     parser.add_argument("--max-turns", type=int, default=Task.max_turns)
     parser.add_argument(
-        "--timeout", type=int, default=Task.timeout, help="limit for the whole rollout, seconds"
+        "--timeout",
+        type=int,
+        default=None,
+        help="time limit for the session's run, seconds (default: 300; with a token budget "
+        "it is a backstop for the machinery and, left out, worked out from the budgets)",
+    )
+    parser.add_argument(
+        "--max-generated-tokens",
+        type=int,
+        default=None,
+        help="the model's budget of generated tokens, its sub-agents' included",
+    )
+    parser.add_argument(
+        "--max-command-seconds",
+        type=float,
+        default=None,
+        help="the model's budget of time its commands may run",
+    )
+    parser.add_argument(
+        "--min-tokens-per-second",
+        type=float,
+        default=None,
+        help="tokens a second the server must at least generate (needed with a token budget)",
+    )
+    parser.add_argument(
+        "--min-prompt-tokens-per-second",
+        type=float,
+        default=None,
+        help="tokens a second the server must at least process of a prompt",
     )
     parser.add_argument(
         "--tool-timeout",
@@ -162,7 +190,12 @@ def main(argv: list[str] | None = None) -> int:
         system_prompt=args.system_prompt,
         setup_files=files,
         max_turns=args.max_turns,
-        timeout=args.timeout,
+        # Without a token budget the time limit is the model's and has a default.
+        timeout=args.timeout
+        if args.timeout is not None or args.max_generated_tokens is not None
+        else 300,
+        max_generated_tokens=args.max_generated_tokens,
+        max_command_seconds=args.max_command_seconds,
         container=ContainerSpec(
             image=args.image,
             workdir=args.workdir,
@@ -188,6 +221,8 @@ def main(argv: list[str] | None = None) -> int:
         extra_body=extra_body,
         sampler_logprobs={"probe": None, "yes": True, "no": False}[args.sampler_logprobs],
         rules=None if args.rules == "none" else args.rules,
+        min_tokens_per_second=args.min_tokens_per_second,
+        min_prompt_tokens_per_second=args.min_prompt_tokens_per_second,
     )
     try:
         record = run_episode(task, config)
@@ -210,6 +245,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     for name, limit in record["limits"].items():
         print(f"  limit {name}: {limit['value']} ({limit['source']})")
+    print("budgets:", json.dumps(record["budgets"]))
+    if record["timeout"]:
+        print("at the time limit:", json.dumps(record["timeout"]))
     print("sampling:", json.dumps(record["sampling"]["requested"]))
     for name, source in record["sampling"]["sources"].items():
         print(f"  setting {name}: {json.dumps(record['sampling'][name])} ({source})")

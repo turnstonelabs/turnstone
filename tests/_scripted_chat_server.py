@@ -174,6 +174,9 @@ class ScriptedChatServer:
         reflects: tuple[str, ...] | None = None,
         agent_script: list[dict[str, Any]] | None = None,
         agent_marker: str = "# Task Agent",
+        keep_reply_limit: bool = False,
+        chunk_delay: float = 0.0,
+        prompt_tokens_per_second: float | None = None,
         first_position_only: bool = False,
     ) -> None:
         self.script = script
@@ -181,6 +184,13 @@ class ScriptedChatServer:
         # generated position and the model's own from there on, as one that
         # takes later tokens of a step from another head might report them.
         self.first_position_only = first_position_only
+        # A server that cuts a reply at the request's reply limit, with the
+        # finish reason for that; without it a scripted reply goes out whole.
+        self.keep_reply_limit = keep_reply_limit
+        # Seconds before each part of a streamed reply: a server that generates slowly.
+        self.chunk_delay = chunk_delay
+        # A server that takes time over a prompt in proportion to its length.
+        self.prompt_tokens_per_second = prompt_tokens_per_second
         # A second conversation: requests whose first message holds
         # ``agent_marker`` (a sub-agent's system prompt) are answered from here.
         self.agent_script = agent_script
@@ -358,6 +368,8 @@ class ScriptedChatServer:
         ):
             messages[0]["content"] = _text_of(messages[0].get("content")) + " (edited)"
         prompt_ids = render_prompt(messages, body.get("tools"))
+        if self.prompt_tokens_per_second:
+            time.sleep(len(prompt_ids) / self.prompt_tokens_per_second)
         top_p = body.get("top_p")
         self._request.certain = ("top_k" in self.reflects and body.get("top_k") == 1) or (
             "top_p" in self.reflects and isinstance(top_p, (int, float)) and top_p <= 0.01
@@ -380,6 +392,10 @@ class ScriptedChatServer:
         ]
         finish = step.get("finish_reason") or ("tool_calls" if calls else "stop")
         pieces = self._pieces(step, calls, finish, call_index)
+        limit = body.get("max_completion_tokens", body.get("max_tokens"))
+        if self.keep_reply_limit and isinstance(limit, int):
+            pieces, cut = self._cut(pieces, limit)
+            finish = "length" if cut else finish
         completion_tokens = sum(len(ids) for ids, _delta in pieces)
         usage = {
             "prompt_tokens": len(prompt_ids),
@@ -466,6 +482,23 @@ class ScriptedChatServer:
             pieces.append(([END], {}))
         return pieces
 
+    @staticmethod
+    def _cut(
+        pieces: list[tuple[list[int], dict[str, Any]]], limit: int
+    ) -> tuple[list[tuple[list[int], dict[str, Any]]], bool]:
+        """*pieces* up to *limit* tokens, and whether anything was left out."""
+        kept: list[tuple[list[int], dict[str, Any]]] = []
+        room = limit
+        for ids, delta in pieces:
+            if len(ids) > room:
+                if room > 0:
+                    # Part of a group: its tokens, without the text they belong to.
+                    kept.append((ids[:room], {}))
+                return kept, True
+            kept.append((ids, delta))
+            room -= len(ids)
+        return kept, False
+
     def _logprob_entries(self, ids: list[int], offset: int) -> list[dict[str, Any]]:
         entries = []
         temperature = getattr(self._request, "temperature", 1.0) or 1.0
@@ -543,6 +576,8 @@ class ScriptedChatServer:
         send(first)
         offset = 0
         for number, (ids, delta) in enumerate(pieces):
+            if self.chunk_delay:
+                time.sleep(self.chunk_delay)
             last = number == len(pieces) - 1
             payload = chunk(delta, finish if last else None)
             # A fault spoils the second group of tokens of the reply.

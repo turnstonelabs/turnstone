@@ -37,7 +37,7 @@ its token data cannot be trained on.
 
 A configuration that cannot work is refused before anything runs, with a
 message and exit status 1: a context window that nothing names (name it with
-`--context-window`).
+`--context-window`), or budgets that do not fit together.
 
 From Python:
 
@@ -152,9 +152,10 @@ from (`sampling`), and beside it what the requests themselves carried
 
 ### The rollout's own limits
 
-Three limits are the rollout's own, because they are the task's: the number of
-turns (`Task.max_turns`, 15), the time (`Task.timeout`, 300 s) and the number
-of sub-agents (`RolloutConfig.max_subagents`, 16).
+These are the rollout's own, because they are the task's: the number of turns
+(`Task.max_turns`, 15), the time (`Task.timeout`, 300 s), the number of
+sub-agents (`RolloutConfig.max_subagents`, 16), and the
+[budgets](#budgets-of-the-models-own) a task may give the model.
 
 `Task.timeout` bounds the session run, sub-agents included, to the next whole
 second. It starts when the sandbox is up: bringing it up, a sidecar's setup
@@ -164,6 +165,77 @@ the run has time limits of its own, and removing a container takes up to 60
 seconds for the removal and 30 to confirm it, which the record reports apart
 (`teardown_seconds`). At the limit the session is cancelled and given ten
 seconds to stop.
+
+### Budgets of the model's own
+
+A time limit can be used up by both sides: by the model, with long replies and
+slow commands, and by the server, by being slow. With the time limit as the
+only limit the two cannot be told apart, so a slow server ends rollouts as the
+model's own `timeout`, and under load that falls on the long episodes.
+
+A task can therefore give the model budgets in units the server's speed does
+not change:
+
+| Budget | What it counts | Running out |
+|--------|----------------|-------------|
+| `Task.max_generated_tokens`, `--max-generated-tokens` | The tokens the session and its sub-agents generate, together | `finish_state: token_budget`, the model's outcome |
+| `Task.max_command_seconds`, `--max-command-seconds` | The time the model's tool calls run while no model call is under way | `finish_state: command_time`, the model's outcome |
+
+**The token budget** is kept before every request. The request's reply limit is
+cut to what is left, counting what requests still under way may yet generate,
+so sub-agents running side by side cannot overshoot together. A reply of the
+session that is cut at what was left ends the rollout as `token_budget`, where
+a reply cut at the reply limit ends it as `length`. With nothing left the
+session's next request is not made. A sub-agent whose request finds nothing
+left fails, and the model gets that as an ordinary failed tool result; a
+sub-agent's reply that was cut is an ordinary result too.
+
+**The command time** is watched while the session runs. Every instant of a run
+is one of three things, in this order: a model call is under way, the
+session's or a sub-agent's (the server's time), or else a batch of the
+session's tool calls is (the commands' time), or else neither (the harness's
+own). So the time a sub-agent spends in its model calls is the server's, and
+the time its commands take is the commands'. Once the commands' time is used
+up the session is told to stop, what it has running is ended, and it is given
+ten seconds.
+
+**The time limit becomes a backstop for the machinery.** With a token budget a
+run that reaches `Task.timeout` was held up by the server or the harness, or
+asked the server for more work than the budgets count: the work on prompts,
+which is in neither budget. Which of the two it was is measured:
+
+- `RolloutConfig.min_tokens_per_second` (`--min-tokens-per-second`) is the
+  speed the server must at least generate at. A token budget needs it; without
+  it the rollout is refused.
+- `RolloutConfig.min_prompt_tokens_per_second`
+  (`--min-prompt-tokens-per-second`) is the speed it must at least process
+  prompts at; left out, a hundred times the generation speed.
+
+At the limit the server's time is compared with what it would take at those
+speeds to process the prompt tokens it was sent and generate the tokens it
+produced, with one second per request on top. A server that took longer was
+too slow: the rollout ends as `backstop`, the machinery's failure, not
+trainable. So does one in which the harness's own time passed 30 seconds plus
+one second for every model call and every batch of tool calls. A server that
+kept its minimum speed did what it was asked in the time that takes, and what
+was asked is the model's doing: the rollout ends as the model's `timeout`.
+
+`Task.timeout=None` (the command's `--timeout` left out) works the backstop out
+from the budgets, for a task that also names `max_command_seconds`: the time
+to generate the whole token budget at the minimum speed, the whole command
+time, the time to process one prompt as long as the context window for every
+turn and every sub-agent the task may have, and a margin of a minute and a
+half. A server at its minimum speed does not reach it before the budgets are
+used up unless the model sends more long prompts than that, which is then its
+own `timeout`.
+
+Without a token budget nothing changes: the time limit is the model's, and
+[how a rollout ends](#how-a-rollout-ends) says when reaching it is the
+server's doing instead.
+
+The record holds the budgets, whose the time limit was and what was spent
+(`budgets`), where every second went and how fast the server was (`time`), and
+at the time limit what decided (`timeout`).
 
 ---
 
@@ -231,10 +303,13 @@ penalised for it.
 | `max_turns` | The model used all its turns | model | yes |
 | `length` | A reply reached the reply limit; the rollout ends there | model | yes |
 | `context_full` | The conversation filled the context window; the run ends before a request that could not fit | model | yes |
-| `timeout` | The time limit passed while the model was generating or one of its commands was running | model | yes |
+| `timeout` | The time limit passed while the model was generating or one of its commands was running; with a token budget, although the server kept its minimum speed | model | yes |
+| `token_budget` | The budget of generated tokens was used up | model | yes |
+| `command_time` | The time the model's commands may run was used up | model | yes |
 | `sandbox_destroyed` | The model ended its own container from inside, where the task's settings let its commands do that (see [the main process](#the-main-process)), or a writable root outgrew its size or could no longer be measured (see [what bounds writes](#what-bounds-writes)) | model | yes |
 | `request_refused` | After a request of the session had been answered: the server refused a later one for what the conversation held (HTTP status 400 or 422); see [a conversation the server refuses](#a-conversation-the-server-refuses) | model | yes |
-| `server_stalled` | The time limit passed while a model request had had nothing from the server for `server_stall_seconds` | machinery | no |
+| `server_stalled` | Without a token budget: the time limit passed while a model request had had nothing from the server for longer than it is allowed | machinery | no |
+| `backstop` | With a token budget: the time limit passed and the server was slower than its minimum speed, or the harness itself took the time | machinery | no |
 | `error` | A request of the session failed (after the client's own retries; the first request refused by the server, and a prompt the server finds too long, included), or the harness raised (a stable-prefix error included) | machinery | no |
 | `sandbox_failed` | The container could not be started | machinery | no |
 | `sandbox_lost` | The container stopped and nothing the model could do explains it, or the runtime stopped answering | machinery | no |
@@ -252,14 +327,19 @@ token is at least one byte), with room for a whole reply. It ends a run a
 little early, never on the server's refusal of a prompt that is too long.
 
 The time limit can be used up by both sides: by the model, with slow commands
-and long replies, and by the server, by not answering. It is the model's budget
-like its turns, so reaching it is the model's outcome, with one exception that
-can be measured: a model request that had had nothing from the server for
-`server_stall_seconds` (60 by default) when the limit passed. The record says
-what the run was waiting on (`timeout`) and where the time went (`time`: the
-session's model calls, its sub-agents' model calls, everything else, and the
-longest the server was silent), so a trainer can apply a stricter rule of its
-own.
+and long replies, and by the server, by not answering. Without a token budget
+it is the model's budget like its turns, so reaching it is the model's outcome,
+with one exception that can be measured: a model request that had had nothing
+from the server for `server_stall_seconds` (60 by default) when the limit
+passed. A request the server has not yet answered with a first token is
+allowed more: the time its prompt takes at the minimum prompt speed (1000
+tokens a second where none is configured), since the length of a prompt is the
+model's doing and a model could otherwise fill its context until the limit fell
+into that silence. With a token budget the time limit is a backstop and the
+verdict is by the server's speed; see
+[budgets of the model's own](#budgets-of-the-models-own). Either way the record
+says what the run was waiting on (`timeout`) and where the time went (`time`),
+so a trainer can apply a stricter rule of its own.
 
 Besides the endings, these also leave a record trainable, because the model can
 cause them: a tool call the session refuses or that fails, malformed arguments
@@ -937,13 +1017,14 @@ environment. The sub-agent's own conversation is not part of the sample.
 | The parent's prompt | Unchanged by starting one: the system prompt and tool list are fixed for the run |
 | Its model calls | Kept out of the token record and the prefix check. The side record under `subagents` is marked `not_for_training` and `token_data_kept: false`: it holds counts and a summary per call, no token IDs or log-probabilities, and none of the checks behind `trainable` is made on them |
 | Its time | Counts toward the task's time limit |
-| Limits | `max_subagents` per rollout (a call past it gets a result that says no sub-agent was started), the framework's turn limit for each (`subagent_max_turns`), and the framework's reply limit for each of its model calls |
+| Limits | `max_subagents` per rollout (a call past it gets a result that says no sub-agent was started), the framework's turn limit for each (`subagent_max_turns`), the framework's reply limit for each of its model calls, and the task's token budget, which its tokens count toward |
 | The rollout's length | `generated_tokens` counts what the session itself generated; sub-agent tokens are under `subagents` and never added in |
 
 What bounds the work sub-agents can do is therefore the number of sub-agents
-times the turn limit times the reply limit, and the task's time limit. With the
-framework's default of no turn limit, the time limit is the bound. The tokens
-sub-agents generate are counted in the record (a measurement, not a limit).
+times the turn limit times the reply limit, the task's time limit, and the
+task's token budget where it has one. With the framework's default of no turn
+limit and no token budget, the time limit is the bound. The tokens sub-agents
+generate are counted in the record.
 
 A sub-agent is not offered the tools of the task's own servers. Those act on
 the task's state, which is what the rollout is scored on. Called by the
@@ -953,11 +1034,12 @@ sub-agent's calls are in neither, so it would act on that state unseen.
 A sub-agent that does its task badly is an ordinary result: the model delegated
 and has to deal with what came back. That includes one whose model returns
 nothing, one that fills its own context window, one that reaches its turn limit,
-and a call refused at the sub-agent limit. None of these makes the record
-untrainable; they are the model's doing. It is the same when a sub-agent had
-already written some text before its model returned nothing or its context was
-full: the kind of failure is read from the whole chain of causes, not from the
-wrapper the session puts around it.
+one that asks for more when the task's token budget is used up, and a call
+refused at the sub-agent limit. None of these makes the record untrainable;
+they are the model's doing. It is the same when a sub-agent had already written
+some text before its model returned nothing or its context was full: the kind
+of failure is read from the whole chain of causes, not from the wrapper the
+session puts around it.
 
 A sub-agent whose conversation the server refuses is an ordinary result as
 well ([above](#a-conversation-the-server-refuses)). Its first message is the
@@ -978,7 +1060,7 @@ subagent_failed`) and is not trainable; `subagents.failures` says what
 happened, and `problems` repeats it.
 
 That holds for what goes wrong while the run is under way. Once the session
-has been told to stop (the time limit passed, the sandbox
+has been told to stop (the time limit passed, a budget ran out, the sandbox
 went away), what fails around a sub-agent follows from the stop: at the time
 limit the session's client is closed, and a sub-agent's model call under way
 dies with it. Such a failure is not counted, and the ending stays what the
@@ -1238,7 +1320,7 @@ whose value does not apply is `null`.
 | Key | Value |
 |-----|-------|
 | `key` | `Task.key` |
-| `task` | The task as it was given: `prompt`, `key`, `system_prompt`, `setup_files`, `files`, `max_turns`, `timeout`, `container` (the `ContainerSpec`), `after_run`, `sidecar`. Content held as bytes is replaced by `{"bytes": N}` |
+| `task` | The task as it was given: `prompt`, `key`, `system_prompt`, `setup_files`, `files`, `max_turns`, `timeout`, `max_generated_tokens`, `max_command_seconds`, `container` (the `ContainerSpec`), `after_run`, `sidecar`. Content held as bytes is replaced by `{"bytes": N}` |
 | `model`, `endpoint` | The model's name and the API root the requests went to |
 | `finish_state`, `finish_cause` | How the rollout ended, and whether that is the model's outcome (`model`) or a failure of the server, the harness or the runtime (`machinery`); see [how a rollout ends](#how-a-rollout-ends) |
 | `error` | `null` where the model ended its turn by itself (`completed`). For every other ending, what happened, in words: the limit that was reached and where the last reply was cut, the request that failed or was refused, why the sandbox is gone or did not start, a sub-agent's failure |
@@ -1264,6 +1346,7 @@ whose value does not apply is `null`.
 | `timeout` | `null` unless the time limit was reached; then what the run was waiting on, below |
 | `seconds`, `startup_seconds`, `teardown_seconds` | The time from the start of the sandbox to the end of the run; of that, the time bringing the sandbox up took; and the time removing it took, which comes on top |
 | `time` | Where the time went, below |
+| `budgets` | The budgets the run was under and what was spent, below |
 | `subagents` | The side record of sub-agent calls, below |
 | `sandbox` | The container, below |
 | `acts_on_host` | Whether the tools acted on the machine the rollout ran on instead of in a sandbox (see [where the tools act](#where-the-tools-act)) |
@@ -1300,17 +1383,35 @@ from 0, as `tool_log[].turn` does:
 
 | Key | Value |
 |-----|-------|
-| `model_seconds` | The time inside the session's own model calls |
-| `subagent_model_seconds` | The time inside its sub-agents' model calls |
-| `other_seconds` | Everything else: tools, a sub-agent's included, and the harness |
+| `own_model_seconds`, `subagent_model_seconds` | The time inside the session's own model calls, and inside its sub-agents' (sub-agents' calls side by side are added up) |
 | `longest_server_silence` | The longest any call waited for the server's next part |
+| `model_seconds`, `command_seconds`, `harness_seconds` | The session's run, split three ways: a model call was under way (the session's or a sub-agent's); else a batch of tool calls was; else neither |
+| `model_calls`, `prompt_tokens`, `generated_tokens` | What the server was asked to do, sub-agents included. A request that never went out is not among it: one the token budget refused, one whose prompt could not be sent, and what the session tried after the time limit, when its client was closed. Such a request still has its entry in `discarded_calls` or `subagents.calls` |
+| `prompt_seconds`, `generation_seconds` | The time up to each call's first token, and from there to its end, over the calls that got as far as a first token |
+| `generation_tokens_per_second`, `prompt_tokens_per_second` | The server's measured speeds over those calls; `null` where nothing was measured |
+
+Where the sandbox did not start, only the first three keys are there.
 
 `timeout`, at the time limit:
 
 | Key | Value |
 |-----|-------|
-| `waiting_on` | `tools`: no model call was under way. `model`: one was |
-| `server_silence_seconds` | With `model`: how long that call had had nothing from the server |
+| `waiting_on` | `tools`: no model call was under way. `model`: one was, or with a token budget the server's time decided. `harness`: with a token budget, the harness's own time decided |
+| `server_silence_seconds`, `server_silence_allowed` | Without a token budget and with `model`: how long the call had had nothing from the server, and how long it was allowed |
+| `model_seconds`, `model_seconds_at_minimum_speed` | With a token budget: the server's time, and what its work takes at the minimum speeds |
+| `harness_seconds`, `harness_seconds_allowed` | With a token budget: the harness's own time, and its allowance |
+| `cause` | With a token budget: the verdict in words |
+
+`budgets`:
+
+| Key | Value |
+|-----|-------|
+| `wall_seconds` | The time limit in force, given or worked out |
+| `wall_clock` | `"the model's time"` without a token budget, `"backstop for the machinery"` with one |
+| `max_generated_tokens`, `max_command_seconds` | The task's budgets, `null` where it has none |
+| `min_tokens_per_second`, `min_prompt_tokens_per_second` | The minimum speeds in force; the second is the configured one or the one worked out from the first |
+| `generated_tokens` | Tokens generated, by the session and its sub-agents |
+| `command_seconds` | The time the model's commands ran |
 
 `subagents`:
 
@@ -1321,7 +1422,7 @@ from 0, as `tool_log[].turn` does:
 | `started`, `refused_at_limit` | Sub-agents started, and calls refused at `max_subagents` |
 | `failures` | Every delegation that came back failed for another reason than the sub-agent's work, in words and in order. An entry that begins `the model server refused the sub-agent's conversation` is a refusal by the server: the model's doing, handed to it as a failed tool result. Every other entry is a failure of the machinery, which ended the run as `subagent_failed` |
 | `refused_by_server` | How many of `failures` are conversations the server refused |
-| `model_calls`, `prompt_tokens`, `generated_tokens` | Totals over the sub-agents' model calls |
+| `model_calls`, `prompt_tokens`, `generated_tokens` | Totals over the sub-agents' model calls. `model_calls` counts the entries of `calls`, among them a request that never went out (one the token budget refused, which says so in its `error`); `time.model_calls` leaves such a request out |
 | `calls` | One summary per call: `index`, `scope`, `complete`, `finish_reason`, `error`, `prompt_tokens`, `generated_tokens`, `seconds` |
 | `text` | With `keep_text` only: each call's generated text |
 
@@ -1428,6 +1529,28 @@ What a user of the harness has to know, in one place:
   `still_running` is empty.
 - **The rules can be written around**, and their patterns look a bounded
   distance; see [rules on tool calls](#rules-on-tool-calls).
+- **The backstop's verdict is as good as the minimum speeds.** Set them from
+  the server as it is under the load of a batch: a minimum above what the
+  server keeps marks long runs as `backstop` and loses them to training, one
+  far below it scores a slow server's time as the model's `timeout`. The
+  record's `time` holds the measured speeds. A prompt the server has not
+  counted yet is taken at its size in bytes, which is more tokens than it has.
+  And the backstop worked out from the budgets assumes one long prompt per turn
+  and per sub-agent; a model that sends more reaches it as its own `timeout`.
+- **The command budget counts what the session waits for.**
+  `max_command_seconds` counts the time in which a batch of the session's tool
+  calls runs and no model call is under way. What the model leaves running
+  across its model calls (a background shell, a process it detached) works on
+  uncharged while the model generates, and a sub-agent's commands that run
+  while another sub-agent's model call is under way are booked as the server's
+  time. The container's processor limit, the token budget and the time limit
+  still bound it.
+- **A minimum speed measured on short prompts is too high for a long context.**
+  A server generates more slowly, and takes longer over each token of a
+  prompt, the fuller the context is. With a token budget, a model that fills
+  its context can bring a long run under minimum speeds that were measured on
+  short prompts, and the run then ends as `backstop`, lost to training. Measure
+  them with contexts as long as the window lets a run become.
 - **A background shell's exit is not announced** to the model in a headless
   run.
 - **The probe needs a token the model is unsure of.** It looks among the
