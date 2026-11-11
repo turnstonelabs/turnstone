@@ -188,6 +188,15 @@ def _gone(record: dict[str, Any], made: list[str]) -> None:
         assert listed.stdout.strip() == ""
 
 
+# The same ledger, where a posting is answered only once two are under way at
+# the same time; each of the two gets a number of its own.
+MEETING_SERVER = SERVER.replace(
+    "TOOLS = [", "import threading" + NL + "MEETING = threading.Barrier(2)" + NL + "TOOLS = [", 1
+).replace(
+    'return "posted " + str(amount)',
+    'return "posted " + str(amount) + " as number " + str(MEETING.wait(timeout=20))',
+)
+
 # The same ledger as a server that keeps its connections open, as most do,
 # and notes the headers of every request it is sent.
 KEEPING_SERVER = SERVER.replace(
@@ -324,29 +333,70 @@ class TestARolloutWithASidecar:
         assert record["trainable"] is True
         _gone(record, containers_made)
 
-    def test_a_sub_agent_is_not_offered_the_sidecars_tools(self, containers_made):
-        """A sub-agent's conversation is neither logged nor trained on.  The task's
-        own servers are the session's to call, so that nothing acts on the task's
-        state unseen."""
-        parent = [
-            {"tool_calls": [{"name": "task_agent", "arguments": {"prompt": "post 5"}}]},
-            {"tool_calls": [POST]},
-            {"content": "posted"},
-        ]
-        agent = [
-            {"tool_calls": [{"name": "mcp__ledger__post_entry", "arguments": {"amount": 5}}]},
-            {"content": "could not"},
-        ]
+    DELEGATING: list[dict[str, Any]] = [
+        {"tool_calls": [{"name": "task_agent", "arguments": {"prompt": "post 5"}}]},
+        {"tool_calls": [POST]},
+        {"content": "posted"},
+    ]
+    POSTING_AGENT: list[dict[str, Any]] = [
+        {"tool_calls": [{"name": "mcp__ledger__post_entry", "arguments": {"amount": 5}}]},
+        {"content": "posted 5"},
+    ]
 
-        def read_the_ledger(context: VerificationContext) -> dict[str, Any]:
-            ledger = export_paths(context.sidecar_name or "", ["/state/ledger.txt"])
-            return {"verdict": "pass", "ledger": ledger.files()["/state/ledger.txt"].decode()}
+    @staticmethod
+    def _read_the_ledger(context: VerificationContext) -> dict[str, Any]:
+        ledger = export_paths(context.sidecar_name or "", ["/state/ledger.txt"])
+        return {"verdict": "pass", "ledger": ledger.files()["/state/ledger.txt"].decode()}
 
-        with ScriptedChatServer(parent, agent_script=agent) as server:
+    def test_a_sub_agent_is_offered_the_sidecars_tools_and_its_calls_are_in_the_record(
+        self, containers_made
+    ):
+        """A task's systems can be reached only as these tools, so a sub-agent is
+        offered them as the session is.  What it does with them acts on the task's
+        state, is in the record apart from the session's own calls, and the check
+        after the run sees the state it left."""
+        with ScriptedChatServer(self.DELEGATING, agent_script=self.POSTING_AGENT) as server:
             record = run_episode(
                 _task(),
                 RolloutConfig(base_url=server.base_url, model="scripted", **SMALL),
-                verifier=read_the_ledger,
+                verifier=self._read_the_ledger,
+            )
+            first_agent, _second_agent = server.agent_requests
+            first_parent = server.parent_requests[0]
+
+        assert record["finish_state"] == "completed", record["error"]
+        # The session and its sub-agent are both offered the sidecar's tools.
+        sidecars = {"mcp__ledger__post_entry", "mcp__ledger__where"}
+        assert sidecars <= {t["function"]["name"] for t in first_parent["tools"]}
+        assert {t["function"]["name"] for t in first_agent["tools"]} == (
+            ENVIRONMENT_TOOL_NAMES | sidecars
+        )
+        assert record["subagents"]["sidecar_tools"] == "offered"
+        # The sub-agent's call reached the server, before the session's own.
+        assert record["verification"]["result"]["ledger"] == "5" + NL + "3" + NL
+        # The session's log holds its own calls; the sub-agent's is in the side record.
+        log = record["tool_log"]
+        assert [e["tool"] for e in log] == ["task_agent", "mcp__ledger__post_entry"]
+        assert log[0]["agent"] == 0 and log[1]["args"] == {"amount": 3}
+        (call,) = record["subagents"]["tool_log"]
+        assert (call["agent"], call["turn"], call["tool"]) == (0, 0, "mcp__ledger__post_entry")
+        assert call["args"] == {"amount": 5} and call["ok"] is True
+        assert call["result"] == "posted 5" and "rule" not in call
+        assert record["subagents"]["not_for_training"] is True
+        assert record["trainable"] is True and record["one_sequence"] is True
+        _gone(record, containers_made)
+
+    def test_a_run_can_withhold_the_sidecars_tools_from_sub_agents(self, containers_made):
+        with ScriptedChatServer(self.DELEGATING, agent_script=self.POSTING_AGENT) as server:
+            record = run_episode(
+                _task(),
+                RolloutConfig(
+                    base_url=server.base_url,
+                    model="scripted",
+                    subagent_sidecar_tools=False,
+                    **SMALL,
+                ),
+                verifier=self._read_the_ledger,
             )
             first_agent, second_agent = server.agent_requests
             first_parent = server.parent_requests[0]
@@ -355,13 +405,50 @@ class TestARolloutWithASidecar:
         # The session is offered the sidecar's tools, its sub-agent is not...
         assert "mcp__ledger__post_entry" in {t["function"]["name"] for t in first_parent["tools"]}
         assert {t["function"]["name"] for t in first_agent["tools"]} == ENVIRONMENT_TOOL_NAMES
+        assert record["subagents"]["sidecar_tools"] == "withheld"
         # ...and a call it makes anyway is refused before it reaches the server.
         (told,) = [m["content"] for m in second_agent["messages"] if m["role"] == "tool"]
         assert "mcp__ledger__post_entry" in told and "not available" in told
-        # Only the session's own call is in the ledger, and it is in the tool log.
+        # Only the session's own call is in the ledger; the attempt is in the record.
         assert record["verification"]["result"]["ledger"] == "3" + NL
         assert [e["tool"] for e in record["tool_log"]] == ["task_agent", "mcp__ledger__post_entry"]
+        (attempt,) = record["subagents"]["tool_log"]
+        assert attempt["tool"] == "mcp__ledger__post_entry" and attempt["ok"] is False
         assert record["trainable"] is True
+        _gone(record, containers_made)
+
+    def test_two_sub_agents_call_the_sidecar_at_the_same_time(self, containers_made):
+        """One MCP client serves the session and every sub-agent.  The ledger here
+        answers a posting only once two are under way at once, and gives each a
+        number of its own: a client that took them one after the other would leave
+        the first waiting until it failed."""
+        parent = [
+            {
+                "tool_calls": [
+                    {"name": "task_agent", "arguments": {"prompt": "post 5"}},
+                    {"name": "task_agent", "arguments": {"prompt": "post 5 as well"}},
+                ]
+            },
+            {"content": "both posted"},
+        ]
+        assert MEETING_SERVER.count("MEETING") == 2
+        with ScriptedChatServer(parent, agent_script=self.POSTING_AGENT) as server:
+            record = run_episode(
+                _task(sidecar=_sidecar(files={"/srv/ledger.py": MEETING_SERVER.encode()})),
+                RolloutConfig(base_url=server.base_url, model="scripted", **SMALL),
+                verifier=self._read_the_ledger,
+            )
+
+        assert record["finish_state"] == "completed", record["error"]
+        calls = record["subagents"]["tool_log"]
+        assert sorted(c["agent"] for c in calls) == [0, 1] and all(c["ok"] for c in calls)
+        assert sorted(c["result"] for c in calls) == [
+            "posted 5 as number 0",
+            "posted 5 as number 1",
+        ]
+        assert record["verification"]["result"]["ledger"] == "5" + NL + "5" + NL
+        assert record["subagents"]["started"] == 2 and record["subagents"]["failures"] == []
+        assert record["trainable"] is True and record["one_sequence"] is True
         _gone(record, containers_made)
 
     def test_a_call_the_model_gets_wrong_is_an_ordinary_result(self, containers_made):

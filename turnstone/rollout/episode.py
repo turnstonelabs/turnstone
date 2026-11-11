@@ -257,6 +257,12 @@ class RolloutConfig:
     # the framework's ``tools.agent_max_turns``, where -1 is no limit).
     max_subagents: int = 16
     subagent_max_turns: int | None = None
+    # Whether a sub-agent is offered the tools of the task's own servers
+    # (:mod:`turnstone.rollout.sidecar`), as the session is.  Every call it
+    # makes to one is in the record (``subagents.tool_log``) and none of it is
+    # part of the training sample.  ``False`` withholds them: a call a
+    # sub-agent makes to one anyway is refused.
+    subagent_sidecar_tools: bool = True
     # Characters of a command's output the model gets (head and tail kept);
     # ``None``: the framework's ``tools.truncation``, where 0 is its automatic
     # share of the remaining context.
@@ -612,6 +618,7 @@ class RolloutSession(HeadlessSession):
         meter: Meter | None = None,
         max_result_chars: int | None = None,
         exact_window: bool = False,
+        subagent_sidecar_tools: bool = True,
         before_acting: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -623,12 +630,14 @@ class RolloutSession(HeadlessSession):
             # The model is not a caller to be trusted with this machine, and
             # the pattern rules are not what keeps it off.
             raise HostExecutionError(_HOST_REFUSAL)
-        # The tools of the task's own servers, by name.  Set before the base
-        # class builds its tool lists, which asks ``_apply_persona_visibility``.
+        # The tools of the task's own servers, by name, and whether a sub-agent
+        # is offered them.  Set before the base class builds its tool lists,
+        # which asks ``_apply_persona_visibility``.
         own_servers = kwargs.get("mcp_client")
         self._own_server_tools: frozenset[str] = frozenset(
             t["function"]["name"] for t in (own_servers.get_tools() if own_servers else [])
         )
+        self._subagent_sidecar_tools = subagent_sidecar_tools
         super().__init__(**kwargs)
         # Called once, before the first of the model's tool calls runs.
         self._before_acting = before_acting
@@ -823,16 +832,25 @@ class RolloutSession(HeadlessSession):
     # -- sub-agents ----------------------------------------------------------
 
     def _apply_persona_visibility(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Keep the tools of the task's own servers out of a sub-agent's list.
+        """A sub-agent's tool list, with the tools of the task's own servers
+        unless the run withholds them.
 
-        They act on the task's state, which is what a rollout is scored on.
-        Called by the session, each such call is in the tool log and is a
-        generated, recorded turn.  A sub-agent's conversation is neither
-        logged nor trained on, so it would act on that state unseen.
+        A sub-agent is offered them as the session is.  Where a task's systems
+        can be reached only as these tools, a sub-agent without them cannot do
+        what was delegated to it, and the rollout would be scored on that.
+        Every call a sub-agent makes is in the record (``subagents.tool_log``),
+        the rules are asked about it, and for the training sample it is what
+        every call of a sub-agent is: no part of it.
+
+        A run that withholds them (``subagent_sidecar_tools=False``) keeps them
+        out of the sub-agent's list, and the sub-agent's loop refuses a call
+        to a tool outside its list.
         """
         visible = super()._apply_persona_visibility(tools)
         own: frozenset[str] = getattr(self, "_own_server_tools", frozenset())
-        if not own or tools is not getattr(self, "_task_tools", None):
+        if getattr(self, "_subagent_sidecar_tools", True) or not own:
+            return visible
+        if tools is not getattr(self, "_task_tools", None):
             return visible
         return [t for t in visible if t.get("function", {}).get("name") not in own]
 
@@ -1799,6 +1817,13 @@ def _build_record(
             # sub-agent's calls, and none of the checks behind ``trainable``
             # is made on them.
             "token_data_kept": False,
+            # Whether a sub-agent was offered the tools of the task's own
+            # servers; ``None`` for a task that brings none.
+            "sidecar_tools": (
+                ("offered" if config.subagent_sidecar_tools else "withheld")
+                if state.get("own_server_tools") or task.sidecar is not None
+                else None
+            ),
             "started": snapshot["subagents_admitted"],
             "refused_at_limit": snapshot["subagents_refused"],
             # Every delegation that came back failed for another reason than
@@ -2410,6 +2435,7 @@ def run_episode(
             state["startup_seconds"] = round(time.monotonic() - state["t0"], 2)
             # This rollout's own MCP servers, if its task brings any.
             mcp_client = getattr(sandbox, "mcp_client", None)
+            state["own_server_tools"] = mcp_client is not None
             offered = config.tool_names if config.tool_names is not None else ROLLOUT_TOOL_NAMES
             if mcp_client is not None:
                 offered = frozenset(offered) | {
@@ -2458,6 +2484,7 @@ def run_episode(
                     meter=meter,
                     max_result_chars=config.max_tool_result_chars,
                     exact_window="assembly" in state,
+                    subagent_sidecar_tools=config.subagent_sidecar_tools,
                     before_acting=before_acting,
                 )
                 state["session"] = session

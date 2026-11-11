@@ -1796,15 +1796,26 @@ calls would go out on a client of its own, past the recorder.
 
 ### Sub-agents
 
-A rollout offers `task_agent`, and for the training sample it is a tool like any
-other. The call that starts a sub-agent is the session's own, generated and
-recorded; what the sub-agent returns is a tool result, text from the
-environment. The sub-agent's own conversation is not part of the sample.
+A rollout offers `task_agent`, and **for training a sub-agent is a tool** like
+any other. The sample holds two things of it:
+
+- the session's own call that starts it. The model generated it, and it is
+  trained on like any tool call the model writes, with its log-probabilities;
+- the result the sub-agent hands back. It is text from the environment:
+  context for what the model generates next, never a training target.
+
+Nothing else of a sub-agent is in the sample. No token and no log-probability
+of its model calls is in the token record (`tokens`), in the prefix check, or
+in anything `trainable` and `one_sequence` are worked out from, whichever way
+the prompts go out. What the record keeps of a sub-agent is under `subagents`,
+which says of itself that it is not for training (`not_for_training`): counts,
+a summary of each of its model calls, and its tool calls
+(`subagents.tool_log`). A reward reads them; a trainer does not.
 
 | | |
 |---|---|
 | Where it acts | In the same container, through the same environment |
-| Its tools | The environment tools only; it cannot start another sub-agent, and it is not offered the tools of the task's sidecar (a call it makes to one anyway is refused) |
+| Its tools | The environment tools and, unless the run withholds them, the tools of the task's sidecar; it cannot start another sub-agent |
 | The parent's prompt | Unchanged by starting one: the system prompt and tool list are fixed for the run |
 | Its model calls | Kept out of the token record and the prefix check. The side record under `subagents` is marked `not_for_training` and `token_data_kept: false`: it holds counts and a summary per call, no token IDs or log-probabilities, and none of the checks behind `trainable` is made on them. With [prompts as token IDs](#prompts-as-token-ids) they go out on the same route as the session's, each prompt the server's rendering of the sub-agent's own messages, and no token of them enters the session's sequence |
 | Its tool calls | In the record under `subagents.tool_log`, apart from the session's `tool_log` and, like everything under `subagents`, not part of the sample |
@@ -1836,9 +1847,26 @@ A call that never ran is there too: one a rule refused, a tool the sub-agent is
 not offered, an attempt to start a sub-agent of its own. A call the run was cut
 in has what the session had noted of it when it was stopped.
 
-A sub-agent is not offered the tools of the task's own servers. Those act on
-the task's state, which is what the rollout is scored on; a call a sub-agent
-makes to one anyway is refused, and the attempt is in `subagents.tool_log`.
+A sub-agent is offered the tools of the task's own servers
+([the sidecar](#a-tasks-own-servers-the-sidecar)), as the session is. Where a
+task's systems can be reached only as these tools, a sub-agent without them
+could not do what was delegated to it, and the rollout would be scored on a
+failure that is the harness's, not the model's. Its calls act on the task's
+state, which is what the rollout is scored on, and nothing of them is unseen:
+
+- each is in `subagents.tool_log`, with its arguments, its outcome and the rule
+  that matched where one did;
+- the [rules](#rules-on-tool-calls) are asked about it as about any call;
+- its result is bounded inside the sub-agent as any of its results is (16,000
+  characters), and what the sub-agent hands back by the
+  [bound on a single tool result](#one-bound-on-a-tool-result);
+- the rollout's one MCP client serves the session and every sub-agent, several
+  of them at the same time.
+
+`RolloutConfig.subagent_sidecar_tools=False` (`--no-subagent-sidecar-tools`)
+withholds them: a sub-agent is then offered the environment tools only, and a
+call it makes to one of the sidecar's anyway is refused and is in the log as
+that. The record says which was in force (`subagents.sidecar_tools`).
 
 A sub-agent that does its task badly is an ordinary result: the model delegated
 and has to deal with what came back. That includes one whose model returns
@@ -1912,7 +1940,9 @@ the tool log like any other tool's. It is not given a way to connect to them
 itself: it would then act on them unseen, and could reach whatever else the
 sidecar serves, such as a task's own health or grading endpoint. A task format
 that ships a bridge for programs in the model's container does not need it
-here. A sub-agent is not offered these tools (see [sub-agents](#sub-agents)).
+here. A sub-agent is offered these tools as the session is, through the same
+client, and its calls are in the record under `subagents.tool_log`; a run can
+withhold them (see [sub-agents](#sub-agents)).
 
 The MCP client is built from the servers the task names and from nothing else.
 Its tool list is read once, when the session is built, and is the same with
@@ -2240,7 +2270,7 @@ whose value does not apply is `null`.
 | `before_run` | `null` for a task that names no [before-run commands](#before-the-run); otherwise below |
 | `time` | Where the time went, below |
 | `budgets` | The budgets the run was under and what was spent, below |
-| `subagents` | The side record of sub-agent calls, below |
+| `subagents` | The side record of sub-agents, below. No part of the training sample, and marked so (`not_for_training`): see [sub-agents](#sub-agents) |
 | `sandbox` | The container, below |
 | `acts_on_host` | Whether the tools acted on the machine the rollout ran on instead of in a sandbox (see [where the tools act](#where-the-tools-act)) |
 | `rules` | `null` without rules; otherwise the set in force (`name`, `sha256`, the count `rules`) and `events`, one per call a rule matched: `call_id`, `tool`, `rule`, `recommendation`, `refused`, `scope` (`parent` or `sub_agent`) |
@@ -2362,8 +2392,9 @@ A verdict that was passed in is stored as it was given.
 
 | Key | Value |
 |-----|-------|
-| `not_for_training` | Always `true` |
-| `token_data_kept` | Always `false`: counts only |
+| `not_for_training` | Always `true`: nothing under `subagents` is part of the training sample, its counts, its call summaries and its `tool_log` alike |
+| `token_data_kept` | Always `false`: no token ID and no log-probability of a sub-agent's model call is kept anywhere in the record |
+| `sidecar_tools` | `"offered"` or `"withheld"`: whether a sub-agent was offered the tools of the task's own servers; `null` for a task that brings none |
 | `started`, `refused_at_limit` | Sub-agents started, and calls refused at `max_subagents` |
 | `failures` | Every delegation that came back failed for another reason than the sub-agent's work, in words and in order. An entry that begins `the model server refused the sub-agent's conversation` is a refusal by the server: the model's doing, handed to it as a failed tool result. Every other entry is a failure of the machinery, which ended the run as `subagent_failed` |
 | `refused_by_server` | How many of `failures` are conversations the server refused |

@@ -6,9 +6,10 @@ that are the ones whose definition declares ``environment`` (every effect goes
 through the session's execution environment):
 :data:`~turnstone.core.tools.ENVIRONMENT_TOOL_NAMES`.
 
-A rollout also offers ``task_agent``.  A sub-agent has no reach of its own: it
-is offered the environment tools only, acts through the same environment and
-cannot spawn another.  For the training sample it is a tool like any other.
+A rollout also offers ``task_agent``.  A sub-agent has no reach of its own: of
+the built-in tools it is offered the environment tools only, it acts through
+the same environment and cannot spawn another.  For the training sample it is
+a tool like any other.
 
 Every other tool an interactive session offers acts somewhere else.
 :data:`HOST_SIDE_TOOLS` gives the reason for each; a test keeps the sets
@@ -24,8 +25,12 @@ client a rollout session ever has is the one built for its task's sidecar
 (:mod:`turnstone.rollout.sidecar`), from the servers the task names and from
 nothing else, so no server configured on this machine can be reached.  Its
 tools are offered beside the ones here (``mcp_tools=True``, see
-``HeadlessSession``); the list is read once and fixed for the run.  They are
-the session's own to call: a sub-agent is not offered them.
+``HeadlessSession``); the list is read once and fixed for the run.  A
+sub-agent is offered them as the session is, unless the run withholds them
+(``RolloutConfig.subagent_sidecar_tools``): where a task's systems can be
+reached only as these tools, a sub-agent without them could not do what was
+delegated to it.  Its calls go to the same servers, are in the record and are
+under the run's rules, like the session's.
 """
 
 from __future__ import annotations
@@ -33,9 +38,9 @@ from __future__ import annotations
 from turnstone.core.tools import ENVIRONMENT_TOOL_NAMES
 
 # The default tool set of a rollout: the tools that act inside the sandbox,
-# and the sub-agent tool.  A sub-agent is offered the first group only and acts
-# through the same environment, so it adds no reach; its conversation stays out
-# of the training sample (see ``episode``).
+# and the sub-agent tool.  Of these a sub-agent is offered the first group
+# only, and it acts through the same environment, so it adds no reach; its
+# conversation stays out of the training sample (see ``episode``).
 ROLLOUT_TOOL_NAMES: frozenset[str] = ENVIRONMENT_TOOL_NAMES | {"task_agent"}
 
 HOST_SIDE_TOOLS: dict[str, str] = {

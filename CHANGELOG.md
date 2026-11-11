@@ -132,8 +132,11 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   connections can hold of the runner is bounded in time and in number.
   The MCP client is built from
   the servers the task names and no others, its tool list is fixed for the run,
-  and it is shut down with the rollout. A sub-agent is not offered these tools.
-  A sidecar that does not come up or stops during the run makes the record not
+  and it is shut down with the rollout. A sub-agent is offered these tools as
+  the session is, through the same client, and every call it makes is in the
+  record apart from the session's own (`subagents.tool_log`); a run can
+  withhold them (`subagent_sidecar_tools`, `--no-subagent-sidecar-tools`). A
+  sidecar that does not come up or stops during the run makes the record not
   trainable; a call the model gets wrong is an ordinary result. Both containers
   are removed afterwards, and a verifier is given the stopped sidecar to read
   its state from.

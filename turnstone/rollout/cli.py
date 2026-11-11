@@ -326,6 +326,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-subagents", type=int, default=RolloutConfig.max_subagents)
     parser.add_argument(
+        "--no-subagent-sidecar-tools",
+        action="store_true",
+        help="do not offer a sub-agent the tools of the task's own servers (default: it is "
+        "offered them, and every call it makes is in the record under subagents.tool_log)",
+    )
+    parser.add_argument(
         "--config",
         default=None,
         metavar="PATH",
@@ -827,6 +833,7 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
         tool_timeout=args.tool_timeout,
         subagent_max_turns=args.subagent_max_turns,
         max_subagents=args.max_subagents,
+        subagent_sidecar_tools=not args.no_subagent_sidecar_tools,
         reasoning_effort=args.effort,
         keep_text=args.keep_text,
         token_id_prompts=args.token_id_prompts,
@@ -988,6 +995,15 @@ def _summary(record: dict[str, Any]) -> list[str]:
         f"{sub['model_calls']} model calls, {sub['generated_tokens']} generated tokens "
         f"(not for training), failures: {_shown(sub['failures'] or 'none')}"
     )
+    if sub["sidecar_tools"] is not None:
+        say(f"  tools of the task's own servers: {sub['sidecar_tools']} to sub-agents")
+    for entry in sub["tool_log"]:
+        arguments = _shown(json.dumps(entry["args"])[:100])
+        rule = f" rule={entry['rule']} ({entry['rule_says']})" if "rule" in entry else ""
+        say(
+            f"  sub-agent {entry['agent']} turn {entry['turn']} {_shown(entry['tool'])} "
+            f"{arguments} ok={entry['ok']}{rule}"
+        )
     rules = record["rules"]
     if rules is not None:
         say(f"rules: {rules['name']} ({rules['rules']} rules, {rules['sha256'][:12]})")
