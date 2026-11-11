@@ -24,6 +24,7 @@ from turnstone.core.project_access import decide_project_access, fold_role_permi
 from turnstone.core.storage._lease import unheld_since_predicate, unleased_predicate
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
+    REVOKED_TOOLS_CONFIG_KEY,
     AttachmentWrite,
     ConversationCommitConflictError,
     ForkCloneExpectation,
@@ -3101,8 +3102,12 @@ def clone_workstream_transaction(
             workstream_config.c.ws_id == source_ws_id
         )
     ).fetchall()
+    # The fork's config rows and the snapshot its session adopts both come from this dict: the
+    # reservation fence and the source's tool restriction stay with the source.
     source_config: dict[str, str] = {
-        str(row[0]): row[1] for row in config_rows if str(row[0]) != FORK_RESERVATION_CONFIG_KEY
+        str(row[0]): row[1]
+        for row in config_rows
+        if str(row[0]) not in (FORK_RESERVATION_CONFIG_KEY, REVOKED_TOOLS_CONFIG_KEY)
     }
     if expected_session is not None:
         from turnstone.core.personas import snapshot_from_config

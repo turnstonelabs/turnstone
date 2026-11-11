@@ -39,6 +39,11 @@ OBO_AUTH_TYPES: frozenset[str] = frozenset({"oauth_obo"})
 # protection; public config reads/writes and fork snapshots always exclude it.
 FORK_RESERVATION_CONFIG_KEY = "__fork_destination_reservation"
 
+# An operator's tool restriction on a coordinator (a JSON list of tool names), saved with its
+# workstream config and re-applied on every rebuild. It belongs to the workstream it was placed
+# on: a fork's clone leaves it out, as it does the reservation fence.
+REVOKED_TOOLS_CONFIG_KEY = "revoked_tools"
+
 
 class StorageConflictError(Exception):
     """Raised by storage methods when a unique-constraint violation occurs.

@@ -1829,13 +1829,21 @@ class CoordinatorTrustResponse(BaseModel):
 
 
 class CoordinatorRestrictRequest(BaseModel):
-    """Body for POST /v1/api/workstreams/{ws_id}/restrict."""
+    """Body for POST /v1/api/workstreams/{ws_id}/restrict: ``revoke`` or ``restore``, not both."""
 
-    revoke: list[str] = Field(
+    revoke: list[str] | None = Field(
+        default=None,
         description=(
-            "Tool names to add to the session's revoked set.  Once "
-            "revoked the coordinator cannot invoke the named tools on "
-            "subsequent turns without closing and re-opening the session."
+            "Tool names to add to the coordinator's revoked set.  The "
+            "coordinator cannot invoke them on subsequent turns, and the set "
+            "is saved with the workstream, so a rebuild (a console restart, a "
+            "close and reopen) keeps withholding them."
+        ),
+    )
+    restore: list[str] | None = Field(
+        default=None,
+        description=(
+            "Tool names to lift from the revoked set.  The lift is saved before it takes effect."
         ),
     )
 
@@ -1844,7 +1852,13 @@ class CoordinatorRestrictResponse(BaseModel):
     """Response body for POST /v1/api/workstreams/{ws_id}/restrict."""
 
     status: str = Field(default="ok")
-    revoked_tools: list[str] = Field(description="Full post-revocation set of revoked tool names.")
+    revoked_tools: list[str] = Field(description="Full post-change set of revoked tool names.")
+    unknown_tools: list[str] = Field(
+        description=(
+            "Requested names no tool of the session matches (a typo, or a tool of "
+            "an MCP server not connected yet).  They are applied all the same."
+        ),
+    )
 
 
 class CoordinatorCloseAllChildrenRequest(BaseModel):

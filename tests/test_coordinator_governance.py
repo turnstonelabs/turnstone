@@ -92,6 +92,11 @@ def _make_session_mock(*, trust_send: bool = False, revoked: frozenset[str] = fr
     session.get_trust_send.side_effect = _get_trust_send
     session.revoke_tools.side_effect = _revoke_tools
     session.get_revoked_tools.side_effect = _get_revoked_tools
+    # A real set: the handler compares requested names with it, and a bare MagicMock only
+    # happens to behave like an empty one.
+    session.known_tool_names.return_value = frozenset(
+        {"bash", "spawn_workstream", "delete_workstream"}
+    )
     return session, state
 
 

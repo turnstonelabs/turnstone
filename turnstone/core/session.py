@@ -265,6 +265,7 @@ from turnstone.core.storage import (
     WorkstreamLeaseHeldError,
     WorkstreamLeaseLostError,
 )
+from turnstone.core.storage._protocol import REVOKED_TOOLS_CONFIG_KEY
 from turnstone.core.storage._registry import get_storage
 from turnstone.core.storage._utils import (
     COMPACTION_SOURCE,
@@ -3271,6 +3272,8 @@ class ChatSession:
         self._trust_send: bool = False
         self._revoked_tools: frozenset[str] = frozenset()
         self._governance_lock = threading.Lock()
+        # Orders the saves of the revoked set, so the last save is of the latest set.
+        self._revocation_save_lock = threading.Lock()
         # The session owns ONE immutable binding snapshot.  Registry-backed
         # construction resolves provider/client/model/config/generation under
         # one lock hold; direct no-registry callers get the same lane shape
@@ -7390,6 +7393,7 @@ class ChatSession:
         # leaves the live session intact. The create lifecycle rolls back a
         # committed fork if snapshot adoption fails.
         scalars = self._parse_config_scalars(config)
+        revoked_tools = self._parse_revoked_tools(config)
         snap = snapshot_from_config(config or {})
         if snap != self._current_persona_snapshot():
             # The persona is construction-time (MCP visibility above all): the
@@ -7438,6 +7442,14 @@ class ChatSession:
         # any session state was touched; the persona already matches it).
         if config:
             self._apply_persisted_config(config, scalars)
+        # An operator's tool restriction belongs to the saved workstream: every rebuild (a
+        # reopen, a resume after a restart) withholds the same tools. A union, not an
+        # assignment: the slot is reachable once its session is built. The console's restrict
+        # route waits for the rebuild on the lifecycle lane; the union keeps a revoke that
+        # reaches this session any other way, and the session started empty (both callers,
+        # ``rehydrate`` and ``adopt_fork_snapshot``, run on a fresh session).
+        with self._governance_lock:
+            self._revoked_tools = self._revoked_tools | revoked_tools
         if _fork_snapshot is not None:
             # The atomic clone persisted every row self.messages holds — the
             # persisted history under this ws_id cannot contain any sender
@@ -21977,7 +21989,10 @@ class ChatSession:
     #
     # Writes hold ``_governance_lock``; reads are lock-free.  ``_trust_send``
     # is a single bool and ``_revoked_tools`` is a frozenset swapped by
-    # reference on each write, so neither read can tear.
+    # reference on each write, so neither read can tear.  The revoked set is
+    # saved with the workstream's config and re-applied on every rebuild;
+    # ``_trust_send`` relaxes approvals, so it stays per session (losing it
+    # on a rebuild is the safe direction).
 
     def set_trust_send(self, value: bool) -> None:
         with self._governance_lock:
@@ -21995,6 +22010,71 @@ class ChatSession:
 
     def get_revoked_tools(self) -> frozenset[str]:
         return self._revoked_tools
+
+    def known_tool_names(self) -> frozenset[str]:
+        """Every tool name this session knows: its tool list, and the deferred ones of its search.
+
+        Revoked tools stay in it: a revoked tool stays on the wire, and dispatch refuses it.
+        """
+        names = {name for tool in self._tools if (name := tool.get("function", {}).get("name"))}
+        # Read once: an MCP catalog refresh on another thread can replace or drop the manager.
+        tool_search = self._tool_search
+        if tool_search is not None:
+            names.update(
+                name
+                for tool in tool_search.get_deferred_tools()
+                if (name := tool.get("function", {}).get("name"))
+            )
+        return frozenset(names)
+
+    def save_revoked_tools(self) -> frozenset[str]:
+        """Save the revoked set as it stands now, and return it.
+
+        Raises when storage refuses or fails the write: the caller tells the operator that a
+        restriction already in effect here will not survive a rebuild.
+        """
+        with self._revocation_save_lock:
+            revoked = self._revoked_tools
+            self._write_revoked_tools(revoked)
+            return revoked
+
+    def restore_tools(self, names: Iterable[str]) -> frozenset[str]:
+        """Lift ``names`` from the revoked set, saving the lift first; return the post-state.
+
+        A save that raises lifts nothing, so the session is never less restricted than the
+        saved restriction that a rebuild would apply.
+        """
+        lifted = frozenset(names)
+        with self._revocation_save_lock:
+            self._write_revoked_tools(self._revoked_tools - lifted)
+            with self._governance_lock:
+                self._revoked_tools = self._revoked_tools - lifted
+                return self._revoked_tools
+
+    def _write_revoked_tools(self, revoked: frozenset[str]) -> None:
+        get_storage().save_workstream_config(
+            self._ws_id,
+            {REVOKED_TOOLS_CONFIG_KEY: json.dumps(sorted(revoked))},
+            lease=self.write_fence(),
+        )
+
+    @staticmethod
+    def _parse_revoked_tools(config: Mapping[str, str] | None) -> frozenset[str]:
+        """The saved tool restriction, raising on a value that does not parse.
+
+        A corrupt value never reads as "no restriction": the load fails instead of running the
+        workstream with tools an operator withheld.
+        """
+        raw = (config or {}).get(REVOKED_TOOLS_CONFIG_KEY) or ""
+        if not raw:
+            return frozenset()
+        try:
+            names = json.loads(raw)
+        except (ValueError, RecursionError) as exc:
+            raise ValueError("the saved tool restriction does not parse") from exc
+        if not isinstance(names, list) or not all(isinstance(n, str) and n for n in names):
+            raise ValueError("the saved tool restriction is not a list of tool names")
+        return frozenset(names)
 
     @staticmethod
     def _coord_str_arg(args: dict[str, Any], key: str, default: str = "") -> str:
