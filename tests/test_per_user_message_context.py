@@ -521,6 +521,8 @@ def test_rehydrate_resets_shared_state():
     storage = MagicMock()
     storage.get_workstream.return_value = None
     storage.ensure_workstream_incarnation_snapshot.return_value = None
+    # A real (empty) saved config: a mock's value would read as an unparsable restriction.
+    storage.load_workstream_config.return_value = {}
     with (
         patch("turnstone.core.session.read_message_turns", return_value=turns),
         patch("turnstone.core.session.get_storage", return_value=storage),

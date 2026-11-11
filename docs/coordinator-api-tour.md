@@ -395,17 +395,37 @@ calls still go through the normal flow.  Requires both
 `admin.coordinator` AND `coordinator.trust.send` permissions (the
 second grants a service token the opt-in it otherwise wouldn't get).
 
-### `POST /restrict` — revoke tool access mid-session
+### `POST /restrict` — revoke or restore tool access
 
 ```http
 POST /v1/api/workstreams/{ws_id}/restrict
 {"revoke": ["spawn_workstream", "delete_workstream"]}
 ```
 
-Unions the names into the session's revoked-tools set.  Additive and
+Unions the names into the coordinator's revoked-tools set.  Additive and
 idempotent — calling twice with overlapping lists converges to the
-union.  Revocations don't survive a session close/reopen; operators
-opt in per session.  Cap 256 tool names per request, 128 chars each.
+union.  The set is saved with the workstream and re-applied whenever the
+coordinator is loaded again: after a console restart (including the
+unattended resume an open pane triggers), and after a close and reopen.
+`{"restore": [...]}` lifts names from the set; a body carries exactly one
+of the two.  Names are trimmed; a name with whitespace inside, or one
+that differs only in case from a tool the coordinator knows, is a 400; a
+name no tool matches (a typo, or a tool of an MCP server not connected
+yet) is applied and listed back in `unknown_tools`.  A restore takes any
+name that is in the set as it is, so every entry can be lifted.  Cap 256
+tool names per list, 128 chars each.
+
+Each change takes effect in the safe direction first.  A revoke applies
+to the running session at once and is then saved; if the save fails the
+answer is 503 with `revoked_tools` still listing it, and the restriction
+holds for the running session but will not survive a rebuild (retry to
+save it).  A restore is saved first and only then lifted; if the save
+fails the answer is 503 and nothing is lifted.  Every call writes one
+`coordinator.restricted` audit row with the requested names, the full
+post-state and whether the change was saved.  A restriction belongs to
+the coordinator it was placed on: a fork leaves it out.  `/trust` is the
+opposite kind of setting (it relaxes approvals), so it stays per
+session: a rebuild drops it.
 
 ### `POST /close_all_children` — soft-close the direct fan-out
 

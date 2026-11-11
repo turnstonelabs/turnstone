@@ -4952,35 +4952,123 @@ async def coordinator_trust(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "trust_send": raw_send})
 
 
-async def coordinator_restrict(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/{ws_id}/restrict — revoke tool access mid-session."""
-    resolved = await _resolve_coord_session(request, allow_service_bypass=False)
-    if isinstance(resolved, JSONResponse):
-        return resolved
-    session, storage, user_id, ws_id = resolved
+def _restrict_tool_names(
+    body: dict[str, Any], key: str, known: frozenset[str], revoked: frozenset[str]
+) -> frozenset[str] | JSONResponse:
+    """The tool names under ``key`` in a ``/restrict`` body, trimmed, or the 400.
 
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    raw_revoke = body.get("revoke")
-    if not isinstance(raw_revoke, list) or not all(isinstance(t, str) and t for t in raw_revoke):
+    A name with whitespace inside, or one that differs only in case from a tool the session knows,
+    withholds nothing, so it is refused; a name no tool matches (a typo, or a tool of an MCP server
+    not connected yet) is accepted, and the caller reports it back. A name in ``revoked`` passes
+    as it is: an entry placed before its tool was known under another spelling must stay
+    liftable.
+    """
+    raw = body.get(key)
+    if not isinstance(raw, list) or not all(isinstance(t, str) and t for t in raw):
         return JSONResponse(
-            {"error": "body must carry {'revoke': [<tool_name>, ...]}"},
+            {"error": f"{key!r} must be a list of tool names: {{'{key}': [<tool_name>, ...]}}"},
             status_code=400,
         )
-    if len(raw_revoke) > _RESTRICT_MAX_TOOLS:
+    if len(raw) > _RESTRICT_MAX_TOOLS:
         return JSONResponse(
-            {"error": f"revoke list exceeds {_RESTRICT_MAX_TOOLS} entries"},
+            {"error": f"{key} list exceeds {_RESTRICT_MAX_TOOLS} entries"},
             status_code=400,
         )
-    if any(len(t) > _RESTRICT_MAX_TOOL_NAME_LEN for t in raw_revoke):
+    if any(len(t) > _RESTRICT_MAX_TOOL_NAME_LEN for t in raw):
         return JSONResponse(
             {"error": f"tool names must be <= {_RESTRICT_MAX_TOOL_NAME_LEN} chars"},
             status_code=400,
         )
+    by_folded = {name.casefold(): name for name in known}
+    names: set[str] = set()
+    for raw_name in raw:
+        name = raw_name.strip()
+        if name in revoked:
+            names.add(name)
+            continue
+        if not name or any(ch.isspace() for ch in name):
+            return JSONResponse(
+                {"error": f"tool names may not be blank or contain whitespace: {raw_name!r}"},
+                status_code=400,
+            )
+        if name not in known and name.casefold() in by_folded:
+            suggestion = by_folded[name.casefold()]
+            return JSONResponse(
+                {"error": f"no tool is named {name!r}; did you mean {suggestion!r}?"},
+                status_code=400,
+            )
+        names.add(name)
+    return frozenset(names)
 
-    additions = frozenset(raw_revoke)
-    after = session.revoke_tools(additions)
+
+async def coordinator_restrict(request: Request) -> JSONResponse:
+    """POST /v1/api/workstreams/{ws_id}/restrict — revoke or restore tool access mid-session.
+
+    The body carries exactly one of ``revoke`` and ``restore``. The revoked set is saved with the
+    workstream, so a rebuild keeps it. Each change takes effect in the safe direction first: a
+    revoke applies to the running session, then is saved (a failed save answers 503: active here,
+    lost on a rebuild); a restore is saved, then lifted (a failed save answers 503 and lifts
+    nothing). Names no tool matches are applied and listed back in ``unknown_tools``.
+    """
+    resolved = await _resolve_coord_session(request, allow_service_bypass=False)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    _session, storage, user_id, ws_id = resolved
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503  # pragma: no cover — _resolve_coord_session already gated this
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    has_revoke = body.get("revoke") is not None
+    if has_revoke == (body.get("restore") is not None):
+        return JSONResponse(
+            {"error": "body must carry exactly one of {'revoke': [...]} or {'restore': [...]}"},
+            status_code=400,
+        )
+    key = "revoke" if has_revoke else "restore"
+
+    def change() -> JSONResponse | tuple[frozenset[str], frozenset[str], frozenset[str], str]:
+        # On the workstream's lifecycle lane, which an open holds until its rebuild has applied
+        # the saved set. A session is reachable before that; a save taken from it would write
+        # its still-empty set over the saved one.
+        with coord_mgr.settled(ws_id) as slot:
+            if slot is None:
+                return JSONResponse({"error": "coordinator not found"}, status_code=404)
+            session = slot.session
+            known = session.known_tool_names()
+            names = _restrict_tool_names(
+                body, key, known, frozenset() if has_revoke else session.get_revoked_tools()
+            )
+            if isinstance(names, JSONResponse):
+                return names
+            refusal = ""
+            if has_revoke:
+                session.revoke_tools(names)
+                try:
+                    session.save_revoked_tools()
+                except Exception:
+                    log.warning("coordinator.restrict.save_failed ws=%s", ws_id[:8], exc_info=True)
+                    refusal = (
+                        "The restriction is active for the running session but was not saved: "
+                        "it will not survive a rebuild (a console restart, or a close and "
+                        "reopen). Retry to save it."
+                    )
+            else:
+                try:
+                    session.restore_tools(names)
+                except Exception:
+                    log.warning(
+                        "coordinator.restrict.restore_save_failed ws=%s", ws_id[:8], exc_info=True
+                    )
+                    refusal = "Nothing was lifted: the change could not be saved. Retry shortly."
+            return names, names - known, session.get_revoked_tools(), refusal
+
+    changed = await asyncio.to_thread(change)
+    if isinstance(changed, JSONResponse):
+        return changed
+    names, unknown, after, refusal = changed
     await _emit_coord_audit(
         storage,
         user_id,
@@ -4988,12 +5076,17 @@ async def coordinator_restrict(request: Request) -> JSONResponse:
         ws_id,
         {
             "src": "coordinator",
-            "revoked": sorted(additions),
+            "revoked": sorted(names) if has_revoke else [],
+            "restored": [] if has_revoke else sorted(names),
             "revoked_total": sorted(after),
+            "saved": not refusal,
         },
         request.client.host if request.client else "",
     )
-    return JSONResponse({"status": "ok", "revoked_tools": sorted(after)})
+    answer = {"revoked_tools": sorted(after), "unknown_tools": sorted(unknown)}
+    if refusal:
+        return JSONResponse({"error": refusal, **answer}, status_code=503)
+    return JSONResponse({"status": "ok", **answer})
 
 
 async def _cascade_cancel_to_children(

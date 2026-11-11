@@ -1818,16 +1818,26 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(
         "/v1/api/workstreams/{ws_id}/restrict",
         "POST",
-        "Revoke tool access on a live coordinator session",
+        "Revoke or restore tool access on a live coordinator session",
         description=(
-            "Adds the named tools to the coordinator session's revoked set "
-            "without closing the session.  The model can keep working on "
-            "whatever is already in flight but cannot invoke the revoked "
-            "tools again.  Idempotent and additive — calling twice with "
-            "disjoint lists unions them.  Revocations do not survive a "
-            "session close / reopen; operators opt in per session.  Writes "
-            "``coordinator.restricted`` with the revocation delta and the "
-            "full post-state."
+            "``revoke`` adds the named tools to the coordinator's revoked set "
+            "without closing the session: the model can keep working on "
+            "whatever is already in flight but cannot invoke them again. "
+            "``restore`` lifts names from the set.  A body carries exactly "
+            "one of the two; idempotent, and revocations union.  Names are "
+            "trimmed; a name with whitespace inside, or a case variant of a "
+            "tool the session knows, is a 400; a name no tool matches is "
+            "applied and listed back in ``unknown_tools``.  A ``restore`` "
+            "takes any name that is in the set as it is.  The set is saved "
+            "with the workstream and re-applied "
+            "whenever the coordinator is loaded again (a console restart, a "
+            "close and reopen, a resume).  A revoke takes effect first and is "
+            "then saved: if the save fails the answer is 503, the restriction "
+            "is active for the running session but will not survive a "
+            "rebuild, and ``revoked_tools`` still lists it.  A restore is "
+            "saved first: if the save fails the answer is 503 and nothing is "
+            "lifted.  Writes ``coordinator.restricted`` with the requested "
+            "names, the full post-state and whether the change was saved."
         ),
         request_model=CoordinatorRestrictRequest,
         response_model=CoordinatorRestrictResponse,

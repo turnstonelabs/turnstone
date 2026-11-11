@@ -1738,6 +1738,20 @@ class SessionManager:
             self._release_slot_lease(ws)
 
     @contextlib.contextmanager
+    def settled(self, ws_id: str) -> Iterator[Workstream | None]:
+        """Hold ``ws_id``'s lifecycle lane and yield its loaded slot, or ``None``.
+
+        A slot's session is reachable through :meth:`get` while the open that built it is still
+        rehydrating it from the saved row. An open holds this lane until that is done, and a
+        close or delete holds it through the unload, so inside the block the session has all of
+        its saved state and stays loaded. For a change that must start from the saved state,
+        such as one that writes part of it back.
+        """
+        with self._id_lifecycle(ws_id):
+            ws = self.get(ws_id)
+            yield ws if ws is not None and ws.session is not None else None
+
+    @contextlib.contextmanager
     def _id_lifecycle(self, ws_id: str) -> Iterator[None]:
         """Serialize all local incarnations of one logical workstream id."""
         lifecycle_lock = self._acquire_open_lock(ws_id)
