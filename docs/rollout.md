@@ -326,10 +326,12 @@ model's outcome:
   command exits with a message). A rollout ends, as the model's own outcome,
   before a request that could not fit the window. With a guessed window that
   ending would say something about the guess.
-- **The reply limit is at most a quarter of the context window**, the most the
-  framework itself reserves for a reply. A larger one is cut to that, and the
-  record's `limits.max_tokens.source` says so. With a reply limit near the
-  window's size the first long tool result would end every rollout.
+- **The reply limit is at most a quarter of the context window** in a run that
+  sends messages: the most the framework itself reserves for a reply. A larger
+  one is cut to that, and the record's `limits.max_tokens.source` says so. With
+  a reply limit near the window's size the first long tool result would end
+  every rollout. With [prompts as token IDs](#the-context-window-exact) the
+  window is kept exactly, request by request, and no share of it is set aside.
 
 A reply that reaches the reply limit ends the rollout (see below), so a limit
 too small for the model cuts rollouts short. A model whose replies with
@@ -394,7 +396,10 @@ not change:
 cut to what is left, counting what requests still under way may yet generate,
 so sub-agents running side by side cannot overshoot together. A reply of the
 session that is cut at what was left ends the rollout as `token_budget`, where
-a reply cut at the reply limit ends it as `length`. With nothing left the
+a reply cut at the reply limit ends it as `length` (with prompts as token IDs
+what the window has left is a third limit on a reply;
+[the context window, exact](#the-context-window-exact) says which ending wins).
+With nothing left the
 session's next request is not made. A sub-agent whose request finds nothing
 left fails, and the model gets that as an ordinary failed tool result; a
 sub-agent's reply that was cut is an ordinary result too.
@@ -517,7 +522,7 @@ penalised for it.
 | `completed` | The model ended its turn without calling a tool (an empty reply included, and a reply of which a server that reads tool calls itself says it holds some and hands over none) | model | yes |
 | `max_turns` | The model used all its turns | model | yes |
 | `length` | A reply reached the reply limit; the rollout ends there | model | yes |
-| `context_full` | The conversation filled the context window; the run ends before a request that could not fit | model | yes |
+| `context_full` | The conversation filled the context window; the run ends before a request that could not fit, and with prompts as token IDs also on a reply that was cut at what the window had left | model | yes |
 | `timeout` | The time limit passed while the model was generating or one of its commands was running; with a token budget, although the server kept its minimum speed | model | yes |
 | `token_budget` | The budget of generated tokens was used up | model | yes |
 | `command_time` | The time the model's commands may run was used up | model | yes |
@@ -525,7 +530,7 @@ penalised for it.
 | `request_refused` | After a request of the session had been answered: the server refused a later one for what the conversation held (HTTP status 400 or 422); see [a conversation the server refuses](#a-conversation-the-server-refuses) | model | yes |
 | `server_stalled` | Without a token budget: the time limit passed while a model request had had nothing from the server for longer than it is allowed | machinery | no |
 | `backstop` | With a token budget: the time limit passed and the server was slower than its minimum speed, or the harness itself took the time | machinery | no |
-| `error` | A request of the session failed (after the client's own retries; the first request refused by the server, and a prompt the server finds too long, included), or the harness raised (a stable-prefix error included; with prompts as token IDs, a prompt that could not be assembled) | machinery | no |
+| `error` | A request of the session failed (after the client's own retries; the first request refused by the server, and a prompt the server finds too long, included), or the harness raised (a stable-prefix error included; with prompts as token IDs, a prompt that could not be assembled, or a task whose own first prompt does not fit the context window) | machinery | no |
 | `server_version_unknown` | The server did not say which [version](#one-version-of-the-server) it is before the run, so the run did not start | machinery | no |
 | `sandbox_failed` | The container could not be started | machinery | no |
 | `sandbox_lost` | The container stopped and nothing the model could do explains it, or it stopped before the first turn of the model's had come back or was found gone before the first of the model's tool calls could run, or the runtime stopped answering | machinery | no |
@@ -550,10 +555,22 @@ loss was found), and a failed request or a time limit the server ran into
 to be gone when the session's run ended. What fails once the container is
 known to be gone does not change the ending: it may follow from the loss.
 
-`context_full` is decided before each request, from the server's own count of
-the previous call's tokens and the size in bytes of what was added since (a
-token is at least one byte), with room for a whole reply. It ends a run a
-little early, never on the server's refusal of a prompt that is too long.
+`context_full` never comes from the server's refusal of a prompt that is too
+long; the harness decides it, and how depends on the way the prompts go out.
+
+A run that sends messages does not know a prompt's length before the server
+has rendered it, so it estimates before each request: the server's own count
+of the previous call's tokens, plus the size in bytes of what was added since,
+plus the whole reply limit, which is at most a quarter of the window. A token
+is at least one byte and usually three or four, so the new messages count for
+several times their tokens. Such a run can end with as little as half of the
+window used when a tool result is large, and ends at three quarters at the
+latest.
+
+A run with [prompts as token IDs](#prompts-as-token-ids) knows each prompt's
+length before it is sent and keeps the window exactly: see
+[the context window, exact](#the-context-window-exact). A cap on the whole
+sequence that has to be exact needs that mode.
 
 The time limit can be used up by both sides: by the model, with slow commands
 and long replies, and by the server, by not answering. Without a token budget
@@ -917,6 +934,55 @@ the session's own calls: how the server would have written an earlier turn does
 not enter the prompt. The token-level prefix check stays on. A break it finds in
 this mode is a fault of the harness, so it makes the record not trainable and
 is listed in `problems`.
+
+### The context window, exact
+
+With prompts as token IDs the length of every prompt is known before it is
+sent, so the context window is kept exactly:
+
+- the whole sequence of a rollout is never longer than the window, and a
+  rollout can use the window to its last token;
+- each request's reply limit is the smallest of the reply limit, what the
+  token budget grants, and what the window has left after the prompt;
+- a request for which nothing is left is not made.
+
+How such a run ends, always as the model's outcome and trainable, with nothing
+sent afterwards:
+
+| What happened | `finish_state` |
+|---------------|----------------|
+| Before a request, the token budget has nothing left | `token_budget` |
+| Before a request, the window has nothing left | `context_full` |
+| A reply reached the reply limit itself | `length` |
+| A reply was cut at what the token budget granted, and that was less than the reply limit | `token_budget` |
+| A reply was cut at what the window had left, and that was less than both | `context_full` |
+
+Where two limits are the same number, the earlier one in that order names the
+ending: the reply limit before the token budget, the token budget before the
+window. Before a request the token budget is looked at first. Each call's
+record carries what the window had left for it (`calls[].window_left`).
+
+Two things differ from a run that sends messages. No share of the window is set
+aside for a reply, so the reply limit is the configured one, not at most a
+quarter of the window. And a task whose own first prompt does not fit the
+window ends as `error`, the machinery's: the model had no part in it.
+
+A sub-agent's reply limit is cut the same way; a sub-agent whose prompt no
+longer fits has filled its own window, which is its own doing.
+
+A window smaller than the server's own is kept the same way (asked against a
+live server with 128,000 of 262,144). A sequence of exactly the server's own
+window is accepted by it; a prompt as long as the window is refused.
+
+A tool result is never shortened to fit. A run whose last result is larger
+than what the window has left ends there, before the request, with part of the
+window unused: the result is in `messages` and the tool log, and the final
+sequence ends with the last reply that was generated. The
+[bound on a single tool result](#one-bound-on-a-tool-result) keeps one result
+from costing more than its share.
+
+A run that sends messages keeps its estimate;
+[how a rollout ends](#how-a-rollout-ends) says how early that can end it.
 
 ### What the server must have
 
@@ -1743,7 +1809,7 @@ environment. The sub-agent's own conversation is not part of the sample.
 | Its model calls | Kept out of the token record and the prefix check. The side record under `subagents` is marked `not_for_training` and `token_data_kept: false`: it holds counts and a summary per call, no token IDs or log-probabilities, and none of the checks behind `trainable` is made on them. With [prompts as token IDs](#prompts-as-token-ids) they go out on the same route as the session's, each prompt the server's rendering of the sub-agent's own messages, and no token of them enters the session's sequence |
 | Its tool calls | In the record under `subagents.tool_log`, apart from the session's `tool_log` and, like everything under `subagents`, not part of the sample |
 | Its time | Counts toward the task's time limit |
-| Limits | `max_subagents` per rollout (a call past it gets a result that says no sub-agent was started), the framework's turn limit for each (`subagent_max_turns`), the framework's reply limit for each of its model calls, and the task's token budget, which its tokens count toward |
+| Limits | `max_subagents` per rollout (a call past it gets a result that says no sub-agent was started), the framework's turn limit for each (`subagent_max_turns`), the framework's reply limit for each of its model calls (with prompts as token IDs cut to what the context window has left after the sub-agent's own prompt), and the task's token budget, which its tokens count toward |
 | The rollout's length | `generated_tokens` counts what the session itself generated; sub-agent tokens are under `subagents` and never added in |
 
 What bounds the work sub-agents can do is therefore the number of sub-agents
@@ -2158,8 +2224,8 @@ whose value does not apply is `null`.
 | `usage` | The session's own token counts as the server reported them: `prompt`, `completion`; both 0 in a run that did not start |
 | `tokens` | The token record, below |
 | `prefix_ok`, `prefix_breaks` | The token-level prefix check: whether it held, and one readable line per break |
-| `calls` | One summary per model call of the session that ended normally, in order: `index`, `scope`, `route` (`chat`, or `completions` with prompts as token IDs), `streamed`, `request` (`model`, the count of `messages`, their `roles`, the names of the `tools`, the `sampling` keywords, the `extra_body`; with prompts as token IDs the `extra_body` is the completions request's, and `template_arguments` and `prompt_tokens_sent` are there too), `finish_reason`, `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`), `complete`, `error`, `aligned`, `misaligned_chunks`, `ids_checked`, `chunks`, `seconds`, `longest_silence`, `problems`. `index` numbers every request the run made, from 0, a sub-agent's and a discarded one included, so the session's calls need not be 0, 1, 2; the token record numbers the calls listed here from 0 (`tokens.calls[].call`), and entry *n* of the one list is entry *n* of the other |
 | `prefix_events` | What the stable-prefix run noted, one entry per `event`; with prompts as token IDs also what the prompt assembly noted, about the session's own calls only: `turn_ended_on_other_token` (`turn`, `token_id`, `end_of_turn_token_id`), `prompt_differs_from_rendering` (`call`, `prompt_tokens`, `rendered_tokens`, `same_tokens`) and `marker_place_uncertain` (`call`, `tokens`), with `turn` and `call` counted as `tokens.calls[].call` |
+| `calls` | One summary per model call of the session that ended normally, in order: `index`, `scope`, `route` (`chat`, or `completions` with prompts as token IDs), `window_left` (with prompts as token IDs, the tokens the context window had left for the reply; otherwise `null`), `streamed`, `request` (`model`, the count of `messages`, their `roles`, the names of the `tools`, the `sampling` keywords, the `extra_body`; with prompts as token IDs the `extra_body` is the completions request's, and `template_arguments` and `prompt_tokens_sent` are there too), `finish_reason`, `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`), `complete`, `error`, `aligned`, `misaligned_chunks`, `ids_checked`, `chunks`, `seconds`, `longest_silence`, `problems`. `index` numbers every request the run made, from 0, a sub-agent's and a discarded one included, so the session's calls need not be 0, 1, 2; the token record numbers the calls listed here from 0 (`tokens.calls[].call`), and entry *n* of the one list is entry *n* of the other |
 | `discarded_calls` | The session's calls that did not end normally (cut by the time limit, failed, or broken off and issued again), the same keys with `prompt_token_ids`, `token_ids` and `logprobs`; `index` as in `calls` |
 | `text` | With `keep_text`, each call's generated text; otherwise `null`. With prompts as token IDs it is the completions route's text, which leaves out the end-of-turn token and other special tokens |
 | `limits` | `max_tokens`, `context_window`, `tool_timeout`, `subagent_max_turns`, `max_output_chars`, `max_tool_result_chars`, each `{"value": ..., "source": "..."}` |

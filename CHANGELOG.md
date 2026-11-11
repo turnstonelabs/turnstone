@@ -290,6 +290,19 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   Sub-agents use the same route. The record says how the prompts went
   (`prompt_mode`) and keeps the check's verdict (`token_id_route`). Off by
   default. See [the rollout guide](docs/rollout.md#prompts-as-token-ids).
+- **Rollouts: the context window kept exactly.** With prompts as token IDs a
+  rollout knows each prompt's length before it is sent, so the whole sequence
+  never passes the context window and can use it to its last token. A request's
+  reply limit is the smallest of the reply limit, what the token budget grants
+  and what the window has left; a request with nothing left is not made. A run
+  ends as `context_full` when nothing is left before a request or when a reply
+  was cut at what the window had left, as `length` when a reply reached the
+  reply limit itself, and as `token_budget` when the budget was the smaller;
+  each is the model's outcome and trainable. No share of the window is set
+  aside for a reply in this mode, and a task whose first prompt does not fit
+  ends as the machinery's failure. A run that sends messages keeps its
+  estimate, and the guide now says how early it can end. See
+  [the rollout guide](docs/rollout.md#the-context-window-exact).
 
 ### Fixed
 

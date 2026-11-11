@@ -72,6 +72,14 @@ class TokenBudgetError(RuntimeError):
     request is made."""
 
 
+class ContextFullError(Exception):
+    """The next request could not fit the model's context window.
+
+    The conversation filled the window: what the model generated and what it
+    asked its tools for.  The rollout ends there, as the model's outcome.
+    """
+
+
 @dataclass(frozen=True)
 class Budgets:
     """The budgets one rollout runs under.

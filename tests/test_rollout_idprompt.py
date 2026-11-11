@@ -31,7 +31,10 @@ from tests._scripted_chat_server import (
 )
 from tests.test_rollout_episode import SCRIPT, SPAWN, _no_configuration_file, _run  # noqa: F401
 from turnstone.core import session as session_module
+from turnstone.core.model_turn import ModelContextLimitError
 from turnstone.rollout import cli
+from turnstone.rollout.budget import ContextFullError
+from turnstone.rollout.episode import Task
 from turnstone.rollout.idprompt import (
     PromptAssembly,
     PromptAssemblyError,
@@ -41,7 +44,7 @@ from turnstone.rollout.idprompt import (
     template_arguments,
 )
 from turnstone.rollout.probe import sampler_logprobs_reported
-from turnstone.rollout.recording import PARENT, SUB_AGENT, RecordingClient
+from turnstone.rollout.recording import PARENT, SUB_AGENT, CallRecord, RecordingClient
 from turnstone.rollout.settings import SetupError
 from turnstone.rollout.tokens import rebuild_final, rebuild_prompts
 
@@ -704,6 +707,24 @@ class TestTheChain:
     # second prompt is not the chat route's rendering.
     MERGED_STEPS = [{**STEP, "content": "a cab drives", "merge": True}, {"content": "done"}]
 
+    def test_a_prompt_that_is_never_sent_leaves_no_event(self) -> None:
+        """The window is full before the second request: its prompt was built
+        and compared, and no request was made.  An event would name a call the
+        token record does not hold."""
+        recorder, longer = self.two_turns(self.MERGED_STEPS)
+        (noted,) = recorder.id_prompts.events
+        assert noted["event"] == "prompt_differs_from_rendering" and noted["call"] == 1
+        window = len(recorder.calls[1].prompt_token_ids)
+        with ScriptedChatServer(self.MERGED_STEPS) as server:
+            assembly = PromptAssembly(ROUTE, context_window=window)
+            recorder = RecordingClient(make_client(server), id_prompts=assembly)
+            ask(recorder, MESSAGES)
+            with pytest.raises(ContextFullError, match="nothing is left for a reply"):
+                ask(recorder, longer)
+            assert len(server.requests) == 1
+        assert assembly.events == []
+        assert [c.complete for c in recorder.calls] == [True, False]
+
     def test_a_prompt_that_differs_is_noted_when_its_reply_has_ended(self) -> None:
         """A request that goes out and is not answered is no call of the token
         record either.  The same request again gets the same prompt, and the
@@ -991,3 +1012,157 @@ class TestWholeRollouts:
         assert sub["started"] == 1 and sub["model_calls"] == 2 and sub["failures"] == []
         assert all(isinstance(r.get("prompt"), list) for r in agent_requests + parent_requests[-2:])
         assert len(record["tokens"]["calls"]) == 2
+
+
+FAST = {"min_tokens_per_second": 1e6}
+
+
+def _shape(**options: Any) -> tuple[list[int], list[int]]:
+    """The prompt and the reply length of every call of the scripted rollout,
+    from a run under no limit that bites."""
+    with ScriptedChatServer(SCRIPT) as server:
+        record, _box = _run(server, token_id_prompts=True, **options)
+    calls = record["tokens"]["calls"]
+    return [c["prompt_len"] for c in calls], [len(c["token_ids"]) for c in calls]
+
+
+def _limits(server: ScriptedChatServer) -> list[int]:
+    """The reply limits of the task's own requests, in order."""
+    return [r["max_tokens"] for r in server.requests if r.get("max_tokens") != 1]
+
+
+class TestTheWindow:
+    """With prompts as token IDs the context window is kept exactly."""
+
+    def test_it_is_usable_to_its_last_token(self) -> None:
+        prompts, replies = _shape()
+        window = prompts[1] + 10
+        assert replies[1] > 10
+        with ScriptedChatServer(SCRIPT, keep_reply_limit=True) as server:
+            record, _box = _run(server, token_id_prompts=True, context_window=window)
+            limits = _limits(server)
+        # The second request could have what the window had left, and used it up.
+        assert limits[1] == 10 and len(limits) == 2
+        assert record["finish_state"] == "context_full" and record["finish_cause"] == "model"
+        assert "cut at the 10 tokens the window had left" in record["error"]
+        assert record["trainable"] is True and record["one_sequence"] is True
+        assert record["tokens"]["final_len"] == window
+        assert [c["window_left"] for c in record["calls"]] == [window - prompts[0], 10]
+        # The cut reply's tool calls did not run, and nothing was sent after it.
+        assert len(record["tool_log"]) == 1
+
+    def test_with_nothing_left_no_request_is_made(self) -> None:
+        prompts, replies = _shape()
+        with ScriptedChatServer(SCRIPT, keep_reply_limit=True) as server:
+            record, _box = _run(server, token_id_prompts=True, context_window=prompts[1])
+            limits = _limits(server)
+        assert len(limits) == 1
+        assert record["finish_state"] == "context_full" and record["finish_cause"] == "model"
+        assert "nothing is left for a reply" in record["error"]
+        assert record["trainable"] is True and record["turns"] == 1
+        assert record["tokens"]["final_len"] == prompts[0] + replies[0] <= prompts[1]
+        # The tool call of the turn before ran: its result is what filled the window.
+        assert len(record["tool_log"]) == 1
+
+    def test_a_prompt_that_did_not_fit_is_in_no_event(self) -> None:
+        """A model that writes tokens the template does not write gets
+        ``prompt_differs_from_rendering`` for every later call.  The prompt
+        that filled the window was never sent: every event names a call the
+        token record holds."""
+        script = [{**SCRIPT[0], "content": "a cab", "merge": True}, *SCRIPT[1:]]
+        with ScriptedChatServer(script) as server:
+            whole, _box = _run(server, token_id_prompts=True)
+        prompts = [c["prompt_len"] for c in whole["tokens"]["calls"]]
+        assert [e["call"] for e in whole["prefix_events"]] == [1, 2]
+        with ScriptedChatServer(script, keep_reply_limit=True) as server:
+            record, _box = _run(server, token_id_prompts=True, context_window=prompts[2])
+            limits = _limits(server)
+        assert record["finish_state"] == "context_full" and "nothing is left" in record["error"]
+        assert len(limits) == 2 and len(record["tokens"]["calls"]) == 2
+        noted = [e for e in record["prefix_events"] if "call" in e]
+        assert [e["call"] for e in noted] == [1]
+        assert noted[0]["prompt_tokens"] == record["tokens"]["calls"][1]["prompt_len"]
+        assert record["trainable"] is True and record["one_sequence"] is True
+
+    def test_a_window_one_token_too_small_for_the_whole_run(self) -> None:
+        prompts, replies = _shape()
+        whole = prompts[-1] + replies[-1]
+        with ScriptedChatServer(SCRIPT, keep_reply_limit=True) as server:
+            exact, _box = _run(server, token_id_prompts=True, context_window=whole)
+        with ScriptedChatServer(SCRIPT, keep_reply_limit=True) as server:
+            short, _box = _run(server, token_id_prompts=True, context_window=whole - 1)
+        assert exact["finish_state"] == "completed" and exact["tokens"]["final_len"] == whole
+        assert short["finish_state"] == "context_full"
+        assert short["tokens"]["final_len"] == whole - 1
+
+    def test_a_reply_that_reaches_the_reply_limit_itself_ends_as_length(self) -> None:
+        prompts, replies = _shape()
+        for window in (prompts[1] + 10, prompts[1] + 11):
+            # The reply limit is what the window has left, or one less: the
+            # reply limit is the ending either way.
+            with ScriptedChatServer(SCRIPT, keep_reply_limit=True) as server:
+                record, _box = _run(
+                    server, token_id_prompts=True, context_window=window, max_tokens=10
+                )
+            assert record["finish_state"] == "length"
+            assert record["trainable"] is True
+
+    @pytest.mark.parametrize(
+        ("budget_left", "window_left", "ending"),
+        [(8, 10, "token_budget"), (10, 8, "context_full"), (9, 9, "token_budget")],
+    )
+    def test_the_limit_that_cut_the_reply_names_the_ending(
+        self, budget_left: int, window_left: int, ending: str
+    ) -> None:
+        prompts, replies = _shape()
+        task = Task(prompt="make a file", key="t1", setup_files={"seed.txt": "seeded"})
+        task.max_generated_tokens = replies[0] + budget_left
+        with ScriptedChatServer(SCRIPT, keep_reply_limit=True) as server:
+            record, _box = _run(
+                server,
+                task=task,
+                token_id_prompts=True,
+                context_window=prompts[1] + window_left,
+                **FAST,
+            )
+            limits = _limits(server)
+        assert limits[1] == min(budget_left, window_left)
+        assert record["finish_state"] == ending and record["finish_cause"] == "model"
+        assert record["trainable"] is True and record["one_sequence"] is True
+
+    def test_a_used_up_token_budget_is_found_before_a_full_window(self) -> None:
+        prompts, replies = _shape()
+        task = Task(prompt="make a file", key="t1", setup_files={"seed.txt": "seeded"})
+        task.max_generated_tokens = replies[0]
+        with ScriptedChatServer(SCRIPT, keep_reply_limit=True) as server:
+            record, _box = _run(
+                server, task=task, token_id_prompts=True, context_window=prompts[1], **FAST
+            )
+        assert record["finish_state"] == "token_budget"
+
+    def test_a_task_whose_first_prompt_does_not_fit_is_not_the_models_outcome(self) -> None:
+        prompts, _replies = _shape()
+        with ScriptedChatServer(SCRIPT) as server:
+            record, _box = _run(server, token_id_prompts=True, context_window=prompts[0])
+        assert record["finish_state"] == "error" and record["finish_cause"] == "machinery"
+        assert "first prompt does not fit the context window" in record["error"]
+        assert record["trainable"] is False
+
+    def test_no_share_of_the_window_is_set_aside_for_a_reply(self) -> None:
+        with ScriptedChatServer(SCRIPT) as server:
+            record, _box = _run(server, token_id_prompts=True, context_window=32768)
+            limits = _limits(server)
+        assert record["limits"]["max_tokens"] == {
+            "value": 32768,
+            "source": "the framework's default for model.max_tokens",
+        }
+        # Each request may have the reply limit, or what the window has left.
+        lefts = [c["window_left"] for c in record["calls"]]
+        assert limits == [min(32768, left) for left in lefts] and limits[0] < 32768
+        assert record["finish_state"] == "completed"
+
+    def test_a_sub_agent_that_fills_its_window_did_that_itself(self) -> None:
+        assembly = PromptAssembly(ROUTE, context_window=10)
+        call = CallRecord(index=0, streamed=True, request={}, scope=SUB_AGENT)
+        with ScriptedChatServer([STEP]) as server, pytest.raises(ModelContextLimitError):
+            assembly.start(make_client(server), call, {"model": "m", "messages": MESSAGES})

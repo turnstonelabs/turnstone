@@ -17,7 +17,9 @@ would be scored as the model's outcome for a property of the configuration,
 so such a setup is refused (:class:`SetupError`).  For the same reason the
 reply limit is at most a quarter of the window, which is the most the
 framework itself reserves for a reply: with a reply limit near the window's
-size the first long tool result would end every rollout.
+size the first long tool result would end every rollout.  A run that sends its
+prompts as token IDs knows each prompt's length before it goes out and keeps
+the window exactly, so there nothing is set aside (``reserve_reply=False``).
 
 The sampling settings (:func:`resolve_sampling`): the temperature, the
 reasoning effort and the model definition's extra request parameters.  A
@@ -217,6 +219,7 @@ def resolve_limits(
     subagent_max_turns: int | None,
     max_output_chars: int | None,
     detect_context_window: Any = None,
+    reserve_reply: bool = True,
 ) -> dict[str, Limit]:
     """The limits one rollout runs under, each with its source.
 
@@ -227,6 +230,10 @@ def resolve_limits(
     *detect_context_window* is called, with no arguments, when neither an
     override nor the configuration names a context window; it returns what the
     model's endpoint reports, or ``None``.
+
+    *reserve_reply* caps the reply limit at a quarter of the window.  A run
+    that knows each prompt's length before it is sent keeps the window exactly
+    and passes ``False``.
 
     Raises :class:`SetupError` when nothing says what the context window is,
     and for an override below its limit's least value.
@@ -290,7 +297,7 @@ def resolve_limits(
     # The most the framework reserves of a window for one reply.
     reserve = max(limits["context_window"].value // 4, 1)
     reply = limits["max_tokens"]
-    if reply.value > reserve:
+    if reserve_reply and reply.value > reserve:
         limits["max_tokens"] = Limit(
             reserve,
             f"a quarter of the context window, the most the framework reserves for a reply "

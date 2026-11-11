@@ -43,6 +43,11 @@ chat-shaped stream.  :func:`check_token_id_route` establishes before a run that
 a server can do all of this, and what its template's closing and generation
 prompt are.
 
+The prompt's length is known before each request, so the context window is
+kept exactly (``PromptAssembly(context_window=...)``): a request's reply limit
+is at most what the window has left after the prompt, a request with nothing
+left is not made, and the whole sequence never grows past the window.
+
 What a server must have: a tokenize route that renders messages with tools and
 template arguments exactly as its chat route does; a completions route that
 takes a prompt of token IDs, stops on the template's end-of-turn token, and
@@ -62,6 +67,8 @@ from typing import TYPE_CHECKING, Any
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
 from turnstone.core.log import get_logger
+from turnstone.core.model_turn import ModelContextLimitError
+from turnstone.rollout.budget import ContextFullError
 from turnstone.rollout.recording import (
     _ID_PREFIX,
     PARENT,
@@ -310,6 +317,8 @@ class PromptAssembly:
     """
 
     route: TokenIdRoute
+    # The context window to keep, in tokens; ``None`` keeps none.
+    context_window: int | None = None
     # What happened that a reader of the record should know: a turn that ended
     # on another token than the template's, a prompt that is not what the chat
     # route would have rendered, a marker token whose place in its part of
@@ -449,7 +458,9 @@ class PromptAssembly:
 
     def start(self, inner: Any, call: CallRecord, request: dict[str, Any]) -> IdStream:
         """Send the chat request *request* with its prompt as token IDs."""
+        first = self._last is None
         prompt = self.prompt(inner, call, request)
+        request = self._within_window(call, request, len(prompt), first)
         outgoing = completion_request(request, prompt)
         messages = request.get("messages") or []
         call.prompt_sent = prompt
@@ -467,6 +478,37 @@ class PromptAssembly:
         }
         response = inner.completions.create(**outgoing)
         return IdStream(response, call, self, request.get("tools") or None, str(outgoing["model"]))
+
+    def _within_window(
+        self, call: CallRecord, request: dict[str, Any], prompt_tokens: int, first: bool
+    ) -> dict[str, Any]:
+        """*request* with its reply limit cut to what the context window has
+        left after a prompt of *prompt_tokens*; raises when nothing is left."""
+        window = self.context_window
+        if window is None:
+            return request
+        left = window - prompt_tokens
+        call.window_left = left
+        if left <= 0:
+            what = f"the prompt holds {prompt_tokens:,} tokens and the context window {window:,}"
+            if call.scope != PARENT:
+                # A sub-agent filled its own context window.
+                raise ModelContextLimitError(f"the context window is full: {what}")
+            if first:
+                raise PromptAssemblyError(
+                    f"the task's own first prompt does not fit the context window: {what}"
+                )
+            raise ContextFullError(f"nothing is left for a reply: {what}")
+        keys = [k for k in ("max_tokens", "max_completion_tokens") if k in request]
+        asked = [request[k] for k in keys if isinstance(request[k], int)]
+        # Less than the request would have had without the window.
+        call.window_cut = not asked or left < min(asked)
+        if not call.window_cut:
+            return request
+        request = dict(request)
+        for key in keys or ["max_tokens"]:
+            request[key] = left
+        return request
 
     # -- the reply ---------------------------------------------------------------
 

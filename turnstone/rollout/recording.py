@@ -111,6 +111,10 @@ class CallRecord:
     # than the request asked for.
     token_grant: int | None = None
     token_grant_cut: bool = False
+    # With a prompt sent as token IDs: what the context window had left for
+    # the reply, and whether that was less than the request would have had.
+    window_left: int | None = None
+    window_cut: bool = False
     # The route the request went out on: ``"chat"`` with messages,
     # ``"completions"`` with the prompt as token IDs.
     route: str = "chat"
@@ -199,6 +203,7 @@ class CallRecord:
             "index": self.index,
             "scope": self.scope,
             "route": self.route,
+            "window_left": self.window_left,
             "streamed": self.streamed,
             "request": self.request,
             "prompt_token_ids": self.prompt_token_ids,
