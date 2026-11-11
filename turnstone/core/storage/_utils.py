@@ -2539,10 +2539,10 @@ def prune_workstreams_shared(
         ),
         workstreams.c.alias.is_(None),
         workstreams.c.updated < orphan_cutoff,
-        # A holder that stopped renewing within the window may still have the
-        # row open. This boundary is measured on the database clock at each
-        # statement; the recheck only re-tests discovered ids, and a renewal
-        # in between only removes a candidate.
+        # A row last held within the window is kept: a holder that stopped renewing may still
+        # have it open, and a clean stop leaves its rows as they were for one window. This
+        # boundary is measured on the database clock at each statement; the recheck only
+        # re-tests discovered ids, and a renewal in between only removes a candidate.
         unheld_since_predicate(dialect_name, orphan_cutoff),
     )
     for ws_id in select_ids(orphan_predicate):

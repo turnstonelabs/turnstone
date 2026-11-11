@@ -31,10 +31,11 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 - **Coordinator panes come back after a console restart.** A coordinator
   pane's event stream now resumes a coordinator that was running when the
-  console stopped, so an open pane reconnects without a click. A coordinator
-  that was closed, by a user, the idle timeout or the orphan sweep, stays
-  closed. The resume needs write scope. A console that takes longer than about
-  a minute to come back leaves the pane on its reconnect banner.
+  console stopped, so an open pane reconnects without a click, including one
+  that was reopened from the saved list and only read. A coordinator that was
+  closed, by a user, the idle timeout or the orphan sweep, stays closed. The
+  resume needs write scope. A console that takes longer than about a minute to
+  come back leaves the pane on its reconnect banner.
 - **Tool restrictions on a coordinator are saved and can be lifted.**
   Restrictions placed with `POST /v1/api/workstreams/{ws_id}/restrict` now
   survive a console restart and a close and reopen, which used to lift them
@@ -78,6 +79,16 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   answer 404 and the coordinator came back on the next open. It now answers 409
   `workstream_lease_held` while another console holds the coordinator, and 503
   when the close can't be recorded.
+- **Idle cleanup waits one window after a clean stop.** A process that stops
+  cleanly now records when it last held each workstream, as a crashed one
+  already did through its lease. The idle close and the pruning of old
+  workstreams leave a row alone for one window after that (the idle timeout
+  for the idle close; the orphan grace or the retention period for pruning),
+  where a clean stop used to make a workstream with an old last-use time
+  eligible at once. A coordinator reopened to read is therefore still
+  resumable after a console restart. Workstreams on nodes follow the same
+  rule. A custom storage backend gets it by setting the lease expiry to the
+  release time in `release_workstream_lease` instead of clearing it.
 - **`coordinator.restricted` audit rows** carry `restored` and `saved` beside
   `revoked`.
 

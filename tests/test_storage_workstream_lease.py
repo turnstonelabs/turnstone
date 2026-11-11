@@ -9,8 +9,10 @@ Every write rule is identical on both.
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -331,9 +333,13 @@ def test_release_is_exact_and_keeps_the_epoch(storage_backend: Any) -> None:
     _register(backend, "ws-release")
     first = _acquire(backend, "ws-release")
 
+    before_ms = int(time.time() * 1000) - 5_000
     assert backend.release_workstream_lease(first) is True
     holder, node, epoch, expires, _updated = _lease_state(backend, "ws-release")
-    assert (holder, node, epoch, expires) == (None, None, 1, None)
+    assert (holder, node, epoch) == (None, None, 1)
+    # The expiry now says when the row was last held; with no holder it grants nothing.
+    assert before_ms <= expires <= int(time.time() * 1000) + 5_000
+    assert backend.get_workstream("ws-release")["lease_node_id"] is None
     assert backend.release_workstream_lease(first) is False
     # A released fence never matches again, even for the same holder.
     with pytest.raises(WorkstreamLeaseLostError):
@@ -343,6 +349,28 @@ def test_release_is_exact_and_keeps_the_epoch(storage_backend: Any) -> None:
     assert second.epoch == 2
     assert backend.release_workstream_lease(first) is False
     assert _lease_state(backend, "ws-release").lease_holder == "node-b/2"
+
+
+def test_cleanup_waits_one_window_after_a_release(storage_backend: Any) -> None:
+    """A released row keeps the time it was last held. Cleanup that judges a row by its age
+    leaves it for one window after the release, as it leaves the row of a holder that stopped
+    renewing: a workstream reopened to read has an old ``updated``, and the process that
+    restarts after a clean stop must find it the way the stopped one left it."""
+    backend = storage_backend
+    ws_id = "ws-released"
+    _register(backend, ws_id)
+    fence = _acquire(backend, ws_id)
+    _force_updated(backend, ws_id, "2020-01-01T00:00:00")
+    assert backend.release_workstream_lease(fence) is True
+    two_hours_ago = (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    assert backend.bulk_close_stale_orphans("interactive", two_hours_ago, []) == []
+    assert backend.get_workstream(ws_id)["state"] == "idle"
+
+    # The same row once the release is older than the window.
+    _expire(backend, ws_id)
+    assert backend.bulk_close_stale_orphans("interactive", two_hours_ago, []) == [ws_id]
+    assert backend.get_workstream(ws_id)["state"] == "closed"
 
 
 def test_a_fence_never_matches_a_later_incarnation_of_the_same_id(storage_backend: Any) -> None:

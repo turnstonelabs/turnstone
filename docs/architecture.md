@@ -684,7 +684,9 @@ database clock, against which expiry is always judged).
   shutdown every hosted session first stops admitting durable writes, then each
   drains those already admitted (one bounded wait); a session that does not
   drain keeps its lease, which expires, and the first storage failure stops the
-  release.
+  release. A release clears the holder and node and sets the expiry to the
+  release time, so the row still says when it was last held (see Idle
+  Workstream Lifecycle below).
 - **Loss.** A lost lease retires the local copy. The session latches
   publication shutdown and cancels its generation, discards rows it can no
   longer write, and tells live viewers why, before the manager unloads it
@@ -767,12 +769,15 @@ not. A second storage pass closes unloaded rows left by dead process
 incarnations whose conversation has not changed for the timeout. A workstream
 any live process has loaded renews its owner lease, so the pass skips rows
 with a live lease and fences out expired ones in the same statement; the row's
-`node_id` grants no protection of its own. It also leaves a row whose lease
-expired less than the timeout ago, since a holder whose renewals are failing
-may still have it open. On close, a `ws_closed` event is broadcast so browser
-clients remove the tab. `--workstream-idle-timeout` controls this path
-(default: 120 minutes, 0 = disable); the separate stale-create recovery above
-keeps running when it is 0.
+`node_id` grants no protection of its own. It also leaves a row that was last
+held less than the timeout ago. A lease that expired then may belong to a
+holder whose renewals are failing and who still has the row open. A lease
+released then belongs to a process that stopped cleanly: a release keeps the
+release time as the expiry, so a restarted process finds its workstreams as
+it left them, however old their conversations. On close, a `ws_closed` event
+is broadcast so browser clients remove the tab. `--workstream-idle-timeout`
+controls this path (default: 120 minutes, 0 = disable); the separate
+stale-create recovery above keeps running when it is 0.
 
 **Workstream eviction at capacity:** When `SessionManager.create()` would
 exceed `max_workstreams` (configurable via `[server].max_workstreams`, default
@@ -2138,10 +2143,11 @@ reservations, which belong to the crash-recovery path above. It removes:
   `retention_days` days ago (default 90)
 
 Named (aliased) workstreams are never pruned by either category, nor is a row
-with a live owner lease or one whose lease expired within the category's
-window (the grace, or `retention_days`): a holder whose renewals are failing
-may still have it open. Configure with `--retention-days N` (0 = disable age
-pruning; the orphan sweep still runs, grace-gated).
+with a live owner lease or one last held within the category's window (the
+grace, or `retention_days`), whether its lease expired then (a holder whose
+renewals are failing may still have it open) or was released then. Configure
+with `--retention-days N` (0 = disable age pruning; the orphan sweep still
+runs, grace-gated).
 
 ---
 
