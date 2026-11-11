@@ -1382,6 +1382,78 @@ def test_open_and_detail_still_reopen_a_closed_coordinator(
     assert factory.builds == [ws_id, ws_id]
 
 
+@pytest.mark.parametrize("verb", ["detail", "open"])
+def test_a_coordinator_reopened_from_closed_resumes_after_a_restart(
+    storage: Any, sse_executor: ThreadPoolExecutor, verb: str
+) -> None:
+    """Reopening a closed coordinator records its live state at once. A console that stops
+    before the coordinator is used again leaves a live row, so an open pane's redial resumes
+    it instead of finding the ``closed`` its last close wrote."""
+    ws_id = _live_coordinator(storage, graceful=True)
+    storage.update_workstream_state(ws_id, "closed")
+    second = _build_mgr(storage, _Factory())
+    reopening = _make_app(storage, second, sse_executor)
+    method, url = (
+        ("GET", f"{_PREFIX}/{ws_id}") if verb == "detail" else ("POST", f"{_PREFIX}/{ws_id}/open")
+    )
+
+    async def reopen() -> int | None:
+        exchange = _Exchange(reopening, method, url, _WRITER)
+        await exchange.finish()
+        return exchange.status
+
+    assert _run(reopen()) == 200
+    assert storage.get_workstream(ws_id)["state"] == "idle"
+    # The console stops with the coordinator loaded and never used.
+    second.release_leases()
+    factory = _Factory()
+    third = _build_mgr(storage, factory)
+    app = _make_app(storage, third, sse_executor)
+
+    async def redial() -> int | None:
+        stream = _Exchange(app, "GET", f"{_PREFIX}/{ws_id}/events?last_event_id=9", _WRITER)
+        await stream.wait_until(lambda: stream.status is not None)
+        status = stream.status
+        await asyncio.to_thread(third.close, ws_id)
+        await stream.finish()
+        return status
+
+    assert _run(redial()) == 200
+    assert factory.builds == [ws_id]
+    assert storage.get_workstream(ws_id)["state"] == "closed"
+
+
+def test_the_reopen_records_the_state_on_the_state_lane(storage: Any) -> None:
+    """The slot is reachable during its open, so the reopen's state write takes the lane every
+    state write takes and reads the state inside it: a transition admitted beside it cannot be
+    overwritten by an older ``idle``."""
+    ws_id = _live_coordinator(storage, graceful=True)
+    storage.update_workstream_state(ws_id, "closed")
+    second = _build_mgr(storage, _Factory())
+    writes: list[tuple[str, bool]] = []
+
+    def recording(ws: Any, state: WorkstreamState) -> None:
+        writes.append((state.value, ws._state_tail_lock.locked()))
+        real_persist(ws, state)
+
+    def moved_during_the_open(ws: Any) -> bool:
+        # A send that reached the half-built slot: its transition is admitted, its own
+        # write not yet made.
+        with ws._lock:
+            second._apply_live_state(ws, WorkstreamState.ATTENTION, "")
+        return bool(real_retain(ws))
+
+    with (
+        _patched(second, "_persist_state", recording) as real_persist,
+        _patched(second, "_retain_current_state_tail", moved_during_the_open) as real_retain,
+    ):
+        _must_open(second, ws_id)
+
+    assert writes == [("attention", True)]
+    assert storage.get_workstream(ws_id)["state"] == "attention"
+    _must_close(second, ws_id)
+
+
 # ---------------------------------------------------------------------------
 # The interactive kind is unchanged
 # ---------------------------------------------------------------------------
