@@ -415,6 +415,19 @@ pod has no other volume for sidecars, and the token volume is the server's.
 {{- end -}}
 
 {{/*
+Image pull secrets to allow pulling sidecar images from authenticated registries.
+*/}}
+{{- define "turnstone.server.imagePullSecrets" }}
+{{- range .Values.server.imagePullSecrets -}}
+{{- if not (kindIs "map" .) -}}
+{{- fail "server.imagePullSecrets: every entry is a map with property 'name'" -}}
+{{- end -}}
+{{- $name := required "server.imagePullSecrets: every entry needs a name" .name -}}
+- name: {{ $name }}
+{{- end -}}
+{{- end }}
+
+{{/*
 Configuration file and secret mounts, shared by the server and console pods.
 The file (config.file rendered into the chart's Secret, or the config.toml key
 of config.existingSecret) is mounted at /etc/turnstone; each

@@ -46,6 +46,10 @@ spec:
       initContainers:
         {{- include "turnstone.server.sidecars" . | trim | nindent 8 }}
       {{- end }}
+      {{- if .Values.server.imagePullSecrets }}
+      imagePullSecrets:
+        {{- include "turnstone.server.imagePullSecrets" . | trim | nindent 8 }}
+      {{- end }}
       containers:
         - name: server
           image: {{ include "turnstone.image" . }}
