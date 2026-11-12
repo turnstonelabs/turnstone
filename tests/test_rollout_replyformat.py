@@ -602,6 +602,10 @@ MANY_PIECES: dict[str, Any] = {
 # seconds; only a linear one gets to the sizes that would take it hours.
 SMALL = [(REPLY_TOKENS // 1024, 0.4), (REPLY_TOKENS // 64, 0.4), (REPLY_TOKENS // 8, 0.4)]
 BOUND = 3.0
+# A reply as long as the window is eight replies long, and a linear reader
+# takes eight times as long over it: on a slow machine that traces every
+# line, more than a reply's own bound.
+WINDOW_BOUND = BOUND * (WINDOW_TOKENS // REPLY_TOKENS)
 
 
 def seconds_to(read_it: Any) -> float:
@@ -631,7 +635,7 @@ class TestTime:
 
     @pytest.mark.parametrize("shape", list(MANY_PIECES))
     def test_a_text_in_very_many_pieces_is_put_together_once(self, shape: str) -> None:
-        for tokens, bound in [*SMALL, (REPLY_TOKENS, BOUND), (WINDOW_TOKENS, BOUND)]:
+        for tokens, bound in [*SMALL, (REPLY_TOKENS, BOUND), (WINDOW_TOKENS, WINDOW_BOUND)]:
             pieces = MANY_PIECES[shape](tokens)
             took = seconds_to(
                 lambda p=pieces: PARAMETER_BLOCKS.read(p, tools=TIME_TOOLS, in_reasoning=True)
@@ -651,7 +655,7 @@ class TestTime:
     def test_the_parts_of_a_reply_are_put_together_once(
         self, text: str, token_ids: list[int]
     ) -> None:
-        for tokens, bound in [*SMALL, (REPLY_TOKENS, BOUND), (WINDOW_TOKENS, BOUND)]:
+        for tokens, bound in [*SMALL, (REPLY_TOKENS, BOUND), (WINDOW_TOKENS, WINDOW_BOUND)]:
             parts = [(text, token_ids)] * tokens
             took = seconds_to(lambda p=parts: pieces_from_chunks(p, IDS, TEXT))
             assert took < bound, f"{tokens} parts took {took:.2f} s"
