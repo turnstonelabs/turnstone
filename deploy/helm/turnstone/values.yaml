@@ -79,6 +79,10 @@ server:
   #      runAsNonRoot: true
   #      allowPrivilegeEscalation: false
   #      capabilities: {drop: [ALL]}
+  # --- Image pull secrets to allow pulling sidecar images from
+  # authenticated registries.
+  imagePullSecrets: []
+  #  - name: toolchain-pull-secret
 
 # -- Turnstone console (cluster dashboard)
 console:
