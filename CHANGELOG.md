@@ -12,6 +12,319 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ## [2026-11-11]
 
+### Added
+
+- **`run_with_lifecycle` takes the number of attempts.** The eval harnesses
+  retried a failed run up to three times, a count written into the loop. It is
+  now the `attempts` parameter, still 3 by default. A caller whose run must not
+  be repeated passes `attempts=1`: the first failure is raised with no backoff,
+  and one `test_timeout` bounds the whole run.
+- **Stable prefix for headless runs.** `HeadlessSession(stable_prefix=True)`
+  makes every request of a run begin with the previous request's messages,
+  unchanged, so a caller that records each prompt holds one growing sequence.
+  Earlier reasoning is sent back on every request, the system messages, tool
+  list and effort are taken once, a turn over the tool-call limit keeps every
+  call and answers the ones it did not run, a tool that would change the prompt
+  or the tool list is refused, a reply cut at the token limit ends the run, and
+  a request that would resend earlier context changed raises `StablePrefixError`
+  instead of being sent. With `raw_arguments`, typed tool-call arguments are
+  sent back as the text the model wrote (`True`, `None`), which a server's
+  template cannot reproduce from the parsed value. Off by default. See
+  [the eval guide](docs/eval.md#stable-prefix).
+- **Execution environment for the shell and file tools.** `bash` (foreground
+  and background), `bash_output`, `kill_shell`, `read_file`, `write_file`,
+  `edit_file`, `search` and `diff_file` now reach processes and files only
+  through an `ExecutionEnvironment` (`turnstone/core/exec_env.py`), in both
+  their prepare and execute steps. The class itself is the host and nothing
+  changes for a session without one; `ChatSession(exec_env=...)` moves all of
+  them at once, for example into a container, with the executors unchanged.
+  An environment says whether it acts on the machine the session runs on
+  (`acts_on_host`), so that a caller can refuse one that does.
+  The host signals a process group through one function (`signal_group`),
+  which sends nothing to an id that is not certain to be the group of the
+  command it is ended for: 1, 0, the caller's own group, anything that is no
+  `int`, an id another process has by then.
+  Tool definitions gain the `environment` metadata key for these tools. See
+  [the tools reference](docs/tools.md#execution-environment).
+- **A headless run can be limited to named tools.**
+  `HeadlessSession(tool_names=...)` offers only those tools and refuses a call
+  to any other before its preparer runs; without it a model can call a tool it
+  was never offered, because dispatch is by name. The limit also holds for a
+  task agent the run spawns. A headless session given an execution environment
+  offers only the tools that act through it unless `tool_names` says otherwise,
+  and their descriptions name the environment's working directory.
+- **A headless run can offer the tools of its own MCP client.**
+  `HeadlessSession(mcp_client=..., mcp_tools=True)` offers the tools of the MCP
+  client the session was given, read once when the session is built, beside the
+  named or environment tools; a tool of any other server is refused. For a run
+  that brings its own servers: a client built from those servers only keeps
+  every configured server out of reach. Headless runs offer no MCP tool
+  otherwise.
+- **Rollouts: one headless run recorded for training (`turnstone-rollout`).**
+  `turnstone.rollout` runs a task through the headless session with the model's
+  shell and file tools acting inside a container made for that run, and records
+  every model call's prompt token IDs, generated token IDs and
+  log-probabilities. The container is the task's (image, working directory,
+  user, what is writable, capabilities, limits; by default an unprivileged user
+  over a read-only root), has no network and nothing of this machine's mounted
+  into it but the three files the runtime puts into every container, and is
+  removed afterwards with the removal confirmed. A setting that can be seen to
+  be wrong without asking the runtime is refused before anything is started: a
+  user that is neither a name nor a number, an environment variable without a
+  name, a size or a limit that is none or is zero. A writable root always has a
+  size (`root_size`, 10g where the task names none), and those three files
+  count toward it. The storage driver keeps that size only where the
+  container's own file system then shows it; a runtime that takes the size
+  and bounds nothing with it is found out when the container starts, and the
+  harness watches the size there. Its main process runs as a user of its
+  own and is out of reach of the task's commands, except where the task's own
+  settings give that reach back; what a model then does to its container is
+  recorded as its own outcome. A rollout refuses an execution environment that
+  acts on the machine it runs on unless its caller says that this is meant
+  (`allow_host_execution`). The record says whether it is `trainable` (each
+  call's tokens and log-probabilities are complete and checked token by token,
+  they come from the distribution the tokens were sampled from, which a probe
+  establishes on differences that the movement of a busy server's values
+  cannot produce, at the first token of a short reply that the model is
+  unsure of (its very first, or a later one where it is certain of that),
+  leaving a setting undecided where the evidence is not clear,
+  and nothing but the model decided how the run went) and whether
+  it is `one_sequence` (every prompt extended the previous one). A record is
+  left out of training only for causes outside the model's control: whatever
+  the model can bring about, down to running out of time, is an outcome that
+  stays trainable. A conversation the server refuses for what it holds is among
+  those: a sub-agent's comes back to the model as a failed delegation, and the
+  session's own, after its first request, ends the rollout as
+  `request_refused`. The reply limit, context window, tool time limit, sub-agent
+  turn limit, temperature and reasoning effort are the framework's settings for
+  the model unless overridden; a context window that nothing names is refused,
+  not guessed, so is a number below the least it can be (a context window or a
+  reply limit of zero, a temperature below zero), and so is a configuration
+  file that is named and not there or that cannot be read or parsed, which is
+  never taken as an empty one. A
+  sub-agent is a tool like any other for the sample: it acts in
+  the same container, and its own conversation is kept apart and not trained
+  on. The command's exit status is read off the record: text in its printed
+  summary that the output cannot encode is escaped, and an output or error
+  stream that takes no writes changes nothing, whoever wrote to it. See
+  [the rollout guide](docs/rollout.md).
+- **Rollouts: a check after the model has finished.** `run_episode(verifier=...)`
+  stops the episode's container once the run is over and calls the given
+  function with the stopped container, so that nothing the model left running
+  can change what is read; what it returns is stored under the record's
+  `verification` and the model never sees it. Helpers read paths out of a
+  stopped container without running anything inside it and start a clean
+  container, never touched by the model, to put files into and run the check
+  in; the task's own files win over anything of the model's that stands in
+  their way. A task's `after_run` commands cover the simple case in the
+  episode's own container; what was left running there is ended first,
+  whoever it runs as, and each command's result says what was found and
+  what could not be ended (`leftovers`). A check that runs and fails is the
+  model's outcome,
+  and so is what the model left for the check to find: more than a helper will
+  read, a path that cannot be read. A check that raises, runs out of time or
+  returns no verdict leaves no reward, and the record is then not trainable.
+  Every container is removed afterwards.
+- **Rollouts: a task's own servers in a sidecar, reached as MCP tools.** A task
+  may bring a second container (`Task.sidecar`) with files, a setup command and
+  MCP servers. It has no network, like the episode's container; the session
+  reaches its servers through the runtime's own channel into it, by way of a
+  loopback listener that carries only connections naming a secret made for
+  the rollout, and the model uses them as tools, each call in the tool log.
+  The secret is taken out of a request before it goes on, and what other
+  connections can hold of the runner is bounded in time and in number.
+  The MCP client is built from
+  the servers the task names and no others, its tool list is fixed for the run,
+  and it is shut down with the rollout. A sub-agent is offered these tools as
+  the session is, through the same client, and every call it makes is in the
+  record apart from the session's own (`subagents.tool_log`); a run can
+  withhold them (`subagent_sidecar_tools`, `--no-subagent-sidecar-tools`). A
+  sidecar that does not come up or stops during the run makes the record not
+  trainable; a call the model gets wrong is an ordinary result. Both containers
+  are removed afterwards, and a verifier is given the stopped sidecar to read
+  its state from.
+- **Rollouts: pattern rules on tool calls.** A rollout enforces a rule set of
+  its own on the model's tool calls, the session's and a sub-agent's alike: a
+  rule that says deny refuses the call before anything runs, with a fixed text
+  as an ordinary tool result, and a rule that says review lets it run and is
+  recorded. A call is judged as it will run: under the name the tool is
+  dispatched by, with arguments that are no JSON made into arguments and a
+  command's typographic dashes and quotes written plain, the way the session
+  runs it. The set shipped with the rollout package (`rules.json`, in the
+  heuristic rule format) keeps what is destructive anywhere, such as deleting
+  the root of a file system or signalling every process, and leaves a root
+  user's ordinary work in a throwaway container alone; a run can replace it or
+  add rules. A rule looks for its program where a command starts, also behind
+  `sudo` and its like, an assignment or a keyword of the shell, and by its
+  path in a system directory; a program that is only named in a text runs. The rules are not isolation: they are patterns that can be written
+  around, and nothing that confines a model rests on them. Every repeat in a
+  pattern must have a limit, so that a long command cannot stall the match; a
+  rule set with an unbounded repeat is refused. The record names the set in
+  force by name and content hash. The fixed list that protects the machine a
+  session runs on is not asked inside a rollout's container, and the
+  model-based judge never runs in a rollout. Interactive and other headless
+  sessions are unchanged.
+- **Rollouts: budgets of the model's own, and the time limit as a backstop.** A
+  task can give the model a budget of generated tokens (`max_generated_tokens`,
+  the session's and its sub-agents' together) and of time its commands may run
+  (`max_command_seconds`); running out of either ends the rollout as the
+  model's own outcome (`token_budget`, `command_time`). With a token budget the
+  time limit stops being the model's and becomes a backstop for the machinery.
+  A run that reaches it is judged by what the server was asked to do and a
+  configured minimum speed (`min_tokens_per_second`): a server slower than
+  that, or a harness that took the time itself, ends the rollout as `backstop`,
+  not trainable; a server that kept its speed leaves it the model's `timeout`.
+  Without a token budget the time limit is the model's as before, and a request
+  whose prompt the server is still working on is given the time that prompt
+  takes before its silence counts as a stalled server. The record splits the
+  run's time into the server's, the commands' and the harness's, holds the
+  server's measured speeds (`time`) and lists the budgets with what was spent
+  (`budgets`).
+- **Rollouts: commands of the task's own before the model starts.**
+  `Task.before_run` names commands that run in the episode's container once the
+  task's files are in place and before any model call, as root unless a command
+  says otherwise, each with its own time limit: build leftovers purged, a
+  service started. The model sees nothing of them, the rules on tool calls are
+  not asked about them, and their time is start-up time, not the task's. Their
+  results are in the record (`before_run`). A command that fails or runs out of
+  time means the run does not start: the record ends as `before_run_failed`,
+  not trainable. A run that did not start is not checked afterwards either. See
+  [the rollout guide](docs/rollout.md#before-the-run).
+- **Rollouts: the server's version before the first model call and after the
+  last.** A server whose weights are replaced in place between batches serves
+  two models under one name, and a rollout that saw both was not sampled from
+  one policy. `RolloutConfig.server_version_url` (`--server-version-url`, with
+  `--server-version-field` for one field of a JSON answer) names an address
+  that is asked right before the run's first model call can go out, the probe
+  and sub-agent calls included, and right after its last has returned. Both
+  answers are in the record (`server_version`). A rollout whose two answers
+  differ, or that gets none after the run, is not trainable, and how it ended
+  stays what it was; without an answer before the run it does not start
+  (`server_version_unknown`). See
+  [the rollout guide](docs/rollout.md#one-version-of-the-server).
+- **`turnstone-rollout` takes a task file and a verifier command.** For a
+  caller that starts the command as a process, one per rollout. `--task FILE`
+  gives the whole task as one JSON object (prompt, files as text or base64,
+  limits and budgets, every container setting, before-run and after-run
+  commands, a sidecar); it is read strictly, so an unknown key, a key given
+  twice or a value of the wrong kind is refused by name, and a task flag beside
+  it is refused. `NaN` and the infinities are refused wherever the command
+  reads a number, and the record it writes is strict JSON. `--verifier-command` names a program of the operator's that is
+  started on this machine without a shell once the episode's container is
+  stopped, with `{container}`, `{sidecar}` and `{key}` in its arguments
+  replaced (never in the program's own name, and a key is one argument
+  whatever it holds); what it prints must be one JSON object with a `verdict`,
+  and no
+  verdict, a status other than 0 or the time limit (`--verifier-timeout`) means
+  no reward exists and the record is not trainable. `--probe-only` probes the
+  server and prints the verdict, which `--sampler-logprobs` then passes to each
+  rollout of a batch; written to `--out`, a new verdict takes the earlier
+  one's place in one step. The output limits, the read limit, the server stall time
+  and the API key's environment variable have flags. The exit status gains 3
+  for a command line, task file or configuration that was refused with nothing
+  run (a usage error included, which was 2), and `--out` is written under
+  another name and renamed, so the record is there whole or not at all. Where
+  it points is looked at before anything runs: a folder that is not there or
+  takes no file is refused, so is a place that holds a file the command reads
+  or anything but a file, and a file already there is removed, so that
+  afterwards the file is this run's record or is not there. See
+  [the rollout guide](docs/rollout.md#a-task-file).
+- **Rollouts: a sub-agent's tool calls are in the record.** A sub-agent acts in
+  the episode's container, and its calls were in no log, so a model could hand
+  a sub-agent what it did not want counted. `subagents.tool_log` now holds
+  every tool call a sub-agent's model issued, apart from the session's own
+  `tool_log` and not part of the training sample: which sub-agent, its turn,
+  the tool, the arguments, the result's first 500 characters, whether it
+  succeeded, and the rule that matched. A call that never ran is there too (one
+  a rule refused, a tool the sub-agent is not offered). The session's
+  `tool_log` entry of a delegation carries the sub-agent's number beside what
+  was asked of it. See [the rollout guide](docs/rollout.md#sub-agents).
+- **Rollouts: one bound on the size of a single tool result.** The tools bound
+  their results each in their own way and some not at all: a file read came
+  whole up to 256 KiB, a sub-agent's answer and a server tool's result without
+  any bound, a command's output at half the truncation setting and never under
+  32,000 characters. `RolloutConfig.max_tool_result_chars`
+  (`--max-tool-result-chars`) is one bound in characters that no single result
+  exceeds when it enters the session's conversation, whatever the tool. A
+  longer result is cut the same way every time, so the prompt still extends,
+  and the cut says what was left out and how to get it: a file read keeps whole
+  lines and names the line to read on from with `offset` and `limit`, anything
+  else keeps its beginning and its end around a counted gap with the tool's own
+  advice. The record has the bound with the other limits, counts the results
+  that were cut (`tool_results`), and the tool log gives the size a cut result
+  had (`cut_from`). Unset, nothing changes. With the bound or without it, half
+  of a surrogate pair in a tool result is replaced where the result enters the
+  conversation: no request body can carry one, and the next request could not
+  have been sent. See
+  [the rollout guide](docs/rollout.md#one-bound-on-a-tool-result).
+- **Rollouts: a reply read from its text.** `turnstone.rollout.replyformat`
+  reads reasoning, text and tool calls out of what a model generated, for a
+  server that hands back text only. How a reply is written is a description
+  asked for by name; the one defined is reasoning that a marker closes, then
+  text, then calls as tagged blocks with one tagged block per argument. The
+  reading is the one a server of that format gives in its non-streamed reply,
+  down to the type of every argument value, which the tool's schema decides.
+  Markers the model generates as one token count only as those tokens, so a
+  marker quoted in a file's content stays text; in a reply that arrives in
+  parts a marker's token is told from the same characters spelled out beside
+  it by the order of the part's tokens. A reply is read in time
+  proportional to its length, whatever the model wrote. Recorded replies with
+  what a server read in them pin the behaviour. See
+  [the rollout guide](docs/rollout.md#reading-a-reply-without-the-server).
+- **Rollouts: prompts sent as token IDs.** With
+  `RolloutConfig(token_id_prompts=True)` or `--token-id-prompts` every prompt of
+  a rollout is the previous prompt, the tokens generated after it and what the
+  server's chat template writes next, sent as token IDs to the completions
+  route. A model can generate a split of a text into tokens that a tokenizer
+  does not reproduce, which broke the sequence of a rollout sent as messages at
+  a place nothing could reach; it no longer can. What the template writes next
+  is taken from the server's own renderings on its tokenize route, never
+  rendered by the harness, and each thing that relies on is checked on every
+  call: a call that fails one is not sent and the run ends as the machinery's
+  failure with the reason. The reply is read on the client, so the server needs
+  no reader of reasoning or tool calls. Before a run the server is checked for
+  what the mode needs, and one that lacks it is refused, with no falling back
+  to messages; the log-probability probe asks on the route the run uses. The
+  check fails only for what the server does: where it has to see a marker or
+  the end-of-turn token generated and the model would write another token, the
+  server is steered to it, and what cannot be seen that way is said in the
+  verdict and held against every reply of the run instead.
+  A prompt built this way that is not what the chat route would render for the
+  same conversation is noted in the record (`prefix_events`:
+  `prompt_differs_from_rendering`, for a call that returned a reply to it); it
+  stays trainable.
+  Sub-agents use the same route. The record says how the prompts went
+  (`prompt_mode`) and keeps the check's verdict (`token_id_route`). Off by
+  default. See [the rollout guide](docs/rollout.md#prompts-as-token-ids).
+- **Rollouts: the context window kept exactly.** With prompts as token IDs a
+  rollout knows each prompt's length before it is sent, so the whole sequence
+  never passes the context window and can use it to its last token. A request's
+  reply limit is the smallest of the reply limit, what the token budget grants
+  and what the window has left; a request with nothing left is not made. A run
+  ends as `context_full` when nothing is left before a request or when a reply
+  was cut at what the window had left, as `length` when a reply reached the
+  reply limit itself, and as `token_budget` when the budget was the smaller;
+  each is the model's outcome and trainable. No share of the window is set
+  aside for a reply in this mode, and a task whose first prompt does not fit
+  ends as the machinery's failure. A run that sends messages keeps its
+  estimate, and the guide now says how early it can end. See
+  [the rollout guide](docs/rollout.md#the-context-window-exact).
+- **`turnstone-rollout`: one check of the server for a batch with prompts as
+  token IDs.** `--probe-only` with `--token-id-prompts` also checks the server
+  for what the mode needs, probes on the completions route, and prints both
+  verdicts in one object. `--token-id-route` hands the check's verdict to each
+  rollout as `--sampler-logprobs` hands on the probe's, so that no rollout of a
+  batch asks the server again. Both verdicts name what they were made for (the
+  model, the endpoint, the time, beside the probe's route and the check's
+  reply format and template arguments), and a run refuses one made for
+  anything else, one that does not say, and one of the wrong shape, with
+  nothing run. A verdict that was given is kept in the record as it was given,
+  and a run's first prompt is held against the generation prompt the check
+  found.
+  `logprob_verdict` and `token_id_route_verdict` in `turnstone.rollout.episode`
+  do the same from Python. See
+  [the rollout guide](docs/rollout.md#started-by-another-program).
+
 ### Fixed
 
 - **Assistant replies are styled the same in the console as on a node's own
@@ -38,6 +351,64 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   summary showed no focus ring while closed, and a code fence or diagram
   placed directly in the block showed only the top and bottom of its ring.
   Both now show the whole ring.
+- **`search` finds matches when it is given a single file and runs its
+  fallback program.** Where the preferred search program is not installed, the
+  fallback leaves the file name out of its output for a single file, which the
+  result parser read as malformed, so the search failed with "all matches
+  returned were malformed" while searching a directory worked. The fallback now
+  always names the file.
+- **A null the model wrote as text is read as no value.** A server that parses
+  tool calls out of generated text passes an argument it does not recognise on
+  as a string, so a model that wrote `None` for an optional number delivered the
+  string `"None"`, and `read_file` refused the call over its `offset`. For an
+  argument that is exactly `"None"` or `"null"` the parameter's schema now
+  decides: it becomes null where the schema allows null, and counts as not given
+  where the parameter is optional, not a string and has no null. A string
+  parameter keeps the text, and so does a required parameter (the tool's
+  validation answers the model) and one the schema does not describe. A schema
+  that is not well formed never fails the call: what names no parameter in its
+  `required` list is passed over, and branches nested deeper than a schema
+  goes leave the text as it is.
+- **A shell command that cannot be written leaves no script file behind.** A
+  command holding half of a surrogate pair, which a model can write as an
+  escape, cannot be encoded: the shell tool reports that, and each such call
+  used to leave an empty script file in the temporary directory. The file is
+  now removed when writing it fails, as it already was when the shell could not
+  be started.
+- **Rollouts: a sandbox that goes away before the model has taken a turn is not
+  the model's outcome.** In a container whose settings let its commands end it,
+  an end that nothing outside explains is taken to be the model's doing
+  (`sandbox_destroyed`, trainable). That also held for a container that went
+  away while it was being brought up, or before the first model turn had come
+  back, so a run the model never took part in was handed to a reward. A run
+  that did not start now keeps its own ending (`sandbox_failed`,
+  `sidecar_failed`), and a sandbox lost with no model turn behind it is
+  `sandbox_lost`, the machinery's. So is one found gone when the first of the
+  model's tool calls is about to run; and where the machinery had failed
+  first, while the sandbox was still there, that failure is the run's ending.
+- **Rollouts: a task's file with an absolute path is put where its path says,
+  whatever its content.** A task's text files were written where their paths
+  say, and its other files (`Task.files`, content as bytes) were all unpacked
+  in the working directory, so one named `/tmp/said/other.bin` landed under
+  the working directory without a word. Both kinds now follow one rule: a
+  relative path is in the working directory, an absolute one is taken as it
+  is, written as the user the model's commands run as.
+
+### Documentation and verification
+
+- **Rollouts: the time limit, the stall rule and the server's minimum speed are
+  tested with prompts as token IDs.** They read the call records (when a
+  request went out, when the server last gave something, when the first
+  generated token came), which with prompts as token IDs are taken on another
+  route. Four rollouts against the scripted server show that they mean the
+  same there.
+- **Rollout guide: the limits of the newer settings are among the known
+  limits.** The list a user of the harness reads in one place now also names
+  what a server under load can fail before a run, a server without readers of
+  its own, how early a run that sends messages can end, a tool result that is
+  never shortened to fit the window, what the two questions about the server's
+  version rest on, that a verifier command runs on the machine itself, and
+  that a sub-agent's own prompts are not one sequence.
 
 ## [2026-11-10]
 

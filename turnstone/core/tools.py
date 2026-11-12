@@ -37,6 +37,13 @@ _META_KEYS = {
     # example.
     "cwd_note",
     "workspace_note",
+    # True when every effect of the tool goes through the session's execution
+    # environment (``exec_env.ExecutionEnvironment``): the shell and file
+    # tools.  A session whose environment is not this host can offer exactly
+    # these and know that nothing the model does lands anywhere else.  A tool
+    # that also reaches the network, the stores or other people must not
+    # declare it.
+    "environment",
 }
 
 
@@ -46,7 +53,8 @@ def _load_tools() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     Returns (tool_defs, metadata) where:
       - tool_defs: list of OpenAI function-calling dicts
       - metadata: dict mapping tool_name -> {task_agent, coordinator,
-                  interactive, auto_approve, primary_key, kind_variants}
+                  interactive, auto_approve, primary_key, kind_variants,
+                  environment}
     """
     tools = []
     meta = {}
@@ -126,6 +134,8 @@ INTERACTIVE_TOOLS = [
     )
 ]
 INTERACTIVE_TOOL_NAMES = frozenset(t["function"]["name"] for t in INTERACTIVE_TOOLS)
+# Tools that act only through the session's execution environment.
+ENVIRONMENT_TOOL_NAMES = frozenset(n for n, m in _META.items() if m.get("environment"))
 TASK_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 PRIMARY_KEY_MAP = {n: m["primary_key"] for n, m in _META.items() if "primary_key" in m}
 
@@ -245,6 +255,131 @@ def apply_cwd_context(
             fn["description"] = " ".join([fn.get("description", "").rstrip(), *notes]).strip()
         out.append(tool)
     return out
+
+
+# Spellings of "no value" that arrive as text: a model writes Python's or
+# JSON's null, and a server that parses tool calls from text hands it on as a
+# string when it does not recognise it.
+_NULL_SPELLINGS = frozenset({"None", "null"})
+
+
+# How many levels of ``anyOf`` / ``oneOf`` a parameter schema is followed into.  A schema
+# is whatever a server sent: one that nests its branches deeper than any real one, or
+# holds itself, must not take the reading of it past the interpreter's recursion limit.
+_MAX_SCHEMA_BRANCH_DEPTH = 32
+
+
+def _schema_admits_string(schema: Any, depth: int = 0) -> bool:
+    """Whether a parameter schema could mean a string value.
+
+    Anything unclear counts as admitting one: an untyped parameter, a schema
+    that is not an object, an ``enum`` that lists strings, a branch of
+    ``anyOf`` / ``oneOf`` that admits one, or branches nested deeper than
+    they are followed.
+    """
+    if not isinstance(schema, dict) or depth > _MAX_SCHEMA_BRANCH_DEPTH:
+        return True
+    enum = schema.get("enum")
+    if isinstance(enum, list):
+        # The listed values are all there is.
+        return any(isinstance(v, str) for v in enum)
+    for key in ("anyOf", "oneOf"):
+        branches = schema.get(key)
+        if isinstance(branches, list):
+            return any(_schema_admits_string(branch, depth + 1) for branch in branches)
+    kind = schema.get("type")
+    if kind is None:
+        return True
+    kinds = kind if isinstance(kind, list) else [kind]
+    return "string" in kinds
+
+
+def _schema_admits_null(schema: Any, depth: int = 0) -> bool:
+    """Whether a parameter schema says the value may be null."""
+    if not isinstance(schema, dict) or depth > _MAX_SCHEMA_BRANCH_DEPTH:
+        return False
+    if schema.get("nullable") is True:
+        return True
+    enum = schema.get("enum")
+    if isinstance(enum, list) and any(v is None for v in enum):
+        return True
+    for key in ("anyOf", "oneOf"):
+        branches = schema.get(key)
+        if isinstance(branches, list) and any(
+            _schema_admits_null(branch, depth + 1) for branch in branches
+        ):
+            return True
+    kind = schema.get("type")
+    kinds = kind if isinstance(kind, list) else [kind]
+    return "null" in kinds
+
+
+# What becomes of an argument whose value is a null spelled as text.
+NULL_SPELLING_TO_NULL = "null"
+NULL_SPELLING_NOT_GIVEN = "not_given"
+
+
+def null_spelled_arguments(args: dict[str, Any], tool: dict[str, Any] | None) -> dict[str, str]:
+    """Top-level arguments of *tool* that hold a null spelled as text, and what
+    each should become.
+
+    A model that means "no value" may write ``None`` or ``null`` for it, and a
+    server that parses tool calls out of generated text hands an argument it
+    does not recognise on as a string.  For a value that is exactly one of the
+    two spellings, the parameter's schema decides:
+
+    - it may be a string: the text may be the value, and stays (not listed);
+    - it allows null: the argument becomes null (``NULL_SPELLING_TO_NULL``);
+    - it is optional, not a string and does not allow null: the argument counts
+      as not given (``NULL_SPELLING_NOT_GIVEN``), which is what the model meant
+      and what the schema has a place for;
+    - it is required, not a string and does not allow null: the value stays, so
+      that the tool's own validation tells the model (not listed).
+
+    A parameter the tool's schema does not describe keeps its value.  *tool* is
+    a tool definition in function-calling form, ``None`` when the tool is
+    unknown.
+
+    The schema is whatever the tool's server sent, and this is asked for every
+    call of the tool, so it never raises over one: a part of the schema that
+    is not what a schema holds there says nothing.
+    """
+    function = tool.get("function") if isinstance(tool, dict) else None
+    parameters = function.get("parameters") if isinstance(function, dict) else None
+    properties = parameters.get("properties") if isinstance(parameters, dict) else None
+    if not isinstance(parameters, dict) or not isinstance(properties, dict):
+        return {}
+    required = parameters.get("required")
+    # Only a string names a parameter.  Anything else in the list names none, also
+    # what could not be put in a set (a list, an object).
+    required_names = (
+        {name for name in required if isinstance(name, str)}
+        if isinstance(required, list)
+        else set()
+    )
+    found: dict[str, str] = {}
+    for name, value in args.items():
+        if not isinstance(value, str) or value not in _NULL_SPELLINGS or name not in properties:
+            continue
+        schema = properties[name]
+        if _schema_admits_string(schema):
+            continue
+        if _schema_admits_null(schema):
+            found[name] = NULL_SPELLING_TO_NULL
+        elif name not in required_names:
+            found[name] = NULL_SPELLING_NOT_GIVEN
+    return found
+
+
+def apply_null_spellings(args: dict[str, Any], tool: dict[str, Any] | None) -> dict[str, str]:
+    """Change *args* in place as :func:`null_spelled_arguments` says; returns what it said."""
+    found = null_spelled_arguments(args, tool)
+    for name, outcome in found.items():
+        if outcome == NULL_SPELLING_TO_NULL:
+            args[name] = None
+        else:
+            del args[name]
+    return found
 
 
 def merge_mcp_tools(

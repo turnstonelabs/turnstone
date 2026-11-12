@@ -878,6 +878,7 @@ turnstone metadata keys:
 | `primary_key` | `str` | Fallback argument name for bare-string JSON recovery |
 | `kind_variants` | `object` | Override descriptions or parameter schemas for a workstream kind |
 | `cwd_note` / `workspace_note` | `str` | Append a session-specific path note without mutating the shared schema constants |
+| `environment` | `bool` | Mark a tool whose every effect goes through the session's execution environment (the shell and file tools) |
 
 Example (`read_file.json`):
 

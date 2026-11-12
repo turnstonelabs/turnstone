@@ -42,6 +42,7 @@ set lives in `_META_KEYS` in `turnstone/core/tools.py`):
 | `kind_variants`  | dict | Per-kind description / parameter-schema overlays so each session kind sees only the surface it can use (see `memory.json`). |
 | `cwd_note`       | str  | Sentence appended to the description at session build time with `{working_dir}` substituted — declare on tools whose semantics depend on the process working directory (see `bash.json`, `apply_cwd_context`). |
 | `workspace_note` | str  | Companion sentence naming the operator-configured workspace directory, `{workspace_dir}` substituted; dropped when no workspace is configured. |
+| `environment`    | bool | Every effect of the tool goes through the session's execution environment (see [Execution environment](#execution-environment)). Declared by the shell and file tools only. |
 
 ---
 
@@ -56,6 +57,7 @@ set lives in `_META_KEYS` in `turnstone/core/tools.py`):
 | `TASK_AUTO_TOOLS`   | Set of all tool names with `auto_approve: true` -- used by task-agent sub-sessions to skip confirmation for matching available tools. |
 | `BUILTIN_TOOL_NAMES`| Frozenset of the built-in union. Used by tool search to distinguish built-ins from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
+| `ENVIRONMENT_TOOL_NAMES` | Frozenset of the tools with `environment: true`: `bash`, `bash_output`, `kill_shell`, `read_file`, `write_file`, `edit_file`, `search`, `diff_file`. |
 
 ---
 
@@ -75,6 +77,21 @@ trajectory (phase 4).
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
+- Reads a null written as text as no value. For an argument whose value is
+  exactly `"None"` or `"null"`, the parameter's schema decides:
+
+  | The parameter | The tool gets |
+  |---------------|---------------|
+  | may be a string | the text, which may be the value |
+  | allows null | null |
+  | is optional, not a string, without null | no such argument |
+  | is required, not a string, without null | the text, so that validation answers the model |
+
+  A parameter the schema does not describe keeps the text. Only top-level
+  arguments are looked at, and only where the arguments are an object:
+  arguments that are valid JSON of another kind (a list, a bare string, a
+  number) are passed on as they came, and the call fails as it would have. A
+  headless run's tool log shows the arguments after this step.
 - Dispatches to the matching `_prepare_{func_name}()` handler, the synthetic
   `tool_search` fallback, or the generic `_prepare_mcp_tool()` handler.
 - Validates arguments and builds a preview dict containing:
@@ -794,6 +811,82 @@ its own approval rule.
   approval and the `model.skills.write` permission, which no role has by default.
 - **Agent availability**: Interactive and coordinator sessions; not available to
   task sub-agents.
+
+---
+
+## Execution environment
+
+The shell tools (`bash` and its background variant, `bash_output`, `kill_shell`)
+and the file tools (`read_file`, `write_file`, `edit_file`, `search`,
+`diff_file`) reach processes and files only through the session's
+`ExecutionEnvironment` (`turnstone/core/exec_env.py`). The class itself is the
+host: its methods are the `os`, `open` and `subprocess` calls the tools made
+before, and a session built without an environment uses the shared
+`HOST_ENVIRONMENT`, so nothing changes for it.
+
+`ChatSession(exec_env=...)` moves all of those tools at once, for example into
+one container per run, while the executors stay the same: output capture, time
+limits, cancellation, the read-before-edit rule. Both halves of a tool go
+through the environment, the prepare step that resolves and checks a path and
+the execute step that reads or writes it.
+
+| Group   | Methods | Used by |
+|---------|---------|---------|
+| Shell   | `spawn`, `kill_group`, `process_label`, `command_refusal` | `bash` (foreground and background), `kill_shell`, cancellation |
+| Search  | `which`, `popen_search` | `search` |
+| Paths   | `getcwd`, `expanduser`, `abspath`, `realpath`, `exists`, `stat` | every file tool |
+| Content | `read_bytes`, `read_text`, `read_lines`, `write_text` | `read_file`, `write_file`, `edit_file`, `diff_file` |
+
+Two bounds, `max_text_chars` and `max_diff_lines`, limit what a tool may build
+in the session's own process from what the model controls: an edit refuses a
+result longer than the first before building it (a replace-all multiplies a
+file), and `diff_file` refuses more lines than the second (comparing files with
+many repeated lines takes time quadratic in their length). The host has
+neither bound. The working-directory notes in tool descriptions, the task
+agent's included, name the environment's directory.
+
+`command_refusal` is asked when a shell call is prepared and says why a command
+must not be started, or nothing. The host answers with its fixed list of
+patterns, exactly as before; the list protects the machine the session runs
+on, and an environment whose commands run elsewhere answers for that place.
+
+`acts_on_host` says whether what an environment does takes effect on the
+machine the session runs on. The base class is that machine and says so; a
+subclass that moves every method somewhere else says it does not, and one that
+does not say is taken to act here. A caller that must keep a model's commands
+off this machine refuses an environment that acts on it. A
+[rollout](rollout.md#where-the-tools-act) is such a caller: it takes one only
+where its own caller says that this is meant.
+
+An implementation must keep three things. `kill_group` is called after every
+foreground command, also one that exited normally, so it must stop exactly
+that command's process group. A missing file raises `FileNotFoundError` and
+any other failure an `OSError`, whose text the tools show to the model. Text is
+split into lines where the built-in text mode splits it.
+
+The host sends every signal to a process group through one function,
+`signal_group` in `turnstone/core/background_shells.py`, and an environment
+that signals a group on this machine should do the same. A group id of 1 names
+every process the user may signal, 0 is the caller's own group, and an id that
+was freed can be another group's a moment later. So the function sends nothing
+unless the id is an `int` above 1 (not a `bool`, and nothing that merely
+converts to a number), is not the caller's own group, and is the id of the
+command the group belongs to. The host's `kill_group` also kills the group of
+a command that has ended and been collected, for what the command left
+running there, but not once another process has the id: an id is not given out
+again while its group has members. A refusal reads like an empty group
+(`ProcessLookupError`).
+
+The other tools do not go through it. They reach the network (`web_fetch`,
+`web_search`), the stores (`memory`, `recall`, `skills`), other people
+(`notify`), the host's schedulers and panes (`watch`, `open_preview`), other
+servers (MCP tools) or other conversations (`task_agent`, the coordinator
+tools). A headless session given an environment therefore offers only
+`ENVIRONMENT_TOOL_NAMES` unless its caller names other tools, and refuses a
+call to any tool it did not offer (see [eval.md](eval.md)). MCP tools are the
+one group a contained run may still want, when the run brings its own servers:
+a headless session offers the tools of the MCP client it was given, and only
+those, when asked to (`mcp_tools=True`).
 
 ---
 

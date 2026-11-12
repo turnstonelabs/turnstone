@@ -510,6 +510,109 @@ class TestRunResourceLifecycle:
         made["sessions"][0].close()
 
 
+class TestLifecycleAttempts:
+    """``run_with_lifecycle``'s attempt count is the caller's to set.
+
+    The measurement harnesses keep the default of three; a caller whose run
+    must not be repeated (it samples the model and acts on the world, and a
+    second attempt would do both again) asks for one.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, *, attempts: int | None, failures: int):
+        """Drive the real lifecycle over fakes; the drive fails *failures* times."""
+        import threading
+
+        from turnstone.eval import core as core_module
+
+        sleeps: list[float] = []
+        monkeypatch.setattr(time, "sleep", sleeps.append)
+        made: dict[str, Any] = {"drives": 0, "clients": [], "sessions": [], "sleeps": sleeps}
+
+        class _Client:
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _Session:
+            closed = False
+
+            def __init__(self) -> None:
+                self._cancelled = threading.Event()
+
+            def close(self) -> None:
+                self.closed = True
+
+        def build_client() -> Any:
+            made["clients"].append(_Client())
+            return made["clients"][-1]
+
+        def build_session(_client: Any) -> Any:
+            session = _Session()
+            made["sessions"].append(session)
+
+            def drive() -> list[dict[str, Any]]:
+                made["drives"] += 1
+                if made["drives"] <= failures:
+                    raise RuntimeError(f"boom {made['drives']}")
+                return [{"tool": "bash"}]
+
+            return session, drive
+
+        kwargs: dict[str, Any] = {} if attempts is None else {"attempts": attempts}
+        try:
+            made["result"] = core_module.run_with_lifecycle(
+                workdir_prefix="turnstone_attempts_",
+                setup=lambda _workdir: None,
+                build_client=build_client,
+                build_session=build_session,
+                finish=lambda _session, tool_log: {"tool_log": tool_log},
+                test_timeout=30,
+                teardown_reset=lambda: None,
+                on_cwd_restore_failed=lambda _cwd: None,
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 - the raise IS the fixture
+            made["raised"] = exc
+        return made
+
+    def test_a_single_attempt_raises_the_first_failure_without_backoff(self, monkeypatch):
+        made = self._run(monkeypatch, attempts=1, failures=1)
+
+        assert str(made["raised"]) == "boom 1"
+        assert made["drives"] == 1
+        assert made["sleeps"] == []  # nothing follows the only attempt
+        assert len(made["sessions"]) == 1 and made["sessions"][0].closed
+        assert all(client.closed for client in made["clients"])
+
+    def test_a_single_attempt_that_succeeds_returns_its_result(self, monkeypatch):
+        made = self._run(monkeypatch, attempts=1, failures=0)
+
+        assert made["result"] == {"tool_log": [{"tool": "bash"}]}
+        assert made["drives"] == 1
+
+    def test_the_default_still_retries_twice(self, monkeypatch):
+        made = self._run(monkeypatch, attempts=None, failures=2)
+
+        assert made["result"] == {"tool_log": [{"tool": "bash"}]}
+        assert made["drives"] == 3
+        assert made["sleeps"] == [1, 2]
+
+    def test_the_count_bounds_the_retries(self, monkeypatch):
+        made = self._run(monkeypatch, attempts=2, failures=5)
+
+        assert str(made["raised"]) == "boom 2"
+        assert made["drives"] == 2
+        assert made["sleeps"] == [1]
+
+    def test_fewer_than_one_attempt_is_refused(self, monkeypatch):
+        made = self._run(monkeypatch, attempts=0, failures=0)
+
+        assert isinstance(made["raised"], ValueError)
+        assert made["drives"] == 0 and made["clients"] == []
+
+
 class TestCaseScoring:
     """``score_case_run``: forbidden actions and answer content on top of
     the expected-action match."""
