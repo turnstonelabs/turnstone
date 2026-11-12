@@ -1457,7 +1457,12 @@ the task's or the default (`sandbox.root_size`, `sandbox.root_size_source`:
 size is enforced by it; where it cannot, the harness watches the size every two
 seconds and stops the container once it is over, which ends the rollout as
 `sandbox_destroyed` (the model's outcome). `sandbox.root_bound` says which of
-the two applied (`enforced` or `watched`).
+the two applied (`enforced` or `watched`). A runtime can take the size without
+a word and bound nothing with it, so a start that went through is not taken
+for a bound: the container is asked once, before anything of the task's has
+run in it, how large the file system at `/` is, and unless that is the size
+asked for the root is watched. An image without a `stat` that can say so is
+watched as well.
 
 Three files are in every container and in no container's own file system:
 `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` are files the runtime keeps

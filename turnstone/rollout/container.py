@@ -932,6 +932,13 @@ def size_bytes(text: str) -> int:
 
 # The most digits a file's size has: nineteen say every size up to 2**63.
 _MOST_SIZE_DIGITS = 19
+# What a container is asked for to learn how large its own file system is:
+# the number of its blocks and the size of one.
+_FILE_SYSTEM_SIZE_FORMAT = "%b %S"
+# How far the size a file system shows may be from the size asked for and
+# still be the storage driver's bound: a hundredth of it, or this many bytes
+# (a driver rounds a size to its blocks).
+_BOUND_SLACK_BYTES = 64 * 1024
 
 
 def _printed_size(text: str) -> int | None:
@@ -1330,6 +1337,7 @@ class Container:
             self._abandon_if_closed()
             self._protect_main_process()
             self._check_start()
+            self._confirm_bound()
             self._check_bound()
             self._abandon_if_closed()
         except (ContainerError, ContainerLostError) as error:
@@ -1514,6 +1522,37 @@ class Container:
         if isinstance(listed, str):
             return f"its file system: {listed}"
         return listed, self._unlinked_bytes(), outside
+
+    def _confirm_bound(self) -> None:
+        """Take the storage driver's bound only where the container shows it.
+
+        A start that went through with a size for the storage driver does not
+        say that the driver bounds anything: a runtime can take the size without
+        a word and leave the root as large as the disk under it.  A driver that
+        does bound a root shows the bound as the size of the file system at
+        ``/``.  So the container is asked for that size once, before any command
+        of the task's or the model's has run in it, while the program that
+        answers is still the image's own.  Unless the answer is the size asked
+        for, the root is watched like one whose driver refused the size: no
+        answer is no bound, and neither is an answer that is no size.
+        """
+        if self.root_bound != "enforced" or self.root_size is None:
+            return
+        limit = size_bytes(self.root_size)
+        done = self.exec(
+            ["stat", "-f", "-c", _FILE_SYSTEM_SIZE_FORMAT, "/"],
+            timeout=30,
+            user="0:0",
+            workdir=OWN_WORKDIR,
+        )
+        shown: int | None = None
+        fields = done.stdout.decode("ascii", errors="replace").split()
+        if done.returncode == 0 and not done.timed_out and len(fields) == 2:
+            blocks, block = _printed_size(fields[0]), _printed_size(fields[1])
+            if blocks is not None and block is not None:
+                shown = blocks * block
+        if shown is None or abs(shown - limit) > max(limit // 100, _BOUND_SLACK_BYTES):
+            self.root_bound = "watched"
 
     def _check_bound(self) -> None:
         """Refuse a writable root that cannot be bounded: the runtime has to

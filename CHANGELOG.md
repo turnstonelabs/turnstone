@@ -73,7 +73,10 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   user that is neither a name nor a number, an environment variable without a
   name, a size or a limit that is none or is zero. A writable root always has a
   size (`root_size`, 10g where the task names none), and those three files
-  count toward it. Its main process runs as a user of its
+  count toward it. The storage driver keeps that size only where the
+  container's own file system then shows it; a runtime that takes the size
+  and bounds nothing with it is found out when the container starts, and the
+  harness watches the size there. Its main process runs as a user of its
   own and is out of reach of the task's commands, except where the task's own
   settings give that reach back; what a model then does to its container is
   recorded as its own outcome. A rollout refuses an execution environment that

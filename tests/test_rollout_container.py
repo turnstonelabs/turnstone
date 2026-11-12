@@ -52,6 +52,7 @@ from turnstone.rollout.container import (
     ContainerLostError,
     ContainerSpec,
     run_captured,
+    size_bytes,
 )
 from turnstone.rollout.episode import ContainerSandbox, RolloutConfig, Task, run_episode
 
@@ -970,7 +971,7 @@ class TestTheSizeOfAWritableRoot:
         assert _archived_size(_archive("hosts", 0, tarfile.SYMTYPE)) is None
 
 
-def _sizing_runtime(tmp_path: Any, *, enforces: bool = False) -> str:
+def _sizing_runtime(tmp_path: Any, *, enforces: bool = False, shows: int | None = None) -> str:
     """A stand-in for the runtime that answers what a writable root is asked.
 
     The listed size of the container's own file system is the content of the
@@ -982,10 +983,15 @@ def _sizing_runtime(tmp_path: Any, *, enforces: bool = False) -> str:
     The look from inside for files deleted while open is answered with the
     file ``opened``, as the container's own programs would print it, and
     with nothing where that file is missing.  Without *enforces* it refuses
-    a size for the storage driver, in words of its own.
+    a size for the storage driver, in words of its own.  Asked how large the
+    container's own file system is, it prints the file ``root_fs``: one block
+    of *shows* bytes, or a disk of a terabyte where *shows* is not given.
     """
     (tmp_path / "copies").mkdir()
     (tmp_path / "listed").write_text("1000" + NL)
+    (tmp_path / "root_fs").write_text(
+        (f"1 {shows}" if shows is not None else "268435456 4096") + NL
+    )
     for path, size in zip(RUNTIME_FILES, (148, 13, 273), strict=True):
         name = path.rsplit("/", 1)[-1]
         (tmp_path / "copies" / name).write_bytes(_archive(name, size))
@@ -998,6 +1004,7 @@ def _sizing_runtime(tmp_path: Any, *, enforces: bool = False) -> str:
         f'  run) case "$*" in *--storage-opt*) {refusal} ;; esac; echo 0123456789abcdef ;;',
         '  exec) case "$*" in',
         f'      *"root %d"*) cat "{tmp_path}/opened" 2>/dev/null ;;',
+        f'      *"%b %S"*) cat "{tmp_path}/root_fs" ;;',
         "      *) echo uid=0; echo main_uid=65533; echo comm=sleep; echo ignored=10000; "
         "echo score=-1000 ;;",
         "    esac ;;",
@@ -1039,6 +1046,9 @@ class TestAWritableRootIsBounded:
         spec = ContainerSpec(
             image=IMAGE, user="0:0", read_only_root=False, writable={}, root_size=size
         )
+        if runtime.get("enforces"):
+            # A driver that bounds the root shows the bound as the file system's size.
+            runtime.setdefault("shows", size_bytes(size))
         container = Container(spec, runtime=_sizing_runtime(tmp_path, **runtime))
         container.size_check_seconds = 0.1
         return container
@@ -1073,6 +1083,69 @@ class TestAWritableRootIsBounded:
                 "/etc/hostname, /etc/resolv.conf, which the runtime keeps on this machine's "
                 "disk)"
             )
+        finally:
+            assert container.close() is True
+
+    def test_a_driver_that_takes_the_size_and_bounds_nothing_is_found_out_at_the_start(
+        self, tmp_path
+    ):
+        """A runtime can take a size for the storage driver without a word and
+        bound nothing with it.  The start goes through, so the start alone says
+        nothing: the container is asked how large its own file system is, and a
+        disk larger than the size asked for means the root is watched."""
+        container = self._container(tmp_path, enforces=True, shows=10**12).start()
+        try:
+            assert container.root_bound == "watched"
+            assert container.describe()["root_bound"] == "watched"
+            calls = self._calls(tmp_path)
+            # One start, with the size, and the question about the file system.
+            runs = [call for call in calls if call.startswith("run --detach ")]
+            assert len(runs) == 1 and "--storage-opt size=1m" in runs[0]
+            assert sum("%b %S" in call for call in calls) == 1
+            # And the root is bounded by the watch from then on.
+            (tmp_path / "listed").write_text("2000000" + NL)
+            assert _wait_for(tmp_path / "killed")
+            with pytest.raises(ContainerLostError):
+                container.ensure_running()
+            assert container.lost_cause == "model"
+            assert "more than the 1,048,576 it may hold" in (container.lost or "")
+        finally:
+            assert container.close() is True
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            "",
+            "no numbers here",
+            "4096",
+            "1 2 3",
+            "9" * 30 + " 4096",
+            "1 4096",  # a file system far smaller than the size asked for
+            "0 0",
+            "-256 4096",
+        ],
+    )
+    def test_only_a_file_system_of_the_size_asked_for_is_the_drivers_bound(self, tmp_path, answer):
+        """No answer, an answer that is no size, and a size that is not the one
+        asked for are no bound: the root is watched."""
+        container = self._container(tmp_path, enforces=True)
+        (tmp_path / "root_fs").write_text(answer + NL)
+        container.start()
+        try:
+            assert container.root_bound == "watched"
+        finally:
+            assert container.close() is True
+
+    @pytest.mark.parametrize("shown", [1024 * 1024, 1024 * 1024 + 4096, 1024 * 1024 - 4096])
+    def test_a_file_system_that_shows_the_size_asked_for_is_bounded_by_the_driver(
+        self, tmp_path, shown
+    ):
+        """To the block: a driver rounds the size to its blocks."""
+        container = self._container(tmp_path, enforces=True, shows=shown).start()
+        try:
+            assert container.root_bound == "enforced"
+            # What the driver bounds is not listed again at every look.
+            assert not any("SizeRw" in call for call in self._calls(tmp_path))
         finally:
             assert container.close() is True
 
