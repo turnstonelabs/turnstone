@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Bare-metal turnstone-server LaunchDaemon for macOS (Apple Silicon).
+  Copy to /Library/LaunchDaemons/ and edit the placeholders below, then
+  `launchctl bootstrap system <path>` (install steps: deploy/launchd/README.md).
+  Identity + URLs are NOT secrets, so they live here; the JWT secret + DB URL
+  live in /etc/turnstone/config.toml. The file must be root:wheel 0644 or
+  launchd silently ignores it; check it with `plutil -lint` before bootstrap.
+
+  Addresses below use RFC 5737 documentation IPs — replace them:
+    <this-host>     = the bare-metal host's own reachable DNS name or IP
+                      address (its mTLS identity and the address peers dial;
+                      below shown as 192.0.2.10)
+    <compose-host>  = the host running the cluster / docker-compose stack,
+                      started with TURNSTONE_HOST_IP=<compose-host> and
+                      TURNSTONE_ACME_EXTERNAL_URL=http://<compose-host>:8090/acme
+                      so enrollment links and published ports are reachable
+                      (below shown as 192.0.2.1).
+
+  TURNSTONE_CONSOLE_URL + TURNSTONE_ACME_EXTERNAL_URL matter only when the
+  cluster runs mTLS (cert enrollment); on a plain-HTTP cluster they are inert.
+  See deploy/systemd/README.md for the full explanation of both.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.turnstone.server</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Library/Turnstone/venv/bin/turnstone-server</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>8080</string>
+  </array>
+
+  <key>UserName</key>
+  <string>turnstone</string>
+  <key>GroupName</key>
+  <string>turnstone</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/turnstone/turnstone-workspace</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <!-- Restart unless the server exited cleanly (e.g. SIGTERM via bootout). -->
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Library/Turnstone/venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/turnstone</string>
+    <!-- Secrets live in config.toml, not here (same rule as the systemd unit). -->
+    <key>TURNSTONE_CONFIG</key>
+    <string>/etc/turnstone/config.toml</string>
+    <key>TURNSTONE_LOG_LEVEL</key>
+    <string>info</string>
+    <!-- Unique + stable, or the node regenerates its identity each start. -->
+    <key>TURNSTONE_NODE_ID</key>
+    <string>&lt;unique-node-id&gt;</string>
+    <key>TURNSTONE_WORKSPACE</key>
+    <string>/Users/turnstone/turnstone-workspace</string>
+    <!-- The address peers + the console collector dial back. -->
+    <key>TURNSTONE_ADVERTISE_URL</key>
+    <string>http://192.0.2.10:8080</string>
+    <!-- The cluster's published SearxNG, for the web_search tool. -->
+    <key>TURNSTONE_SEARXNG_URL</key>
+    <string>http://192.0.2.1:8081</string>
+    <!-- mTLS only: the console's reachable ACME/API endpoint + the trusted
+         canonical responder base (must match the console-side value). -->
+    <key>TURNSTONE_CONSOLE_URL</key>
+    <string>http://192.0.2.1:8090</string>
+    <key>TURNSTONE_ACME_EXTERNAL_URL</key>
+    <string>http://192.0.2.1:8090/acme</string>
+  </dict>
+
+  <!-- Plain files — launchd has no journal; tail these. -->
+  <key>StandardOutPath</key>
+  <string>/var/log/turnstone-server.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/turnstone-server.log</string>
+
+  <key>SoftResourceLimits</key>
+  <dict>
+    <!-- SSE keeps an fd per active workstream + outbound LLM stream. -->
+    <key>NumberOfFiles</key>
+    <integer>65535</integer>
+  </dict>
+</dict>
+</plist>
