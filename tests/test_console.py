@@ -3120,14 +3120,11 @@ class TestSSEProxy:
             async def aclose(self):
                 pass
 
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
         class FakeClient:
-            def stream(self, method, url, **kwargs):
+            def build_request(self, method, url, **kwargs):
+                return (method, url, kwargs)
+
+            async def send(self, request, *, stream=False):
                 return FakeResponse()
 
         class FakeRequest:
@@ -3160,7 +3157,10 @@ class TestSSEProxy:
         asyncio.run(_run())
 
     def test_proxy_sse_upstream_error_status(self):
-        """Non-200 upstream status should yield an error event."""
+        """Non-200 upstream status passes through as the browser-facing
+        status (fatal to the browser's EventSource) — not an in-band
+        error frame on a 200 stream, which the browser native-retries
+        forever (see _proxy_sse's docstring)."""
 
         from turnstone.console.server import _proxy_sse
 
@@ -3174,14 +3174,11 @@ class TestSSEProxy:
             async def aclose(self):
                 pass
 
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
         class FakeClient:
-            def stream(self, method, url, **kwargs):
+            def build_request(self, method, url, **kwargs):
+                return (method, url, kwargs)
+
+            async def send(self, request, *, stream=False):
                 return FakeResponse()
 
         class FakeRequest:
@@ -3197,12 +3194,9 @@ class TestSSEProxy:
 
         async def _run():
             response = await _proxy_sse(FakeRequest(), "http://fake:8080", "events")
-            chunks: list[bytes] = []
-            async for chunk in response.body_iterator:
-                chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
-            body = b"".join(chunks)
-            assert b"event: error" in body
-            assert b"502" in body
+            assert response.status_code == 502
+            body = json.loads(response.body)
+            assert body["error"] == "Upstream returned status 502"
 
         asyncio.run(_run())
 
@@ -3299,14 +3293,14 @@ class TestSSEProxy:
                     # relay.
                     await asyncio.Event().wait()
 
-                async def __aenter__(self):
-                    return self
-
-                async def __aexit__(self, *args):
+                async def aclose(self):
                     upstream_closed.set()
 
             class FakeClient:
-                def stream(self, method, url, **kwargs):
+                def build_request(self, method, url, **kwargs):
+                    return (method, url, kwargs)
+
+                async def send(self, request, *, stream=False):
                     return FakeResponse()
 
             class FakeRequest:

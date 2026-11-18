@@ -3865,11 +3865,29 @@ async def _proxy_sse(
     console's service token. The ``events/global`` upstream
     (``server.py``'s ``global_events_sse``) requires ``service`` scope
     by design — end-user JWTs lack it, so a user-scoped proxy call
-    would 403-loop forever as the browser's EventSource auto-retries.
-    Treating it as a service-to-service call mirrors how the cluster
-    collector itself subscribes; the user identity stays with the
-    console-side gate (the ``/node/{node_id}/v1/api/`` route is
-    already gated by the console's ``AuthMiddleware``).
+    would 403, and the fatal-status pass-through below makes that a
+    closed stream instead of a retry storm. Treating it as a
+    service-to-service call mirrors how the cluster collector itself
+    subscribes; the user identity stays with the console-side gate
+    (the ``/node/{node_id}/v1/api/`` route is already gated by the
+    console's ``AuthMiddleware``).
+
+    A non-2xx upstream status is passed through as the browser-facing
+    status.  The legacy shape demoted it to an in-band ``event: error``
+    frame on an already-committed 200 stream: to the browser's
+    EventSource a 200 is a *successful* connection, so it announced
+    ``open`` — which resets ``workstream_sync.js``'s strike budget —
+    and native-retried when the stream then ended, looping a permanent
+    404 (closed workstream, session gone) through "Reconnecting…"
+    forever without ever reaching the dead state whose banner offers
+    the designed ``POST /open`` revive.  Per the HTML spec — the ES9
+    rule this repo's JS contract tests pin — a non-2xx reply is a
+    *fatal* connection failure: ``error`` fires, ``readyState`` is
+    ``CLOSED``, no native retry follows, and the sync core counts the
+    refusal against its strike budget.  A transport failure (node
+    down) is transient by contrast, so it keeps the legacy 200 +
+    immediate close whose native retry self-heals when the node
+    returns.
     """
     target = f"{server_url}/{api_prefix}/{path}"
     if request.url.query:
@@ -3881,10 +3899,10 @@ async def _proxy_sse(
         proxy_token_mgr = getattr(request.app.state, "proxy_token_mgr", None)
         if proxy_token_mgr is None:
             # Fail fast on misconfig — without a service token the
-            # upstream 401/403s on every request and the browser's
-            # EventSource auto-retries forever, filling logs.
-            # Surface as 503 so the operator sees a single clear
-            # signal instead of a retry storm.
+            # upstream 401/403s on every request.  Surface as 503 so
+            # the operator sees a single clear signal; as a non-2xx
+            # it is fatal to the browser's EventSource, so the
+            # misconfig cannot produce a retry storm either.
             log.error(
                 "proxy.sse.no_service_token url=%s — proxy_token_mgr "
                 "not configured; events/global proxy unavailable",
@@ -3917,38 +3935,81 @@ async def _proxy_sse(
     if last_event_id_hdr is not None:
         upstream_headers["Last-Event-ID"] = last_event_id_hdr
 
+    # Open the upstream before committing any byte to the browser.  The
+    # browser-facing headers below are sent on the first body chunk, so a
+    # non-2xx upstream must be known *before* this returns: the legacy
+    # shape committed the 200 first and demoted the status to an in-band
+    # ``event: error`` frame, which the browser reads as a successful
+    # connection that dropped — see the docstring for why that looped.
+    try:
+        # build_request is inside the guard: an unsanitized path can hold
+        # characters httpx2 refuses to put in a URL, which it raises while
+        # building the request, not while sending it.
+        sse_request = sse_client.build_request(
+            "GET",
+            target,
+            headers=upstream_headers,
+            timeout=httpx2.Timeout(connect=10, read=None, write=5, pool=None),
+        )
+        upstream = await sse_client.send(sse_request, stream=True)
+    except REQUEST_FAILURES:
+        # Transport failure (node down, TLS, unparseable redirect):
+        # transient, so keep the legacy 200 + immediate close whose
+        # browser-side native retry self-heals when the node returns.
+        log.debug("SSE proxy stream ended for %r", target)
+
+        async def closed_stream() -> AsyncGenerator[bytes]:
+            return
+            yield  # unreachable: marks this an async generator
+
+        return StreamingResponse(
+            closed_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    if upstream.status_code != 200:
+        status = upstream.status_code
+        body_preview = await bounded_stream_preview(upstream)
+        await upstream.aclose()
+        # Non-200 from a service-auth-backed SSE path is
+        # operator-actionable: 4xx = scope/tenant drift,
+        # 5xx = upstream outage.  Raise the log floor to
+        # WARNING so it surfaces in ops logs; the browser
+        # also receives the status as a fatal EventSource
+        # error.
+        log.warning(
+            "proxy.sse.non_200 status=%d url=%r body=%s",
+            status,
+            target,
+            body_preview,
+        )
+        # Pass the status through unchanged: the fatal (non-2xx)
+        # response is what makes the browser's EventSource treat the
+        # connection as refused, so the sync core's strike budget
+        # bounds the retries and the pane reaches the designed dead
+        # banner whose click revives the session via POST /open.
+        return JSONResponse(
+            {"error": f"Upstream returned status {status}"},
+            status_code=status,
+        )
+
     async def raw_stream() -> AsyncGenerator[bytes]:
         try:
-            async with sse_client.stream(
-                "GET",
-                target,
-                headers=upstream_headers,
-                timeout=httpx2.Timeout(connect=10, read=None, write=5, pool=None),
-            ) as response:
-                if response.status_code != 200:
-                    status = response.status_code
-                    body_preview = await bounded_stream_preview(response)
-                    # Non-200 from a service-auth-backed SSE path is
-                    # operator-actionable: 4xx = scope/tenant drift,
-                    # 5xx = upstream outage.  Raise the log floor to
-                    # WARNING so it surfaces in ops logs; the browser
-                    # also receives the error event for UX.
-                    log.warning(
-                        "proxy.sse.non_200 status=%d url=%r body=%s",
-                        status,
-                        target,
-                        body_preview,
-                    )
-                    yield f"event: error\ndata: Upstream returned status {status}\n\n".encode()
-                    return
-                # No per-chunk disconnect check: under ASGI spec < 2.4, which uvicorn reports for
-                # HTTP, the StreamingResponse cancels this generator when the browser goes away,
-                # which closes the upstream stream. Under 2.4 or later the response learns of the
-                # disconnect only when a send fails, at the next upstream byte.
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+            # No per-chunk disconnect check: under ASGI spec < 2.4, which uvicorn reports for
+            # HTTP, the StreamingResponse cancels this generator when the browser goes away,
+            # which closes the upstream stream. Under 2.4 or later the response learns of the
+            # disconnect only when a send fails, at the next upstream byte.
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
         except REQUEST_FAILURES:
             log.debug("SSE proxy stream ended for %r", target)
+        finally:
+            await upstream.aclose()
 
     return StreamingResponse(
         raw_stream(),

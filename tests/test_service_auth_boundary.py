@@ -467,9 +467,13 @@ class TestProxySseNon200LogLevel:
 
         with caplog.at_level(logging.WARNING, logger="turnstone.console.server"):
             response = await _proxy_sse(request, "http://node-1:8001", "events", api_prefix="api")
-            # Drain the streaming body so the async gen executes.
-            async for _ in response.body_iterator:  # type: ignore[attr-defined]
-                pass
+
+        # The upstream status must reach the browser as that status: a
+        # 200 text/event-stream with an in-band error frame reads as a
+        # successful connection that dropped, which the browser's
+        # EventSource native-retries forever (see _proxy_sse's docstring).
+        assert response.status_code == 403
+        assert response.headers["content-type"].startswith("application/json")
 
         matches = [
             r
@@ -480,6 +484,91 @@ class TestProxySseNon200LogLevel:
         # Control-char scrub replaces the literal \n byte with a
         # space so the preview can't forge a log-line break.
         assert "\n" not in matches[0].getMessage().split("body=", 1)[-1]
+
+
+# ---------------------------------------------------------------------------
+# _proxy_sse — fatal upstream statuses pass through to the browser (ES9)
+# ---------------------------------------------------------------------------
+
+
+def _sse_proxy_request(handler, header_pairs=()):
+    """A Starlette Request wired to a MockTransport upstream for ``_proxy_sse``."""
+    from starlette.requests import Request
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/node/n/api/workstreams/ws-1/events",
+        "headers": list(header_pairs),
+        "query_string": b"",
+        "app": MagicMock(
+            state=SimpleNamespace(
+                proxy_sse_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+                proxy_client=MagicMock(),
+            )
+        ),
+    }
+
+    async def _receive():
+        return {"type": "http.request", "body": b""}
+
+    return Request(scope, receive=_receive)
+
+
+class TestProxySseFatalStatusPassthrough:
+    """A non-2xx upstream status must reach the browser as that status.
+
+    The legacy shape demoted a non-200 to an in-band ``event: error``
+    frame on an already-committed 200 ``text/event-stream``.  To the
+    browser's EventSource a 200 is a successful connection: ``open``
+    resets ``workstream_sync.js``'s strike budget, and when the stream
+    ends the browser native-retries — so a permanent 404 (closed
+    workstream, session gone) looped "Reconnecting…" forever without
+    ever reaching the dead state whose banner offers the POST /open
+    revive.  A non-2xx response is a *fatal* connection failure per the
+    HTML spec (the ES9 rule the JS contract tests pin): ``error`` fires,
+    ``readyState`` is ``CLOSED``, no native retry follows, and the sync
+    core's strike budget bounds the recovery."""
+
+    @pytest.mark.parametrize("status", [403, 404, 503])
+    @pytest.mark.anyio
+    async def test_non_200_upstream_passes_the_status_through(self, status):
+        import json
+
+        from turnstone.console.server import _proxy_sse
+
+        def handler(_req: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(status, json={"error": "upstream says no"})
+
+        request = _sse_proxy_request(handler)
+        response = await _proxy_sse(request, "http://node-1:8001", "events", api_prefix="api")
+
+        assert response.status_code == status
+        assert response.headers["content-type"].startswith("application/json")
+        body = json.loads(response.body)
+        assert body["error"] == f"Upstream returned status {status}"
+        # And it must not be the legacy in-band error frame on a 200
+        # stream — that is exactly the shape the browser looped on.
+        assert b"event: error" not in response.body
+
+    @pytest.mark.anyio
+    async def test_200_upstream_stays_an_event_stream_and_relays_verbatim(self):
+        from turnstone.console.server import _proxy_sse
+
+        def handler(_req: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(
+                200,
+                text="id: 1\ndata: {}\n\n: ping\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+
+        request = _sse_proxy_request(handler)
+        response = await _proxy_sse(request, "http://node-1:8001", "events", api_prefix="api")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        relayed = b"".join([chunk async for chunk in response.body_iterator])
+        assert relayed == b"id: 1\ndata: {}\n\n: ping\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +620,7 @@ class TestProxySseLastEventIdForwarding:
         response = await _proxy_sse(
             request, "http://node-1:8001", "workstreams/ws-1/events", api_prefix="api"
         )
-        # Drain so the upstream call actually fires.
+        # Drain the relay so the streaming body executes.
         async for _ in response.body_iterator:  # type: ignore[attr-defined]
             pass
 
