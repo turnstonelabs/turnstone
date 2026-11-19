@@ -214,21 +214,20 @@ def _text_of(part: Any) -> str | None:
 
 def _with_text(part: Any, text: str, rule: Rule) -> Any:
     """The text part *part* with its text replaced by *text*, and whatever
-    else it holds walked."""
+    else it holds walked: each key and each value once."""
     if isinstance(part, str):
         return text
-    rest = {name: item for name, item in part.items() if name != "text"}
-    walked = map_strings(rest, rule, json_keys=JSON_KEYS)
-    if text is part["text"] and walked is rest:
-        return part
     out: dict[Any, Any] = {}
-    for name in part:
+    changed = text is not part["text"]
+    for name, item in part.items():
         if name == "text":
             out[name] = text
-        else:
-            new_name = _new(name, rule)
-            out[new_name] = walked[new_name]
-    return out
+            continue
+        one = {name: item}
+        walked = map_strings(one, rule, json_keys=JSON_KEYS)
+        changed = changed or walked is not one
+        out.update(walked)
+    return out if changed else part
 
 
 def _new(name: Any, rule: Rule) -> Any:

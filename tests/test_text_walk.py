@@ -204,6 +204,20 @@ class TestAMessage:
 
 
 class TestTheParts:
+    def test_a_rule_is_asked_once_about_each_text_of_a_text_part(self) -> None:
+        """Its text, and each key and value beside it: a rule that counts
+        what it changes counts each once."""
+        asked: list[str] = []
+
+        def counting(text: str) -> list[Any]:
+            asked.append(text)
+            return rule(text)
+
+        part = {"type": "text", "text": "plain", END: END}
+        out = map_message({"role": "user", "content": [part]}, counting)
+        assert out["content"] == [{"type": "text", "text": "plain", CUT: CUT}]
+        assert sorted(asked) == sorted(["role", "content", "plain", "type", "text", END, END])
+
     def test_data_is_left_alone_in_a_messages_content_and_only_there(self) -> None:
         image = {"type": "image_url", "image_url": {"url": "data:" + END}}
         message = {
