@@ -23,6 +23,7 @@ from tests.test_rollout_episode import (
     _no_configuration_file,  # noqa: F401
     _NotingSandbox,
     _run,
+    both_ways,  # noqa: F401
 )
 from tests.test_rollout_rules import SHIPPED
 from turnstone.core.mcp_client import MCPClientManager
@@ -346,6 +347,8 @@ def _keys(value: Any) -> set[str]:
     return set()
 
 
+# The token-ID runs twice: rendered as it is, and with plain text and vision on.
+@pytest.mark.usefixtures("both_ways")
 @pytest.mark.parametrize("mode", ["messages", "token_ids"])
 class TestNothingOfASubAgentIsInTheSample:
     """For training a sub-agent is a tool.  The sample holds the session's own

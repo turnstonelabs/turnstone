@@ -241,16 +241,35 @@ class TestAroundARollout:
         assert [a["chat_requests_before"] for a in asked] == [0, everything]
         assert record["server_version"]["same"] is True and record["trainable"] is True
 
-    def test_with_prompts_as_token_ids_the_check_of_the_routes_is_inside_them_too(self):
+    @pytest.mark.parametrize("defaults", ["rendered as it is", "plain text and vision"])
+    def test_with_prompts_as_token_ids_the_check_of_the_routes_is_inside_them_too(
+        self, defaults, tmp_path
+    ):
         """The check of the two routes and the probe on the completions route make
-        requests of their own: the first question is put before any of them."""
-        with _server(7, sampler_logprobs=True) as server:
-            record, _box = _versioned(server, token_id_prompts=True, sampler_logprobs=None)
+        requests of their own: the first question is put before any of them.  So
+        it is with the command's defaults on, where the run also establishes
+        plain text and checks the route for images itself."""
+        served: dict[str, Any] = {}
+        wanted: dict[str, Any] = {}
+        if defaults == "plain text and vision":
+            served = {"own_tokens": True, "tokenizer_info": True}
+            wanted = {
+                "plain_text": True,
+                "tokenizer_info_from_server": True,
+                "vision": None,
+                "image_dir": str(tmp_path / "images"),
+            }
+        with _server(7, sampler_logprobs=True, **served) as server:
+            record, _box = _versioned(
+                server, token_id_prompts=True, sampler_logprobs=None, **wanted
+            )
             first, last = server.version_requests
             everything = len(server.requests)
             rendered = len(server.tokenize_requests)
 
         assert record["prompt_mode"] == "token_ids" and record["token_id_route"]["ok"] is True
+        assert record["plain_text"]["applied"] is bool(wanted)
+        assert record["vision"]["applied"] is bool(wanted)
         assert record["logprobs"]["route"] == "completions"
         # More went out than the session's three calls: the check and the probe.
         assert everything > 3 and rendered > 0
