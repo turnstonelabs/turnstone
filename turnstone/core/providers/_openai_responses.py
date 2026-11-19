@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 import structlog
 
+from turnstone.core.control_text import escape_conversation
 from turnstone.core.providers._openai_common import (
     OPENAI_COMPAT_DEFAULT,
     REASONING_MODES,
@@ -715,6 +716,9 @@ class OpenAIResponsesProvider:
         if extra_params:
             log.debug("openai.responses: extra_params ignored (not supported by Responses API)")
         caps = capabilities or self.get_capabilities(model)
+        if caps.escape_control_tokens:
+            messages = escape_conversation(messages)
+            tools = escape_conversation(tools)
         kwargs = self._build_kwargs(
             model,
             messages,

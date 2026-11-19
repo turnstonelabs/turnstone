@@ -653,6 +653,11 @@ class ModelCapabilities:
     supports_web_search: bool = False
     supports_tool_search: bool = False
     supports_vision: bool = False
+    # Self-hosted lanes: the server tokenizes the whole rendered prompt, so the
+    # text of a chat-template control token anywhere in a conversation (a tool
+    # result, say) becomes that token.  ``True`` escapes such text in what is
+    # sent (:mod:`turnstone.core.control_text`).
+    escape_control_tokens: bool = False
     # Chat-input modalities carried as user-turn attachments — distinct from the
     # STT/TTS *roles* below.  ``supports_pdf``: native PDF document ingest;
     # ``supports_audio_input``: native audio ingest (OpenAI ``input_audio`` /

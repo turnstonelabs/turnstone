@@ -246,15 +246,28 @@ def _text(message: dict[str, Any]) -> str:
 NO_USER_QUERY = "No user query found in messages."
 
 
-def _no_user_query(messages: list[dict[str, Any]]) -> str | None:
+def _no_user_query(messages: list[dict[str, Any]], escaped: bool = False) -> str | None:
     """What a chat template says of a conversation in which every user message
-    is a tool-response block: it finds nothing the user asked."""
+    is a tool-response block: it finds nothing the user asked.
+
+    *escaped* takes the block's markers with a backslash after their first
+    character for the markers too (see :func:`_no_user_query_escaped`)."""
     for message in messages:
         text = _text(message).strip()
+        if escaped:
+            text = text.replace("<" + chr(92), "<")
         tool_response = text.startswith("<tool_response>") and text.endswith("</tool_response>")
         if message.get("role") == "user" and not tool_response:
             return None
     return NO_USER_QUERY
+
+
+def _no_user_query_escaped(messages: list[dict[str, Any]]) -> str | None:
+    """The same for the chat route, where the markers of such a block go out
+    escaped and a real template would no longer take the message for a tool
+    response.  This server refuses that form all the same: the test that uses
+    it is about what becomes of a refused request, whatever it was refused for."""
+    return _no_user_query(messages, escaped=True)
 
 
 def _status_error(status: int, message: str = "refused", body: Any = None) -> Any:
@@ -1374,7 +1387,10 @@ class TestSubAgents:
             {"tool_calls": [{"name": "task_agent", "arguments": {"prompt": self.TOOL_RESPONSE}}]},
             {"content": "The delegation came back refused."},
         ]
-        with _PickyServer(parent, agent_script=self.AGENT, refuses=_no_user_query) as server:
+        # With prompts as token IDs the sub-agent's prompt is rendered as the model
+        # wrote it, so the template itself refuses it.
+        refuses = _no_user_query if token_id_prompts else _no_user_query_escaped
+        with _PickyServer(parent, agent_script=self.AGENT, refuses=refuses) as server:
             record, _box = _run(server, token_id_prompts=token_id_prompts)
             refused = list(server.refused)
             agent_requests = len(server.agent_requests)
@@ -1382,7 +1398,10 @@ class TestSubAgents:
         assert refused == ["tokenize" if token_id_prompts else "chat"] and agent_requests == 0
         said = "the model server refused the sub-agent's conversation (HTTP 400): " + NO_USER_QUERY
         assert record["finish_state"] == "completed" and record["finish_cause"] == "model"
-        assert record["trainable"] is True and record["one_sequence"] is True
+        assert record["trainable"] is True
+        # Sent as messages, the model's own call goes back with the markers it wrote
+        # escaped, so the next prompt is not what was generated plus more.
+        assert record["one_sequence"] is token_id_prompts
         assert record["final_content"] == "The delegation came back refused."
         (delegation,) = record["tool_log"]
         assert delegation["args"] == {"prompt": self.TOOL_RESPONSE}

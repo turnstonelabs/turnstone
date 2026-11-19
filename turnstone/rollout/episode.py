@@ -680,6 +680,7 @@ class RolloutSession(HeadlessSession):
         subagent_sidecar_tools: bool = True,
         before_acting: Callable[[], None] | None = None,
         vision: bool = False,
+        token_ids: bool = False,
         **kwargs: Any,
     ) -> None:
         if kwargs.get("judge_config") is not None:
@@ -700,6 +701,17 @@ class RolloutSession(HeadlessSession):
         self._subagent_sidecar_tools = subagent_sidecar_tools
         super().__init__(**kwargs)
         self._vision = vision
+        if token_ids:
+            # The prompts are built here, token by token, from the conversation as
+            # it is: read as plain text (plaintext.py) or, where that is switched
+            # off, rendered as it stands.  The framework's escape of control-token
+            # text in what is sent is for the routes that take text, and would
+            # put a character into the prompt that no file holds.
+            lane = self._model_binding.lane
+            exact = replace(require_lane_capabilities(lane), escape_control_tokens=False)
+            self._model_binding = replace(
+                self._model_binding, lane=replace(lane, capabilities=exact)
+            )
         if vision:
             # The model sees images.  The framework's own paths then bring one
             # into the conversation as an image: a file the model reads, what
@@ -2866,6 +2878,7 @@ def run_episode(
                     subagent_sidecar_tools=config.subagent_sidecar_tools,
                     before_acting=before_acting,
                     **({"vision": True} if state["vision"]["applied"] else {}),
+                    **({"token_ids": True} if config.token_id_prompts else {}),
                 )
                 state["session"] = session
                 # A sandbox that is gone ends the run at the next turn: nothing
