@@ -359,6 +359,16 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   refuses. The time a silent server is allowed for a prompt of token IDs is
   now the prompt's exact length at the minimum speed, where it was bounded by
   the request's size in bytes. A harness fault ends a run with exit status 4.
+  An image is sized with the server's own image code (the loader's steps,
+  Pillow's own reading of an orientation, the image processor's sizing
+  function), so a size that differs from the server's is a harness fault and
+  no longer a record that cannot be trained on. A tokenizer file that cannot
+  be held against the server's own description (`/tokenizer_info` answers
+  404) fails the check unless `--tokenizer-info-uncompared` is given. With
+  prompts as token IDs an escape of control-token text is a harness fault,
+  and `control_text_escape` in a record adds up over the run (`requests`).
+  A probe that is refused for its command line leaves the verdict an earlier
+  probe wrote.
   See [the rollout guide](docs/rollout.md#the-text-of-the-tokenizers-own-tokens).
 
 ### Fixed
