@@ -481,6 +481,12 @@ _SERVER_FORMATS = (
 )
 
 
+# The most pixels a server loads an image of: vLLM 0.32, ``VLLM_MAX_IMAGE_PIXELS``,
+# its default.  The same number as twice Pillow's own ``MAX_IMAGE_PIXELS``,
+# above which Pillow refuses to open an image at all.
+SERVER_MAX_IMAGE_PIXELS = 178_956_970
+
+
 def server_image_size(data: bytes) -> tuple[int, int]:
     """Width and height of the image *data* holds as a server works from it:
     turned the way the server turns it, by the server's own steps in the
@@ -502,13 +508,22 @@ def server_image_size(data: bytes) -> tuple[int, int]:
 
     No limit of the framework's is applied either (pixels, JPEG scans): the
     server applied none to an image it rendered, and an image it rendered
-    is sized here.  Raises whatever Pillow raises for bytes it cannot open
-    or decode.
+    is sized here.  The server's own limit on an image's pixels is applied
+    where the server applies it, straight after the open
+    (:data:`SERVER_MAX_IMAGE_PIXELS`), whatever Pillow's own limit is set to
+    in this process.  Raises ``ValueError`` above that limit, and whatever
+    Pillow raises for bytes it cannot open or decode.
     """
     from PIL import Image as _Pil
     from PIL import ImageOps
 
     with _Pil.open(io.BytesIO(data), formats=_SERVER_FORMATS) as opened:
+        wide, high = opened.size
+        if wide * high > SERVER_MAX_IMAGE_PIXELS:
+            raise ValueError(
+                f"Image dimensions {wide}x{high} ({wide * high} pixels) exceed the maximum of "
+                f"{SERVER_MAX_IMAGE_PIXELS} pixels"
+            )
         image: _Pil.Image = opened
         with contextlib.suppress(Exception):
             image = ImageOps.exif_transpose(opened)
@@ -678,6 +693,50 @@ class Vision:
         """The images a request's messages carry, in order."""
         return images_of(messages, self._known)
 
+    def _size(self, data: bytes) -> dict[str, Any]:
+        """What the server makes of the image *data* holds, worked out here
+        with the server's own code.  Raises what that code raises for an
+        image it does not take."""
+        rule = self.route.resize
+        width, height = server_image_size(data)
+        wide, high = rule.size(width, height)
+        return {
+            "width": width,
+            "height": height,
+            "tokens": (wide // rule.multiple) * (high // rule.multiple),
+            "processed": {
+                "width": wide,
+                "height": high,
+                # Frames, rows and columns of patches, before they are merged.
+                "grid": [1, high // rule.patch, wide // rule.patch],
+            },
+        }
+
+    def unshowable(self, data: bytes) -> str | None:
+        """Why the image *data* holds cannot be shown to the model, ``None``
+        where it can: asked where an image is about to enter a conversation.
+
+        The image is sized here as it will be when it is sent, with the
+        server's own code and so with the server's own limits: bytes Pillow
+        cannot open or decode (a file cut short), more pixels than the
+        server loads (:data:`SERVER_MAX_IMAGE_PIXELS`, which is also where
+        Pillow, left at its default, refuses to open an image at all), an
+        image more than 200 times longer than wide, which the image
+        processor refuses.  A server refuses such an image, and not always as a
+        request it will not take: one answers the largest of them as a
+        failure of its own, which would end the run as a failure of the
+        machinery over a picture the model made.  So it is kept out of the
+        conversation, and the model is told why instead.  An image that is
+        let in is sized already when it is sent."""
+        sha256 = hashlib.sha256(data).hexdigest()
+        if sha256 in self._sizes:
+            return None
+        try:
+            self._sizes[sha256] = self._size(data)
+        except Exception as error:
+            return f"{type(error).__name__}: {str(error)[:200]}"
+        return None
+
     def _sized(self, assembly: PromptAssembly, image: Image, length: int) -> None:
         """Size *image* here, by the server's own steps, and hold the result
         against the *length* placeholder tokens the server rendered it as.
@@ -692,10 +751,8 @@ class Vision:
         better, so it is the harness's alarm."""
         sized = self._sizes.get(image.sha256)
         if sized is None:
-            rule = self.route.resize
             try:
-                width, height = server_image_size(image.data)
-                wide, high = rule.size(width, height)
+                sized = self._size(image.data)
             except Exception as error:
                 assembly.fault = (
                     f"an image the server rendered as {length} placeholder tokens could not be "
@@ -703,17 +760,6 @@ class Vision:
                     "here is not the server's"
                 )
                 raise HarnessFaultError(assembly.fault) from None
-            sized = {
-                "width": width,
-                "height": height,
-                "tokens": (wide // rule.multiple) * (high // rule.multiple),
-                "processed": {
-                    "width": wide,
-                    "height": high,
-                    # Frames, rows and columns of patches, before they are merged.
-                    "grid": [1, high // rule.patch, wide // rule.patch],
-                },
-            }
             self._sizes[image.sha256] = sized
         if sized["tokens"] != length:
             assembly.fault = (

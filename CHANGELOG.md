@@ -369,6 +369,9 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   and `control_text_escape` in a record adds up over the run (`requests`).
   A probe that is refused for its command line leaves the verdict an earlier
   probe wrote.
+  With images on, `read_file` hands the model an image only if it can be
+  sized (the server's own limits); for any other the call fails and the
+  model is told why.
   See [the rollout guide](docs/rollout.md#the-text-of-the-tokenizers-own-tokens).
 
 ### Fixed

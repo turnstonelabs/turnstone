@@ -799,6 +799,62 @@ class _ImageSandbox(_DirSandbox):
         return environment
 
 
+def _png_of(width: int, height: int, rows: bytes) -> bytes:
+    """A PNG that says in its header that it is *width* by *height* and
+    holds *rows* as its pixel data, whatever they are."""
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+    return (
+        bytes([137, 80, 78, 71, 13, 10, 26, 10])
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _cut_short_png() -> bytes:
+    """A PNG whose rows all differ, cut in the middle of its pixel data."""
+    rows = b"".join(
+        bytes([0]) + bytes((x * 7 + y * 13) % 256 for x in range(320 * 3)) for y in range(200)
+    )
+    whole = _png_of(320, 200, rows)
+    return whole[: len(whole) * 55 // 100]
+
+
+# Files a model can write that a server does not take as images: one cut
+# short, one of 250 megapixels (more than Pillow decodes at all), and one more
+# than 200 times longer than wide (which the image processor refuses).
+UNSHOWABLE: dict[str, bytes] = {
+    "cut.png": _cut_short_png(),
+    # Its header says so, and that is what is looked at first.
+    "huge.png": _png_of(16000, 15625, bytes(4)),
+    "line.png": png(3000, 10, (30, 60, 220)),
+}
+
+
+class _OddImagesSandbox(_ImageSandbox):
+    """The same, with the files of ``UNSHOWABLE`` beside the image."""
+
+    def start(self) -> Any:
+        environment = super().start()
+        for name, data in UNSHOWABLE.items():
+            with open(os.path.join(self.root, name), "wb") as handle:
+                handle.write(data)
+        return environment
+
+
+def _reads(path: str, thought: str) -> dict[str, Any]:
+    return {
+        "reasoning": thought,
+        "tool_calls": [{"name": "read_file", "arguments": {"path": path}}],
+    }
+
+
 # The first reply opens with a token the toy model is unsure of, so that the probe of the
 # generate route, which a check for images makes, has something to measure.
 LOOK: list[dict[str, Any]] = [
@@ -1030,6 +1086,99 @@ class TestWholeRollouts:
             with pytest.raises(SetupError, match="template_arguments missing"):
                 _run(server, plain_text_verdict=unsaid, **handed)
 
+    def test_an_image_that_cannot_be_sized_is_refused_where_it_enters_and_the_run_goes_on(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A file cut short, one of more pixels than a server loads, one the
+        image processor refuses: a server does not take them, and answers the
+        largest as a failure of its own.  The model made the file, so that
+        must not end the run as a failure of the machinery or as the alarm:
+        read_file fails for it, the model is told why, and the run goes on."""
+        from PIL import Image as Pil
+
+        # Pillow's own limit as a rollout's process has it (another test of
+        # this suite may have lowered it for the whole process).
+        monkeypatch.setattr(Pil, "MAX_IMAGE_PIXELS", 89478485)
+        script = [
+            _reads("cut.png", "I look at it."),
+            _reads("huge.png", "The next."),
+            _reads("line.png", "And the next."),
+            _reads("shot.png", "And the one that is whole."),
+            {"content": "Only shot.png could be shown."},
+        ]
+        with ScriptedChatServer(script, sampler_logprobs=True, **SERVED) as server:
+            record, _box = _run(
+                server,
+                task=LOOKS,
+                sandbox=_OddImagesSandbox(),
+                **{**SEES, "image_dir": str(tmp_path / "i")},
+            )
+            asked = json.dumps([server.tokenize_requests, server.generate_requests])
+        assert record["finish_state"] == "completed", record["error"]
+        assert record["trainable"] is True and record["one_sequence"] is True
+        assert cli._status(record) == 0 and record["turns"] == 5
+        told = [m["content"] for m in record["messages"] if m["role"] == "tool"]
+        assert told[0].startswith("Error: cut.png cannot be shown as an image: ")
+        assert told[1].startswith(
+            "Error: huge.png cannot be shown as an image: DecompressionBombError: Image size "
+            "(250000000 pixels) exceeds limit of 178956970 pixels"
+        )
+        assert told[2].startswith(
+            "Error: line.png cannot be shown as an image: ValueError: absolute aspect ratio"
+        )
+        assert [entry["ok"] for entry in record["tool_log"]] == [False, False, False, True]
+        # Only the whole image entered the conversation, and only it was sent.
+        assert [image["sha256"] for image in record["vision"]["images"]] == [RED.sha256]
+        for data in UNSHOWABLE.values():
+            assert Image.of(data, "image/png").url not in asked
+        assert RED.url in asked
+
+    def test_a_sub_agent_is_refused_such_an_image_the_same_way(self, tmp_path: Any) -> None:
+        parent = [{"reasoning": "I delegate.", "tool_calls": [SPAWN]}, {"content": "done"}]
+        agent = [_reads("huge.png", "I look at it."), {"content": "It cannot be shown."}]
+        with ScriptedChatServer(
+            parent, agent_script=agent, sampler_logprobs=True, **SERVED
+        ) as server:
+            record, _box = _run(
+                server,
+                task=LOOKS,
+                sandbox=_OddImagesSandbox(),
+                **{**SEES, "image_dir": str(tmp_path / "i")},
+            )
+            asked = json.dumps([server.tokenize_requests, server.generate_requests])
+        assert record["finish_state"] == "completed", record["error"]
+        assert record["trainable"] is True and not record["subagents"]["failures"]
+        (call,) = record["subagents"]["tool_log"]
+        assert call["tool"] == "read_file" and call["ok"] is False
+        assert call["result"].startswith("Error: huge.png cannot be shown as an image: ")
+        assert Image.of(UNSHOWABLE["huge.png"], "image/png").url not in asked
+
+    @pytest.mark.parametrize("pillows_limit", [89478485, 40_000_000, None])
+    def test_an_image_that_is_let_in_is_sized_once(
+        self, monkeypatch: pytest.MonkeyPatch, pillows_limit: int | None
+    ) -> None:
+        """And the server's limit on an image's pixels holds whatever
+        Pillow's own is set to in this process: its default, a lower one, or
+        none at all."""
+        from PIL import Image as Pil
+
+        monkeypatch.setattr(Pil, "MAX_IMAGE_PIXELS", pillows_limit)
+        seeing = Vision(SEEING)
+        assert seeing.unshowable(RED.data) is None
+        assert seeing._sizes[RED.sha256]["tokens"] == RED_TOKENS
+        why = {name: seeing.unshowable(data) for name, data in UNSHOWABLE.items()}
+        assert all(why.values()), why
+        assert "250000000 pixels" in str(why["huge.png"])
+        if pillows_limit is None:
+            assert "exceed the maximum of 178956970 pixels" in str(why["huge.png"])
+        assert "aspect ratio" in str(why["line.png"])
+        assert list(seeing._sizes) == [RED.sha256]
+        # Just under the server's limit by its header: not refused for its size.
+        under = _png_of(13377, 13377, bytes(4))
+        assert 13377 * 13377 <= 178_956_970 < 13378 * 13378
+        if pillows_limit != 40_000_000:
+            assert "pixels" not in str(seeing.unshowable(under))
+
     def test_sizing_that_is_not_the_servers_is_a_harness_fault(
         self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1037,8 +1186,12 @@ class TestWholeRollouts:
         tokens than the server's, or an image the server rendered that cannot
         be sized here, is no property of an image: the run stops, loudly,
         before the request with the image goes out."""
+        import turnstone.rollout.episode as episode_module
         import turnstone.rollout.vision as vision_module
 
+        # An image that entered the conversation another way than by a file
+        # read, where an image that cannot be sized is refused to the model.
+        monkeypatch.setattr(episode_module, "_image_check", lambda _state: None)
         real = vision_module.server_image_size
 
         # The run's own image only: the images of the check before the run

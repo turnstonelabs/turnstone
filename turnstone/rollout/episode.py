@@ -657,6 +657,14 @@ def _refused_text(whose: str, refusal: APIStatusError) -> str:
     )
 
 
+def _image_check(state: Mapping[str, Any]) -> Callable[[bytes], str | None] | None:
+    """What a run whose model sees images asks about each image a file
+    read hands it; ``None`` for a run without images."""
+    assembly: PromptAssembly | None = state.get("assembly")
+    seeing = assembly.vision if assembly is not None else None
+    return seeing.unshowable if seeing is not None else None
+
+
 def _escape_breach(assembly: PromptAssembly) -> Callable[[str], None]:
     """What a session with prompts as token IDs is told when control-token
     text was about to be escaped in one of its requests: the harness's
@@ -714,6 +722,7 @@ class RolloutSession(HeadlessSession):
         subagent_sidecar_tools: bool = True,
         before_acting: Callable[[], None] | None = None,
         vision: bool = False,
+        image_check: Callable[[bytes], str | None] | None = None,
         token_ids: bool = False,
         escape_breach: Callable[[str], None] | None = None,
         escape_control_text: bool | None = None,
@@ -737,6 +746,9 @@ class RolloutSession(HeadlessSession):
         self._subagent_sidecar_tools = subagent_sidecar_tools
         super().__init__(**kwargs)
         self._vision = vision
+        # Says why an image cannot be shown to the model, where it cannot
+        # (:meth:`turnstone.rollout.vision.Vision.unshowable`).
+        self._image_check = image_check
         lane = self._model_binding.lane
         capabilities = require_lane_capabilities(lane)
         # What became of the escape in the session's requests, for the record.
@@ -1037,6 +1049,30 @@ class RolloutSession(HeadlessSession):
             if not item.get("error"):
                 self.subagents_admitted += 1
             return item
+
+    def _exec_read_image(
+        self, call_id: str, path: str, resolved: str
+    ) -> tuple[str, str | list[dict[str, Any]]]:
+        """An image file as ``read_file`` hands it on, for the session and for
+        a sub-agent.  In a run whose model sees images, an image that cannot
+        be sized here is not put into the conversation: the server would not
+        take it either, and can answer it as a failure of its own, which is
+        no outcome a file the model wrote may bring about.  The call fails
+        instead, and the model is told why.  The bytes looked at are the
+        very ones the result carries."""
+        found = super()._exec_read_image(call_id, path, resolved)
+        output = found[1]
+        if self._image_check is None or not isinstance(output, list):
+            return found
+        for part in output:
+            image = self._decode_image_part(part, "read_file")
+            why = self._image_check(image.content) if image is not None else None
+            if why is not None:
+                self._current_read_files.discard(resolved)
+                message = f"Error: {path} cannot be shown as an image: {why}"
+                self._report_tool_result(call_id, "read_file", message, is_error=True)
+                return call_id, message
+        return found
 
     def _execute_tools(self, *args: Any, **kwargs: Any) -> Any:
         if self._before_acting is not None:
@@ -3015,6 +3051,7 @@ def run_episode(
                     subagent_sidecar_tools=config.subagent_sidecar_tools,
                     before_acting=before_acting,
                     vision=bool(state["vision"]["applied"]),
+                    image_check=_image_check(state),
                     token_ids=bool(config.token_id_prompts),
                     escape_breach=(
                         _escape_breach(state["assembly"]) if config.token_id_prompts else None
