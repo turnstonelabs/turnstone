@@ -865,7 +865,7 @@ class TestTheProbe:
         with ScriptedChatServer(SCRIPT, sampler_logprobs=True) as server:
             base = ["--base-url", server.base_url, "--model", "scripted", "--probe-only"]
             base += ["--top-k", "20", "--top-p", "0.95"]
-            assert cli.main([*base, "--token-id-prompts"]) == 0
+            assert cli.main([*base, "--token-id-prompts", "--no-plain-text", "--no-vision"]) == 0
             asked = list(server.requests)
         verdict = json.loads(capsys.readouterr().out)
         assert verdict["route"] == "completions" and verdict["sampler_logprobs"] is True

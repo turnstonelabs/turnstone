@@ -71,7 +71,7 @@ class TestOneCheckForABatch:
     def test_the_probe_alone_also_checks_the_routes_with_prompts_as_token_ids(self, capsys):
         with ScriptedChatServer(SCRIPT, sampler_logprobs=True) as server:
             base = ["--base-url", server.base_url, "--model", "scripted", *BASE, "--probe-only"]
-            assert cli.main([*base, "--token-id-prompts"]) == 0
+            assert cli.main([*base, "--token-id-prompts", "--no-plain-text", "--no-vision"]) == 0
             as_token_ids = json.loads(capsys.readouterr().out)
             assert cli.main(base) == 0
             as_messages = json.loads(capsys.readouterr().out)
@@ -90,7 +90,7 @@ class TestOneCheckForABatch:
         out = tmp_path / "episode.json"
         with ScriptedChatServer(SCRIPT, sampler_logprobs=True) as server:
             base = ["--base-url", server.base_url, "--model", "scripted", *BASE]
-            base += ["--token-id-prompts"]
+            base += ["--token-id-prompts", "--no-plain-text", "--no-vision"]
             assert cli.main([*base, "--probe-only", "--out", str(verdict)]) == 0
             asked, rendered = len(server.requests), len(server.tokenize_requests)
             _in(monkeypatch, _DirSandbox())
@@ -116,7 +116,12 @@ class TestOneCheckForABatch:
     def test_a_server_that_cannot_be_sent_token_ids_has_another_status(self, capsys):
         with ScriptedChatServer(SCRIPT, sampler_logprobs=True, tokenize_status=404) as server:
             base = ["--base-url", server.base_url, "--model", "scripted", *BASE]
-            assert cli.main([*base, "--probe-only", "--token-id-prompts"]) == 2
+            assert (
+                cli.main(
+                    [*base, "--probe-only", "--token-id-prompts", "--no-plain-text", "--no-vision"]
+                )
+                == 2
+            )
         route = json.loads(capsys.readouterr().out)["token_id_route"]
         assert route["ok"] is False and "tokenize route" in route["reason"]
 
@@ -124,14 +129,38 @@ class TestOneCheckForABatch:
         ("flags", "why"),
         [
             (["--token-id-route", "{}"], "--token-id-route is for --token-id-prompts"),
-            (["--token-id-prompts", "--token-id-route", "maybe"], "the verdict of the check"),
             (
-                ["--token-id-prompts", "--token-id-route", '{"token_id_route": null}'],
+                [
+                    "--token-id-prompts",
+                    "--no-plain-text",
+                    "--no-vision",
+                    "--token-id-route",
+                    "maybe",
+                ],
                 "the verdict of the check",
             ),
-            (["--token-id-prompts", "--token-id-route", "@/no/such/file"], "cannot be read"),
             (
-                ["--token-id-prompts"]
+                [
+                    "--token-id-prompts",
+                    "--no-plain-text",
+                    "--no-vision",
+                    "--token-id-route",
+                    '{"token_id_route": null}',
+                ],
+                "the verdict of the check",
+            ),
+            (
+                [
+                    "--token-id-prompts",
+                    "--no-plain-text",
+                    "--no-vision",
+                    "--token-id-route",
+                    "@/no/such/file",
+                ],
+                "cannot be read",
+            ),
+            (
+                ["--token-id-prompts", "--no-plain-text", "--no-vision"]
                 + ["--sampler-logprobs", '{"route": "chat", "reflects": ' + REFLECTS + "}"],
                 "probed on the chat route",
             ),
@@ -156,7 +185,7 @@ class TestOneCheckForABatch:
         box = _DirSandbox()
         with ScriptedChatServer(SCRIPT, sampler_logprobs=True) as server:
             base = ["--base-url", server.base_url, "--model", "scripted", *BASE]
-            base += ["--token-id-prompts"]
+            base += ["--token-id-prompts", "--no-plain-text", "--no-vision"]
             probe = [*base, "--probe-only", "--effort", "low", "--out", str(verdict)]
             assert cli.main(probe) == 0
             asked = len(server.requests)
@@ -208,7 +237,15 @@ class TestEverySettingFromTheCommand:
             _in(monkeypatch, box)
             status = cli.main(
                 ["--base-url", server.base_url, "--model", "scripted", "--task", str(task)]
-                + ["--top-k", "20", "--top-p", "0.95", "--token-id-prompts"]
+                + [
+                    "--top-k",
+                    "20",
+                    "--top-p",
+                    "0.95",
+                    "--token-id-prompts",
+                    "--no-plain-text",
+                    "--no-vision",
+                ]
                 + ["--context-window", "200000", "--max-tokens", "1000"]
                 + ["--max-tool-result-chars", "1200", "--min-tokens-per-second", "1"]
                 + ["--server-version-url", server.version_url]

@@ -142,7 +142,7 @@ def probe_verdict(given: Any, *, model: str, endpoint: str, route: str) -> dict[
     the other route, does not say what it was made for, or was made for another
     model or endpoint.  The verdict comes back as it was given; a check for
     prompts as token IDs printed into the same object is left out, and so is
-    one for images, because a run keeps each under a key of its own.
+    the one for plain text, because a run keeps each under a key of its own.
     """
     again = "probe again"
     reflects = given.get("reflects") if isinstance(given, dict) else None
@@ -176,7 +176,7 @@ def probe_verdict(given: Any, *, model: str, endpoint: str, route: str) -> dict[
             f"{_said(given['sampler_logprobs'])} and reflects says {_said(reflects)}: {again}"
         )
     kept = {
-        key: value for key, value in given.items() if key not in ("token_id_route", "vision_route")
+        key: value for key, value in given.items() if key not in ("token_id_route", "plain_text")
     }
     kept.setdefault("sampler_logprobs", summed_up(reflects))
     return kept

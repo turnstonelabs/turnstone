@@ -103,10 +103,14 @@ class CallRecord:
     # working on the prompt.  ``None`` while it has not, and for a reply that
     # came in one piece.
     first_token_at: float | None = None
-    # The size of the request's messages and tools in bytes.  A token is at
-    # least one byte, so this bounds the prompt's tokens before the server
-    # has counted them.
+    # The size of the request's messages and tools in bytes, the data of
+    # images and sounds left out.  A token of text is at least one byte, so
+    # this bounds the prompt's text tokens before the server has counted
+    # them.
     prompt_bytes: int = 0
+    # With a prompt sent as token IDs: how many tokens it holds, known before
+    # the request goes out.  The server's speed is held against this.
+    prompt_tokens_sent: int | None = None
     # The reply limit a gate granted this call, and whether that was less
     # than the request asked for.
     token_grant: int | None = None
@@ -476,9 +480,23 @@ class _Completions:
         return getattr(self._inner, name)
 
 
+def _without_data(value: Any) -> Any:
+    """A request part without the data of its images and sounds: their size
+    in bytes says nothing about the tokens they become."""
+    if isinstance(value, list):
+        return [_without_data(item) for item in value]
+    if isinstance(value, dict):
+        if value.get("type") in ("image_url", "input_audio", "audio_url", "video_url"):
+            return {"type": value.get("type")}
+        return {key: _without_data(item) for key, item in value.items()}
+    return value
+
+
 def _size(value: Any) -> int:
-    """The size of a request part in bytes.  Never raises."""
+    """The size of a request part in bytes, the data of images and sounds
+    left out.  Never raises."""
     try:
+        value = _without_data(value)
         return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8", "replace"))
     except (TypeError, ValueError, RecursionError):
         return len(repr(value).encode("utf-8", "replace"))

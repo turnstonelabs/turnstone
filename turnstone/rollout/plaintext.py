@@ -11,36 +11,42 @@ the image placeholder's characters takes the next image.  Nothing on a server
 says "this part is content".
 
 With prompts as token IDs it can be said on this side.  Before a conversation
-goes to the tokenize route, each such text in what the environment wrote (the
-system prompt, user messages, tool results, tool definitions) is replaced by
-one stand-in: a token of the tokenizer that the template never writes.  A
-token of the tokenizer comes out of any text as itself, never joined with its
-neighbours, so the rendering holds one stand-in token per replaced text, in
-order.  Each is then replaced by an ordinary spelling of the original text:
-the tokens of the text cut in two, neither half being a token's text any
-more.  The model sees the characters a person reading the file sees, and no
-token the environment could not have typed as text.
+goes to the tokenize route, each such text in it is cut: a stand-in, a token
+of the tokenizer that the template never writes, is put after the text's
+first character.  The tokenizer then meets the first character, the stand-in
+and the rest, none of which is the token's text, and writes the stand-in as
+the one token it is.  After the rendering every stand-in token is taken out
+again.  What is left is the text's own characters as ordinary tokens: the
+model sees what a person reading the file sees, and no token the environment
+could not have typed as text.
 
-What the model itself generated is never touched: its turns stand in the
-sequence as the tokens it wrote.  Where a turn of the model's is rendered
-again from its text (to find where the turn ends, and for a sub-agent's
-prompts, which are renderings throughout) its text is read the same way: a
-model that wrote the characters of a token wrote characters.
+Nothing has to be put back and nothing depends on where a template writes
+what, so it does not matter in which order a server renders a tool
+definition's fields or which of them it leaves out.  What it takes is that no
+token's text can come about across a cut, which the check before a run
+establishes once for the tokenizer's whole set of texts
+(:func:`plain_text_verdict`).
 
-A rendering whose stand-in tokens do not match the texts replaced cannot be
-spliced: that is a fault of this code or of the check that chose the stand-in,
-never of what the model or the environment wrote, and it is raised as
-:class:`HarnessFaultError`.
+Every text of a conversation is cut: the system prompt, user messages, tool
+results, tool definitions, and the model's own turns where they are rendered
+again from their text.  A model that wrote the characters of a token wrote
+characters.  Its turn in the rollout's sequence is the tokens it generated
+and is never touched.  A tool call's arguments are cut as the values they
+decode to, which is how a server renders them.
 
-:func:`plain_text_verdict` establishes, as part of the check before a run,
-what a run needs: which texts the tokenizer has tokens for, an ordinary
-spelling of each, a stand-in, and where the template writes the tool
-definitions.
+The stand-ins a rendering holds are also counted, as an alarm.  In the part
+of a rendering a prompt is built from, which holds what the environment wrote
+and nothing of the model's, there can be no more stand-in tokens than cuts
+were made.  More means the template wrote one or a text went uncut: a fault
+of this code or of the check, raised as :class:`HarnessFaultError`.  Fewer is
+no fault: a template need not write everything it is given.
 """
 
 from __future__ import annotations
 
+import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -49,6 +55,9 @@ from turnstone.rollout.settings import SetupError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+
+# Parts of a message that hold data, not text: left as they are.
+_DATA_PARTS = frozenset({"image_url", "image", "input_audio", "audio_url", "video_url"})
 
 
 class HarnessFaultError(RuntimeError):
@@ -80,166 +89,189 @@ def added_tokens_of(info: Any) -> dict[str, int]:
     return found
 
 
+def can_meet(texts: Sequence[str]) -> str | None:
+    """Why a cut after the first character does not keep the texts of
+    *texts* apart, or ``None`` when it does.
+
+    A cut text must not be able to become another text, or itself, with what
+    stands before or after it.  That holds when no text ends the way another
+    begins (two occurrences cannot overlap) and none holds another: every
+    occurrence in a text is then found and cut by itself, and neither side of
+    a cut can complete a text.
+    """
+    for one in texts:
+        for other in texts:
+            if one != other and other in one:
+                return f"{one!r} holds {other!r}"
+            for size in range(1, min(len(one), len(other))):
+                if one[-size:] == other[:size]:
+                    return f"{one!r} ends the way {other!r} begins"
+    return None
+
+
+@dataclass(frozen=True)
+class Swapped:
+    """A conversation with its texts cut, and what was cut."""
+
+    messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]] | None
+    # Cuts made per message, and in the tool definitions.
+    per_message: list[int]
+    in_tools: int
+    # The texts cut in what the environment wrote (every message that is not
+    # the model's own turn, and the tool definitions), each with how often.
+    environment: dict[str, int]
+
+
 @dataclass(frozen=True)
 class PlainText:
     """What :func:`plain_text_verdict` established: all a run needs to have
-    the environment's text read as plain text."""
+    a conversation's text read as plain text."""
 
     # The stand-in: a token of the tokenizer the template never writes.
     stand_in: str
     stand_in_id: int
-    # Each text the tokenizer has a token for, with an ordinary spelling of it.
-    spelled: dict[str, tuple[int, ...]]
-    # Whether the template writes the tool definitions before the text of a
-    # system message at the head of the conversation.
-    tools_first: bool = False
+    # The texts the tokenizer has tokens for.
+    texts: tuple[str, ...]
 
     @classmethod
-    def from_verdict(cls, verdict: Any) -> PlainText | None:
-        """What a check's verdict describes; ``None`` for a check that could
-        not establish it.  Raises :class:`SetupError` for one that says it did
-        and does not hold what that takes."""
+    def from_verdict(cls, verdict: Any) -> PlainText:
+        """What a passed check's verdict describes.  Raises
+        :class:`SetupError` for one that says the server cannot and for one
+        that does not hold what a passed check found."""
         if not isinstance(verdict, dict) or not verdict.get("ok"):
-            return None
-        spelled = verdict.get("spelled")
-        text, token = verdict.get("stand_in"), verdict.get("stand_in_id")
-        sound = (
-            isinstance(text, str)
-            and isinstance(token, int)
-            and not isinstance(token, bool)
-            and isinstance(spelled, dict)
-            and text in spelled
-            and all(
-                isinstance(k, str)
-                and isinstance(v, list)
-                and v
-                and all(isinstance(t, int) and not isinstance(t, bool) for t in v)
-                for k, v in spelled.items()
+            said = verdict.get("reason") if isinstance(verdict, dict) else None
+            raise SetupError(
+                "the text of the tokenizer's own tokens cannot be read as plain text: "
+                f"{said or 'the check of the server did not establish how'}"
             )
-        )
+        texts = verdict.get("texts")
+        text, token = verdict.get("stand_in"), verdict.get("stand_in_id")
         if (
-            not sound
-            or not isinstance(text, str)
+            not isinstance(text, str)
+            or isinstance(token, bool)
             or not isinstance(token, int)
-            or not isinstance(spelled, dict)
+            or not isinstance(texts, list)
+            or not texts
+            or any(not isinstance(t, str) or not t for t in texts)
+            or text not in texts
+            or verdict.get("cut_checked") is not True
         ):
             raise SetupError(
                 "the given check of the server does not hold what it found about the "
-                "tokenizer's own tokens (special_text: a stand-in and a spelling for each "
-                "text): check the server again"
+                "tokenizer's own tokens (plain_text: the texts, a stand-in among them, and "
+                "that a cut keeps them apart): check the server again"
             )
-        return cls(
-            stand_in=text,
-            stand_in_id=token,
-            spelled={k: tuple(v) for k, v in spelled.items()},
-            tools_first=bool(verdict.get("tools_first")),
-        )
+        return cls(stand_in=text, stand_in_id=token, texts=tuple(texts))
 
     @cached_property
     def _every(self) -> re.Pattern[str]:
-        # The longest text first: one token's text can begin another's.
-        return re.compile(
-            "|".join(re.escape(t) for t in sorted(self.spelled, key=len, reverse=True))
-        )
+        # The longest text first, though none holds another.
+        return re.compile("|".join(re.escape(t) for t in sorted(self.texts, key=len, reverse=True)))
 
-    def _text(self, text: str, replaced: list[str]) -> str:
-        def note(match: re.Match[str]) -> str:
-            replaced.append(match.group(0))
-            return self.stand_in
+    def cut(self, text: str, seen: Counter[str]) -> str:
+        """*text* with the stand-in after the first character of every text
+        of a token; *seen* is told which."""
 
-        return self._every.sub(note, text)
+        def one(match: re.Match[str]) -> str:
+            found = match.group(0)
+            seen[found] += 1
+            return found[0] + self.stand_in + found[1:]
 
-    def _walk(self, value: Any, replaced: list[str]) -> Any:
-        """A JSON value with every text of the tokenizer's replaced, in the
-        order a template writes the value out."""
+        return self._every.sub(one, text)
+
+    def _walk(self, value: Any, seen: Counter[str]) -> Any:
+        """A JSON value with every text in it cut: strings, and the keys of
+        objects, which a template writes out as well."""
         if isinstance(value, str):
-            return self._text(value, replaced)
+            return self.cut(value, seen)
         if isinstance(value, list):
-            return [self._walk(item, replaced) for item in value]
+            return [self._walk(item, seen) for item in value]
         if isinstance(value, dict):
+            if value.get("type") in _DATA_PARTS:
+                return value
             return {
-                self._walk(key, replaced) if isinstance(key, str) else key: self._walk(
-                    item, replaced
-                )
+                self.cut(key, seen) if isinstance(key, str) else key: self._walk(item, seen)
                 for key, item in value.items()
             }
         return value
 
-    def _content(self, content: Any, replaced: list[str]) -> Any:
-        if isinstance(content, str):
-            return self._text(content, replaced)
-        if isinstance(content, list):
-            return [
-                {**part, "text": self._text(part["text"], replaced)}
-                if isinstance(part, dict) and isinstance(part.get("text"), str)
-                else part
-                for part in content
-            ]
-        return content
-
-    def _message(self, message: Mapping[str, Any], replaced: list[str]) -> dict[str, Any]:
-        """One message with its texts replaced, in the order a template writes
-        a message out: reasoning, text, tool calls."""
-        out = dict(message)
-        for name in ("reasoning", "reasoning_content", "content"):
-            if name in out:
-                out[name] = self._content(out[name], replaced)
-        calls = out.get("tool_calls")
-        if isinstance(calls, list):
-            swapped = []
-            for call in calls:
-                function = call.get("function") if isinstance(call, dict) else None
-                if isinstance(function, dict) and isinstance(function.get("arguments"), str):
-                    arguments = self._text(function["arguments"], replaced)
-                    call = {**call, "function": {**function, "arguments": arguments}}
-                swapped.append(call)
-            out["tool_calls"] = swapped
+    def _message(self, message: Mapping[str, Any], seen: Counter[str]) -> dict[str, Any]:
+        """One message with every text in it cut.  A tool call's arguments
+        are cut as what they decode to: a server decodes them before its
+        template writes them, so the text it meets is the decoded one."""
+        out: dict[str, Any] = {}
+        for name, value in message.items():
+            if name == "role":
+                out[name] = value
+            elif name == "tool_calls" and isinstance(value, list):
+                out[name] = [self._call(call, seen) for call in value]
+            else:
+                out[name] = self._walk(value, seen)
         return out
+
+    def _call(self, call: Any, seen: Counter[str]) -> Any:
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict):
+            return self._walk(call, seen)
+        cut = {k: self._walk(v, seen) for k, v in function.items() if k != "arguments"}
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                decoded = json.loads(arguments)
+            except (ValueError, RecursionError):
+                # No JSON: no server decodes it, and it is written as it is.
+                cut["arguments"] = self.cut(arguments, seen)
+            else:
+                cut["arguments"] = json.dumps(self._walk(decoded, seen), ensure_ascii=False)
+        elif "arguments" in function:
+            cut["arguments"] = self._walk(arguments, seen)
+        rest = {k: self._walk(v, seen) for k, v in call.items() if k != "function"}
+        return {**rest, "function": cut}
 
     def swap(
         self,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]] | None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, list[str]]:
-        """*messages* and *tools* with each text of the tokenizer's own tokens
-        replaced by the stand-in, and the replaced texts in the order their
-        stand-ins come out of the rendering.  A conversation that holds none
-        comes back as the very objects it was given."""
-        head: list[str] = []
-        rest: list[str] = []
-        defined: list[str] = []
-        swapped = []
-        at_head = True
+    ) -> Swapped:
+        """*messages* and *tools* with every text of a token cut.  A
+        conversation that holds none comes back as the very objects it was
+        given."""
+        environment: Counter[str] = Counter()
+        per_message: list[int] = []
+        swapped: list[dict[str, Any]] = []
         for message in messages:
-            at_head = at_head and message.get("role") in ("system", "developer")
-            swapped.append(self._message(message, head if at_head else rest))
+            seen: Counter[str] = Counter()
+            swapped.append(self._message(message, seen))
+            per_message.append(sum(seen.values()))
+            if message.get("role") != "assistant":
+                environment.update(seen)
+        defined: Counter[str] = Counter()
         new_tools = self._walk(list(tools), defined) if tools else None
-        replaced = (defined + head if self.tools_first else head + defined) + rest
-        if not replaced:
+        environment.update(defined)
+        in_tools = sum(defined.values())
+        if not in_tools and not any(per_message):
             # The very objects: a request without such a text is the request it was.
-            return messages, tools, []  # type: ignore[return-value]
-        return swapped, new_tools, replaced
+            return Swapped(messages, tools, per_message, 0, {})  # type: ignore[arg-type]
+        return Swapped(swapped, new_tools, per_message, in_tools, dict(environment))
 
-    def splice(self, ids: list[int], replaced: Sequence[str]) -> list[int]:
-        """*ids*, a rendering of a swapped conversation, with each stand-in
-        token replaced by the ordinary spelling of the text it stands for."""
-        count = ids.count(self.stand_in_id)
-        if count != len(replaced):
-            raise HarnessFaultError(
-                f"a rendering holds {count} stand-in tokens ({self.stand_in_id}) for "
-                f"{len(replaced)} texts that were replaced: the texts of the tokenizer's own "
-                "tokens cannot be put back as plain text"
-            )
-        if not count:
+    def strip(self, ids: list[int]) -> list[int]:
+        """*ids*, a rendering of a cut conversation, without its stand-in
+        tokens; the very list where it holds none."""
+        if self.stand_in_id not in ids:
             return ids
-        out: list[int] = []
-        texts = iter(replaced)
-        for token in ids:
-            if token == self.stand_in_id:
-                out.extend(self.spelled[next(texts)])
-            else:
-                out.append(token)
-        return out
+        return [token for token in ids if token != self.stand_in_id]
+
+    def surplus(self, raw: Sequence[int], kept_before: int, cuts: int) -> int:
+        """How many more stand-in tokens *raw*, a rendering as it came, holds
+        than *cuts* were made, in the part that follows its first
+        *kept_before* tokens that are no stand-ins; 0 or less is no fault."""
+        at = 0
+        kept = 0
+        while at < len(raw) and kept < kept_before:
+            kept += raw[at] != self.stand_in_id
+            at += 1
+        return sum(1 for token in raw[at:] if token == self.stand_in_id) - cuts
 
 
 _TOOL: dict[str, Any] = {
@@ -259,7 +291,7 @@ def plain_text_verdict(
     added: Mapping[str, int],
     written: Sequence[int],
 ) -> dict[str, Any]:
-    """What a run needs to read the environment's text as plain text, for a
+    """What a run needs to read a conversation's text as plain text, for a
     tokenizer whose own tokens are *added* (text to ID).
 
     *render* renders a conversation with tools on the server's tokenize
@@ -269,7 +301,18 @@ def plain_text_verdict(
 
     ``ok`` is true when everything was established; ``reason`` says what was
     not.  A token of *added* the server does not write for its text is left
-    out and named (``left_out``).
+    out and named (``left_out``).  What is established:
+
+    - which texts the server writes a token for (``texts``);
+    - a stand-in among them that the template writes nowhere in a
+      conversation with a system message, tools, a call and its result;
+    - that a cut keeps the texts apart (``cut_checked``): none can come about
+      across a cut by the texts themselves (:func:`can_meet`), and for each
+      one the server, given the cut text, writes the stand-in once, no other
+      token of the set, and tokens that read as the text;
+    - the whole of it once: a conversation with every text in a system
+      message, a tool's description and a tool result comes out with the
+      tokens the template writes and no others, and reads as the texts.
     """
     verdict: dict[str, Any] = {"ok": False, "reason": None}
 
@@ -286,18 +329,10 @@ def plain_text_verdict(
             left_out.append(text)
     if not known:
         return failed("the server writes none of the named tokens for its text")
+    meet = can_meet(list(known))
+    if meet is not None:
+        return failed(f"a cut does not keep the texts of the tokenizer's tokens apart: {meet}")
     ids = set(known.values())
-    spelled: dict[str, list[int]] = {}
-    for text in known:
-        for cut in range(len(text) // 2, 0, -1):
-            halves = tokens_of(text[:cut]) + tokens_of(text[cut:])
-            if not (set(halves) & ids) and text_of(halves) == text:
-                spelled[text] = halves
-                break
-        else:
-            return failed(f"no ordinary spelling was found for the text of token {known[text]}")
-    # The stand-in: the template writes it nowhere in a conversation with a
-    # system message, tools, a call and its result.
     conversation: list[dict[str, Any]] = [
         {"role": "system", "content": "Be brief."},
         {"role": "user", "content": "Look up alpha."},
@@ -317,9 +352,7 @@ def plain_text_verdict(
     plain = render(conversation, [_TOOL])
     taken = set(written) | set(plain)
     free = [
-        text
-        for text, token in sorted(known.items(), key=lambda item: -item[1])
-        if token not in taken
+        t for t, token in sorted(known.items(), key=lambda item: -item[1]) if token not in taken
     ]
     if not free:
         return failed(
@@ -327,36 +360,15 @@ def plain_text_verdict(
         )
     stand_in = free[0]
     stand_id = known[stand_in]
-    # Where the template writes the tool definitions: one stand-in in the
-    # system message, two in a tool's description, three in the user's.
-    marked_tool = {**_TOOL, "function": {**_TOOL["function"], "description": stand_in * 2}}
-    probe = [
-        {"role": "system", "content": "Be brief. " + stand_in},
-        {"role": "user", "content": "Look up alpha. " + stand_in * 3},
-    ]
-    runs: list[int] = []
-    previous = -2
-    for at, token in enumerate(render(probe, [marked_tool])):
-        if token == stand_id:
-            if at == previous + 1:
-                runs[-1] += 1
-            else:
-                runs.append(1)
-            previous = at
-    if runs not in ([1, 2, 3], [2, 1, 3]):
-        return failed(
-            "the template does not write a system message, the tool definitions and a user "
-            f"message once each, in an order this code knows (stand-in tokens came as {runs})"
-        )
-    route = PlainText(
-        stand_in=stand_in,
-        stand_in_id=stand_id,
-        spelled={k: tuple(v) for k, v in spelled.items()},
-        tools_first=runs[0] == 2,
-    )
-    # The whole of it once: every text in a system message, a tool's
-    # description and a tool result comes out as its characters, and the
-    # rendering holds the tokens it holds without them and no other.
+    for text in known:
+        cut = tokens_of(text[0] + stand_in + text[1:])
+        rest = [token for token in cut if token != stand_id]
+        if cut.count(stand_id) != 1 or set(rest) & ids or text_of(rest) != text:
+            return failed(
+                f"the text of token {known[text]}, cut after its first character, does not come "
+                "out as the stand-in and ordinary tokens that read as the text"
+            )
+    route = PlainText(stand_in=stand_in, stand_in_id=stand_id, texts=tuple(known))
     every = " ".join(known)
     loaded = [dict(m) for m in conversation]
     loaded[0]["content"] = "Be brief. " + every
@@ -365,25 +377,24 @@ def plain_text_verdict(
         **_TOOL,
         "function": {**_TOOL["function"], "description": "Look a word up. " + every},
     }
-    messages, tools, replaced = route.swap(loaded, [loaded_tool])
-    try:
-        spliced = route.splice(render(messages, tools), replaced)
-    except HarnessFaultError as fault:
-        return failed(str(fault))
-    if sorted(t for t in spliced if t in ids) != sorted(t for t in plain if t in ids):
+    swapped = route.swap(loaded, [loaded_tool])
+    raw = render(swapped.messages, swapped.tools)
+    if route.surplus(raw, 0, sum(swapped.per_message) + swapped.in_tools) > 0:
+        return failed("a rendering holds more stand-in tokens than cuts were made")
+    stripped = route.strip(raw)
+    if sorted(t for t in stripped if t in ids) != sorted(t for t in plain if t in ids):
         return failed(
-            "a rendering with the texts replaced and put back does not hold the tokens the "
-            "template writes and no others"
+            "a rendering with the texts cut does not hold the tokens the template writes and "
+            "no others"
         )
-    if text_of(spliced).count(every) != 3:
-        return failed("a rendering with the texts replaced and put back does not read as the texts")
+    if text_of(stripped).count(every) != 3:
+        return failed("a rendering with the texts cut does not read as the texts")
     verdict.update(
         ok=True,
         stand_in=stand_in,
         stand_in_id=stand_id,
-        tools_first=route.tools_first,
-        tokens=len(known),
-        spelled=spelled,
+        texts=list(known),
         left_out=left_out,
+        cut_checked=True,
     )
     return verdict

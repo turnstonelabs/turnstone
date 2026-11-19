@@ -114,7 +114,19 @@ class TestWhatAVerdictNames:
         out = tmp_path / "server.json"
         with ScriptedChatServer(SCRIPT, sampler_logprobs=True) as server:
             flags = ["--base-url", server.base_url, "--model", "scripted", "--probe-only"]
-            assert cli.main([*flags, "--token-id-prompts", "--out", str(out)]) == 0
+            assert (
+                cli.main(
+                    [
+                        *flags,
+                        "--token-id-prompts",
+                        "--no-plain-text",
+                        "--no-vision",
+                        "--out",
+                        str(out),
+                    ]
+                )
+                == 0
+            )
             here = server.base_url
         written = json.loads(out.read_text(encoding="ascii"))
         assert written == json.loads(capsys.readouterr().out)
@@ -468,7 +480,20 @@ class TestTheCommand:
         """What ``--probe-only --token-id-prompts`` writes for *server*."""
         out = tmp_path / "server.json"
         flags = ["--base-url", server.base_url, "--model", "scripted", *self.BASE, *more]
-        assert cli.main([*flags, "--token-id-prompts", "--probe-only", "--out", str(out)]) == 0
+        assert (
+            cli.main(
+                [
+                    *flags,
+                    "--token-id-prompts",
+                    "--no-plain-text",
+                    "--no-vision",
+                    "--probe-only",
+                    "--out",
+                    str(out),
+                ]
+            )
+            == 0
+        )
         written: dict[str, Any] = json.loads(out.read_text(encoding="ascii"))
         return written
 
@@ -491,7 +516,15 @@ class TestTheCommand:
             verdicts = f"@{tmp_path / 'server.json'}"
             status = cli.main(
                 ["--base-url", server.base_url, "--model", "scripted", *self.BASE]
-                + ["--token-id-prompts", "--prompt", "go", "--out", str(out)]
+                + [
+                    "--token-id-prompts",
+                    "--no-plain-text",
+                    "--no-vision",
+                    "--prompt",
+                    "go",
+                    "--out",
+                    str(out),
+                ]
                 + ["--sampler-logprobs", verdicts, "--token-id-route", verdicts]
             )
             assert len(server.requests) == asked + 3
@@ -571,7 +604,15 @@ class TestTheCommand:
             asked, rendered = len(server.requests), len(server.tokenize_requests)
             monkeypatch.setattr(cli, "run_episode", _never)
             flags = ["--base-url", server.base_url, "--model", "scripted", *self.BASE]
-            flags += ["--token-id-prompts", "--prompt", "go", flag, json.dumps(change(given))]
+            flags += [
+                "--token-id-prompts",
+                "--no-plain-text",
+                "--no-vision",
+                "--prompt",
+                "go",
+                flag,
+                json.dumps(change(given)),
+            ]
             assert cli.main(flags) == 3
             assert len(server.requests) == asked and len(server.tokenize_requests) == rendered
         assert said in capsys.readouterr().err
@@ -584,7 +625,15 @@ class TestTheCommand:
             capsys.readouterr()
             monkeypatch.setattr(cli, "run_episode", _never)
             flags = ["--base-url", server.base_url, "--model", "scripted", *self.BASE]
-            flags += ["--token-id-prompts", "--prompt", "go", "--sampler-logprobs", "yes"]
+            flags += [
+                "--token-id-prompts",
+                "--no-plain-text",
+                "--no-vision",
+                "--prompt",
+                "go",
+                "--sampler-logprobs",
+                "yes",
+            ]
             flags += ["--token-id-route", json.dumps(given), "--effort", "high"]
             assert cli.main(flags) == 3
         said = capsys.readouterr().err

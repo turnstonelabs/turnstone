@@ -39,7 +39,6 @@ server must do for all of this is established once, before a run, by
 from __future__ import annotations
 
 import base64
-import binascii
 import contextlib
 import copy
 import hashlib
@@ -54,6 +53,7 @@ from typing import TYPE_CHECKING, Any
 from openai import APIStatusError, Stream
 
 from turnstone.core.log import get_logger
+from turnstone.core.session import ChatSession
 from turnstone.rollout.idprompt import (
     IdStream,
     PromptAssemblyError,
@@ -72,7 +72,6 @@ from turnstone.rollout.recording import (
 )
 from turnstone.rollout.settings import SetupError
 from turnstone.rollout.tokens import common_prefix_len
-from turnstone.rollout.verdicts import _made_here, _said, _says_what_for, made_for
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -124,7 +123,6 @@ _KEYWORDS = (
 # tokens named by ID by the way the server was started.
 _ASKED_ANOTHER_WAY = frozenset({"return_token_ids", "return_tokens_as_token_ids"})
 _EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
-_VERDICT_NAMES = ("model", "endpoint", "checked_at", "template_arguments")
 
 
 class PlaceholderGeneratedError(Exception):
@@ -160,9 +158,13 @@ class Image:
         return {"type": "image_url", "image_url": {"url": self.url}}
 
 
-def images_of(messages: Sequence[Mapping[str, Any]]) -> list[Image]:
+def images_of(
+    messages: Sequence[Mapping[str, Any]], known: dict[str, Image] | None = None
+) -> list[Image]:
     """The images a request's messages carry, in the order a chat template
-    writes them: message by message, part by part.
+    writes them: message by message, part by part.  *known* remembers each
+    image by the text that carries it, so that one is decoded and hashed once
+    however many requests hold it.
 
     Raises :class:`PromptAssemblyError` for an image that is not carried in
     the request itself (an address the server would fetch): its bytes could
@@ -177,20 +179,23 @@ def images_of(messages: Sequence[Mapping[str, Any]]) -> list[Image]:
             if not isinstance(part, dict) or part.get("type") != "image_url":
                 continue
             given = part.get("image_url")
-            url = given.get("url") if isinstance(given, dict) else given
-            head, marker, encoded = str(url or "").partition(";base64,")
-            if not head.startswith("data:") or not marker:
-                raise PromptAssemblyError(
-                    "a message holds an image that is not carried in the request itself (no "
-                    "data URL), so its bytes cannot be sent beside the token IDs or kept"
+            url = str((given.get("url") if isinstance(given, dict) else given) or "")
+            image = known.get(url) if known is not None else None
+            if image is None:
+                # The framework's own reading of such a part: the bytes and their hash.
+                decoded = ChatSession._decode_image_part(
+                    {"type": "image_url", "image_url": {"url": url}}, "tool"
                 )
-            try:
-                data = base64.b64decode(encoded, validate=True)
-            except (binascii.Error, ValueError):
-                raise PromptAssemblyError(
-                    "a message holds an image whose data URL cannot be decoded"
-                ) from None
-            found.append(Image.of(data, head[len("data:") :] or "image/png"))
+                if decoded is None:
+                    raise PromptAssemblyError(
+                        "a message holds an image that is not carried in the request itself "
+                        "(no data URL that can be decoded), so its bytes cannot be sent beside "
+                        "the token IDs or kept"
+                    )
+                image = Image(decoded.content, decoded.mime_type, decoded.attachment_id)
+                if known is not None:
+                    known[url] = image
+            found.append(image)
     return found
 
 
@@ -206,82 +211,47 @@ def collapsed(prompt: Sequence[int], places: Sequence[tuple[int, int]]) -> list[
 
 
 def find_places(
-    prompt: list[int],
-    counts: Sequence[int],
-    placeholder: int,
-    frame: tuple[int, int] | None = None,
+    prompt: list[int], images: int, placeholder: int, frame: tuple[int, int]
 ) -> list[tuple[int, int]]:
-    """Where each image stands in *prompt*, the rendering of a conversation
-    whose images take *counts* placeholder tokens, in order.
+    """Where the *images* images of a conversation stand in *prompt*, its
+    rendering: the runs of placeholder tokens the template wrote, each
+    between the two tokens of *frame*, in order.
 
-    A server gives the first image the first placeholder token of the prompt,
-    the next image the first one after that image's run, and so on, whatever
-    wrote the token: the template for an image, or a tokenizer that met the
-    placeholder's text in a message.  Its tokenize route and its generate
-    route both do, so the two agree with each other even where an image has
-    gone to a token that was never meant for it.  The same walk is made here,
-    and what it finds is held to what the template writes: with *frame*, the
-    two tokens a template puts around an image's placeholders, every image
-    must stand between them, and no such place may be left without an image.
-
-    Raises :class:`PromptAssemblyError` where that does not hold, before
-    anything is sent:
-
-    - no placeholder is left for an image, or the run at an image's place is
-      shorter than the image;
-    - an image's place is not one the template wrote (the text of the
-      placeholder token stands in a message before the image, a tool result
-      for one, and the server has put the image there);
-    - a place the template wrote holds no image (the image that belongs there
-      went to a placeholder token before it).
-
-    A placeholder token that is no image's and stands after the images is left
-    alone by the server and is no fault here; the record lists it.
+    A server gives the first image the first placeholder token it finds, the
+    next image the first after that image's run, and so on.  So the prompt
+    can be sent with each run cut to one token only when the template's
+    places are the first placeholder tokens there are.  Raises
+    :class:`PromptAssemblyError` where they are not: the prompt holds another
+    number of places than the conversation has images, or a placeholder token
+    that is no image's stands before one.  With the conversation's text read
+    as plain text neither comes from what the environment wrote.
     """
     places: list[tuple[int, int]] = []
-    cursor = 0
-    for index, count in enumerate(counts):
-        try:
-            start = prompt.index(placeholder, cursor)
-        except ValueError:
-            raise PromptAssemblyError(
-                f"the rendering holds no placeholder for image {index} of the conversation"
-            ) from None
-        run = 0
-        while start + run < len(prompt) and prompt[start + run] == placeholder:
-            run += 1
-        if run < count:
-            raise PromptAssemblyError(
-                f"image {index} of the conversation takes {count} placeholder tokens, and the "
-                f"first placeholder left for it (position {start}) is a run of {run}: a "
-                "placeholder token that is no image's stands before the image, and the server "
-                "would put the image there"
-            )
-        end = start + count
-        if frame is not None and (
-            start == 0 or prompt[start - 1] != frame[0] or prompt[end : end + 1] != [frame[1]]
-        ):
-            raise PromptAssemblyError(
-                f"image {index} of the conversation would stand at position {start}, which is "
-                "no place the template wrote for an image: the text of the placeholder token "
-                "stands in a message before the image, and the server puts the image there"
-            )
-        places.append((start, count))
-        cursor = end
-    if frame is not None:
-        taken = {start for start, _count in places}
-        for at in range(1, len(prompt) - 1):
-            if (
-                prompt[at] == placeholder
-                and prompt[at - 1] == frame[0]
-                and prompt[at + 1] == frame[1]
-                and at not in taken
-            ):
-                raise PromptAssemblyError(
-                    f"the place the template wrote for an image at position {at} holds no "
-                    "image: the server gave the image to a placeholder token that stands "
-                    "before it"
-                )
+    loose: list[int] = []
+    at = 0
+    size = len(prompt)
+    while at < size:
+        if prompt[at] != placeholder:
+            at += 1
+            continue
+        end = at
+        while end < size and prompt[end] == placeholder:
+            end += 1
+        if at and prompt[at - 1] == frame[0] and end < size and prompt[end] == frame[1]:
+            places.append((at, end - at))
+        else:
+            loose.append(at)
+        at = end
+    if len(places) != images:
+        raise PromptAssemblyError(
+            f"the prompt holds {len(places)} places the template wrote for an image, and the "
+            f"conversation holds {images} images"
+        )
+    if places and loose and loose[0] < places[-1][0]:
+        raise PromptAssemblyError(
+            f"a placeholder token that is no image's stands at position {loose[0]}, before an "
+            "image: the server would give the image to it"
+        )
     return places
 
 
@@ -408,29 +378,40 @@ def ask_generate(
     alternatives: int = 0,
     **settings: Any,
 ) -> tuple[CallRecord, str, list[dict[str, Any]]]:
-    """One reply of the generate route to *token_ids* with *images*, read the
-    way a run reads it: the call's record, the reply's text and its
-    log-probability entries (each with the alternatives the server listed).
+    """One reply of the generate route to *token_ids* with *images*, asked
+    for and read the way a run does it, streamed: the call's record, the
+    reply's text and its log-probability entries (each with the alternatives
+    the server listed).
 
     *expected* is the prompt the server is to report (the IDs sent where
     nothing is to be expanded) and *places* where it is to say the images
     are.  *settings* are sampler settings and the reply limit; *alternatives*
     is how many tokens the server is to list at each position.
     """
-    outgoing = {"model": model, "extra_body": settings, "stream": False, "logprobs": alternatives}
+    outgoing = {"model": model, "extra_body": settings, "stream": True, "logprobs": alternatives}
     body = generate_body(outgoing, token_ids, images)
-    call = CallRecord(index=0, streamed=False, request={}, route="generate")
+    call = CallRecord(index=0, streamed=True, request={}, route="generate")
     call.prompt_sent = list(token_ids) if expected is None else expected
     if images:
         call.placeholders_sent = [list(place) for place in places or ()]
-    reply = client.post(_root(client) + GENERATE_PATH, body=body, cast_to=object)
-    taken = take_generate(call, reply)
-    call.complete = call.finish_reason is not None
+    text = ""
     entries: list[dict[str, Any]] = []
-    for choice in (reply.get("choices") if isinstance(reply, dict) else None) or []:
-        if isinstance(choice, dict) and choice.get("index", 0) == 0:
-            entries += list((choice.get("logprobs") or {}).get("content") or [])
-    return call, taken[0] if taken else "", entries
+    stream = client.post(
+        _root(client) + GENERATE_PATH,
+        body=body,
+        cast_to=object,
+        stream=True,
+        stream_cls=Stream[object],
+    )
+    for part in stream:
+        taken = take_generate(call, part)
+        if taken is not None:
+            text += taken[0]
+        for choice in (part.get("choices") if isinstance(part, dict) else None) or []:
+            if isinstance(choice, dict) and choice.get("index", 0) == 0:
+                entries += list((choice.get("logprobs") or {}).get("content") or [])
+    call.complete = call.finish_reason is not None
+    return call, text, entries
 
 
 # -- what a check established ------------------------------------------------------
@@ -486,7 +467,7 @@ class VisionRoute:
     # The token an image is rendered as, once per patch.
     placeholder: int
     # The two tokens the template writes around an image's placeholders.
-    frame: tuple[int, int] | None = None
+    frame: tuple[int, int]
     # The rule the server's counts follow, where the check found one.
     resize: ResizeRule | None = None
 
@@ -536,38 +517,7 @@ class VisionRoute:
                 "found (frame must be the two tokens the template writes around an image's "
                 "placeholders): check again"
             )
-        return cls(placeholder=token, frame=(around[0], around[1]), resize=resize)
-
-
-def vision_verdict(
-    given: Any, *, model: str, endpoint: str, arguments: dict[str, Any]
-) -> dict[str, Any]:
-    """The verdict of a check for images that a run was *given*, for a run
-    that asks *model* at *endpoint* and renders with the template arguments
-    *arguments*.
-
-    Raises :class:`SetupError` where it is no verdict of such a check, does
-    not say what it was made for, was made for another model, endpoint or set
-    of template arguments, or says that the server cannot.  The verdict comes
-    back as it was given.
-    """
-    again = "check the server again for this run"
-    if not isinstance(given, dict) or not isinstance(given.get("ok"), bool):
-        raise SetupError(
-            "the given check of the server for images is not what a check returns: an "
-            "object that says whether the server can be sent images beside token IDs (ok), "
-            "what the check found and what it was made for"
-        )
-    _says_what_for(given, _VERDICT_NAMES, "check of the server for images", again)
-    _made_here(given, "check of the server for images", again, model, endpoint)
-    if given["template_arguments"] != arguments:
-        raise SetupError(
-            "the given check of the server for images was made with the template arguments "
-            f"{_said(given['template_arguments'])}, and the run's are {_said(arguments)}: "
-            f"{again}"
-        )
-    VisionRoute.from_verdict(given)
-    return dict(given)
+        return cls(placeholder=token, frame=(int(around[0]), int(around[1])), resize=resize)
 
 
 # -- a run's images ----------------------------------------------------------------
@@ -597,30 +547,17 @@ class Vision:
     # Whether the model itself generated the placeholder token in one of the
     # session's own turns.
     generated: bool = False
-    # Placeholder tokens an image takes, by the hash of its bytes.
-    _counts: dict[str, int] = field(default_factory=dict)
+    # Each image by the text that carried it: decoded and hashed once.
+    _known: dict[str, Image] = field(default_factory=dict)
+
+    def images_of(self, messages: Sequence[Mapping[str, Any]]) -> list[Image]:
+        """The images a request's messages carry, in order."""
+        return images_of(messages, self._known)
 
     def note_generated(self, tokens: Sequence[int]) -> None:
         """Note what one of the session's own replies holds."""
         if self.route.placeholder in tokens:
             self.generated = True
-
-    def count(self, client: Any, model: str, arguments: Mapping[str, Any], image: Image) -> int:
-        """How many placeholder tokens the server renders *image* as: asked of
-        its tokenize route once per image, in a message that holds nothing
-        else."""
-        known = self._counts.get(image.sha256)
-        if known is None:
-            alone = [{"role": "user", "content": [image.part()]}]
-            ids = render(client, model, alone, None, arguments, generation_prompt=False)
-            known = self._counts[image.sha256] = ids.count(self.route.placeholder)
-            if not known:
-                raise PromptAssemblyError(
-                    "the server's rendering of a message with one image holds no placeholder "
-                    f"token ({self.route.placeholder}): the check of the server was made for "
-                    "another template"
-                )
-        return known
 
     def start(
         self,
@@ -636,9 +573,8 @@ class Vision:
         prompt as the tokenize route's rendering has it."""
         model = str(request.get("model"))
         arguments = template_arguments(request)
-        counts = [self.count(inner, model, arguments, image) for image in images]
         try:
-            places = find_places(prompt, counts, self.route.placeholder, self.route.frame)
+            places = find_places(prompt, len(images), self.route.placeholder, self.route.frame)
         except PromptAssemblyError as misplaced:
             # The environment's text holds no placeholder token: it is read as
             # plain text.  So either the model generated one, which is its
@@ -816,11 +752,17 @@ def image_size(data: bytes) -> tuple[int | None, int | None]:
     upright before it resizes it."""
     try:
         from PIL import Image as _Pil
-        from PIL import ImageOps
 
+        from turnstone.core.images import exif_orientation, too_many_jpeg_scans
+
+        if too_many_jpeg_scans(data):
+            return None, None
         with _Pil.open(io.BytesIO(data)) as opened:
-            upright = ImageOps.exif_transpose(opened)
-            return int(upright.size[0]), int(upright.size[1])
+            width, height = opened.size
+            # Orientations 5 to 8 lay the picture on its side.
+            if exif_orientation(opened) >= 5:
+                width, height = height, width
+            return int(width), int(height)
     except Exception:
         return None, None
 
@@ -982,13 +924,8 @@ def check_vision_route(
     if temperature is not None:
         settings["temperature"] = temperature
     checks: dict[str, Any] = {}
-    verdict: dict[str, Any] = {
-        "ok": False,
-        "reason": None,
-        "template_arguments": arguments,
-        **made_for(client, model),
-        "checks": checks,
-    }
+    # Part of the check for prompts as token IDs, which says what it was made for.
+    verdict: dict[str, Any] = {"ok": False, "reason": None, "checks": checks}
 
     def failed(reason: str) -> dict[str, Any]:
         verdict["reason"] = reason
@@ -1070,11 +1007,6 @@ def check_vision_route(
     frame = (first[opened - 1], first[closed])
     verdict["frame"] = list(frame)
 
-    def count(image: Image) -> int:
-        alone = [{"role": "user", "content": [image.part()]}]
-        ids = render(client, model, alone, None, arguments, generation_prompt=False)
-        return ids.count(placeholder)
-
     checks["image_is_a_run_of_one_token"] = True
 
     # 3. How many tokens images of a few sizes take, and the rule behind it.
@@ -1114,6 +1046,9 @@ def check_vision_route(
             "content": [{"type": "text", "text": "Images returned by the tool:"}, large.part()],
         },
     ]
+    # The same with a turn that reasoned first: what a run's second request looks like.
+    reasoned = [dict(m) for m in after_a_tool]
+    reasoned[1] = {**reasoned[1], "reasoning": "The user wants shot.png looked at."}
     two: list[dict[str, Any]] = [
         {
             "role": "user",
@@ -1124,13 +1059,13 @@ def check_vision_route(
         "one_image": (shows(red), [red], False),
         "two_images": (two, [red, large], False),
         "an_image_after_a_tool_result": (after_a_tool, [large], True),
+        "an_image_after_a_turn_with_reasoning": (reasoned, [large], True),
     }
     expands: dict[str, bool] = {}
     for name, (conversation, images, tools) in layouts.items():
         try:
             whole = rendered(conversation, tools)
-            counts = [count(image) for image in images]
-            places = find_places(whole, counts, placeholder, frame)
+            places = find_places(whole, len(images), placeholder, frame)
             answer, _text, _entries = ask_generate(
                 client,
                 model,
@@ -1155,9 +1090,27 @@ def check_vision_route(
             )
     checks["generate_expands_like_tokenize"] = expands
 
+    # A run cuts the template's tail out of the rendering of the whole
+    # conversation: the rendering up to the turn must begin it, images or not.
+    try:
+        through = render(
+            client, model, reasoned[:2], [_CHECK_TOOL], arguments, generation_prompt=False
+        )
+        extends = rendered(reasoned, True)[: len(through)] == through
+    except Exception as error:
+        return failed(
+            f"the tokenize route does not render a turn before an image ({_status_words(error)})"
+        )
+    checks["turn_is_a_prefix_of_the_rendering_with_an_image"] = extends
+    if not extends:
+        return failed(
+            "the server renders the conversation up to an assistant turn differently once a "
+            "message with an image follows it"
+        )
+
     # 5. The images reach the model: two of them, one prompt, two replies.
     whole = rendered(shows(red))
-    places = find_places(whole, [count(red)], placeholder, frame)
+    places = find_places(whole, 1, placeholder, frame)
     replies: list[str] = []
     seen: list[list[int]] = []
     try:

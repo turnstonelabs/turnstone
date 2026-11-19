@@ -61,7 +61,6 @@ from __future__ import annotations
 import copy
 import time
 import uuid
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -386,6 +385,27 @@ class TokenIdRoute:
         return prompt
 
 
+@dataclass(frozen=True)
+class _Rendering:
+    """One rendering of a conversation: its tokens with the stand-ins taken
+    out, the tokens as they came, and how many texts were cut in each
+    message and in the tool definitions."""
+
+    ids: list[int]
+    raw: list[int]
+    cuts: list[int]
+    tool_cuts: int
+
+
+def _holds_images(messages: Sequence[Mapping[str, Any]]) -> bool:
+    return any(
+        isinstance(part, dict) and part.get("type") == "image_url"
+        for message in messages
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+    )
+
+
 @dataclass
 class _Link:
     """The session's latest request: its messages, its prompt and its call."""
@@ -457,10 +477,10 @@ class PromptAssembly:
         arguments = template_arguments(request)
         model = str(request.get("model"))
 
-        def rendered(conversation: list[dict[str, Any]], generation_prompt: bool) -> list[int]:
+        def rendered(conversation: list[dict[str, Any]], generation_prompt: bool) -> _Rendering:
             plain = self.plain
             if plain is None:
-                ids = render(
+                raw = render(
                     client,
                     model,
                     conversation,
@@ -468,28 +488,35 @@ class PromptAssembly:
                     arguments,
                     generation_prompt=generation_prompt,
                 )
+                made = _Rendering(raw, raw, [0] * len(conversation), 0)
             else:
-                sent, offered, replaced = plain.swap(conversation, tools)
-                ids = render(
-                    client, model, sent, offered, arguments, generation_prompt=generation_prompt
+                cut = plain.swap(conversation, tools)
+                raw = render(
+                    client,
+                    model,
+                    cut.messages,
+                    cut.tools,
+                    arguments,
+                    generation_prompt=generation_prompt,
                 )
-                try:
-                    ids = plain.splice(ids, replaced)
-                except HarnessFaultError as fault:
-                    self.fault = str(fault)
-                    raise
+                made = _Rendering(plain.strip(raw), raw, cut.per_message, cut.in_tools)
                 if generation_prompt and call.scope == PARENT:
-                    self.plain_seen = dict(Counter(replaced))
+                    self.plain_seen = cut.environment
             # The server answered: it is working on this call.
             call.heard(time.monotonic())
-            return ids
+            return made
 
         if call.scope != PARENT:
-            return rendered(messages, True)
+            # A rendering throughout, the sub-agent's own turns among it: what
+            # a model wrote is never held against the count of stand-ins.
+            return rendered(messages, True).ids
         last = self._last
         differs: dict[str, Any] | None = None
         if last is None:
-            prompt = self.route.first_prompt(rendered(messages, True))
+            whole = rendered(messages, True)
+            # The first prompt holds what the environment wrote and nothing else.
+            self._no_surplus(whole, 0, sum(whole.cuts) + whole.tool_cuts)
+            prompt = self.route.first_prompt(whole.ids)
         elif messages == last.messages and not last.call.complete:
             # The same request again, after an attempt that did not end.
             prompt, differs = last.prompt, last.differs
@@ -499,11 +526,28 @@ class PromptAssembly:
         self._last = _Link(copy.deepcopy(messages), prompt, call, differs)
         return prompt
 
+    def _no_surplus(self, made: _Rendering, kept_before: int, cuts: int) -> None:
+        """Hold a rendering's stand-in tokens against the cuts that were made,
+        in the part of it a prompt is built from (what follows its first
+        *kept_before* tokens): that part holds what the environment wrote and
+        nothing of the model's, so more stand-ins than cuts is this code's
+        fault or the check's, never a conversation's."""
+        if self.plain is None:
+            return
+        over = self.plain.surplus(made.raw, kept_before, cuts)
+        if over > 0:
+            self.fault = (
+                f"a rendering holds {over} more stand-in tokens ({self.plain.stand_in_id}) than "
+                "texts were cut in what the environment wrote: the template writes the stand-in, "
+                "or a text went uncut"
+            )
+            raise HarnessFaultError(self.fault)
+
     def _extended(
         self,
         last: _Link,
         messages: list[dict[str, Any]],
-        rendered: Callable[[list[dict[str, Any]], bool], list[int]],
+        rendered: Callable[[list[dict[str, Any]], bool], _Rendering],
     ) -> tuple[list[int], dict[str, Any] | None]:
         """The previous prompt, what was generated after it, and the tail; and
         where that is not what the chat route renders for the same
@@ -529,22 +573,33 @@ class PromptAssembly:
                 f"call {call.index} did not end by itself ({call.finish_reason or call.error}); "
                 "a turn that was cut cannot be continued as it was generated"
             )
-        if call.route == "generate" and (call.prompt_differs or call.placeholders_differ):
-            # The prompt of a request with images is held to the rendering
-            # before it goes out, so this is not something a conversation
-            # can bring about.
-            self.fault = (
-                f"the server answered call {call.index}, a request with images, for another "
-                "prompt or other places of the images than it was sent"
-            )
-            raise HarnessFaultError(self.fault)
         if call.prompt_differs or call.prompt_token_ids is None:
             raise PromptAssemblyError(
                 f"the server did not report the prompt of call {call.index} as it was sent"
             )
-        through = rendered(messages[: earlier + 1], False)
-        whole = rendered(messages, True)
         closing = list(route.closing)
+        opening = list(route.generation_prompt)
+        generated = call.token_ids
+        ended = bool(generated) and generated[-1] == closing[0]
+        new_cuts = 0
+        if self.vision is not None and _holds_images(messages):
+            # A request with images: every rendering carries them, so the
+            # one of the conversation up to the turn is asked for only where
+            # the whole one does not already begin with what was sent and
+            # generated.  It usually does, and is then the prompt.
+            made = rendered(messages, True)
+            head = call.prompt_token_ids + generated + (closing[1:] if ended else closing)
+            if made.ids[: len(head)] == head and made.ids[-len(opening) :] == opening:
+                self._no_surplus(made, len(head), sum(made.cuts[earlier + 1 :]))
+                if not ended:
+                    self.events.append(self._other_token(generated, closing[0]))
+                return made.ids, None
+            through = rendered(messages[: earlier + 1], False).ids
+        else:
+            through = rendered(messages[: earlier + 1], False).ids
+            made = rendered(messages, True)
+        whole = made.ids
+        new_cuts = sum(made.cuts[earlier + 1 :])
         if whole[: len(through)] != through:
             raise PromptAssemblyError(
                 "the server renders the conversation up to an assistant turn differently once "
@@ -556,23 +611,17 @@ class PromptAssembly:
                 "the server's rendering of an assistant turn does not end with the closing "
                 f"found before the run ({closing}): it ends {through[-len(closing) :]}"
             )
-        generated = call.token_ids
-        if generated and generated[-1] == closing[0]:
+        # The part the prompt takes from the rendering holds what the
+        # environment wrote since the turn.
+        self._no_surplus(made, len(through), new_cuts)
+        if ended:
             # The model generated the end-of-turn token itself.
             rest = closing[1:]
         else:
             # It ended on another token: the template's closing follows whole.
             rest = closing
-            self.events.append(
-                {
-                    "event": "turn_ended_on_other_token",
-                    "turn": self._turn,
-                    "token_id": generated[-1] if generated else None,
-                    "end_of_turn_token_id": closing[0],
-                }
-            )
+            self.events.append(self._other_token(generated, closing[0]))
         tail = rest + whole[len(through) :]
-        opening = list(route.generation_prompt)
         if tail[-len(opening) :] != opening:
             raise PromptAssemblyError(
                 "the server's rendering does not end with the generation prompt found before "
@@ -594,17 +643,30 @@ class PromptAssembly:
             "same_tokens": common_prefix_len(prompt, whole),
         }
 
+    def _other_token(self, generated: list[int], end_of_turn: int) -> dict[str, Any]:
+        return {
+            "event": "turn_ended_on_other_token",
+            "turn": self._turn,
+            "token_id": generated[-1] if generated else None,
+            "end_of_turn_token_id": end_of_turn,
+        }
+
     # -- the request -------------------------------------------------------------
 
     def start(self, inner: Any, call: CallRecord, request: dict[str, Any]) -> IdStream:
         """Send the chat request *request* with its prompt as token IDs."""
+        if self.fault is not None:
+            # Nothing more goes out once the harness has found itself at
+            # fault, whoever asks: the session, a sub-agent, a retry.
+            raise HarnessFaultError(self.fault)
         first = self._last is None
         prompt = self.prompt(inner, call, request)
+        # The prompt's length is known exactly: what the server's speed is
+        # held against, and never the size of what the messages carry.
+        call.prompt_tokens_sent = len(prompt)
         request = self._within_window(call, request, len(prompt), first)
         if self.vision is not None:
-            from turnstone.rollout.vision import images_of
-
-            images = images_of(request.get("messages") or [])
+            images = self.vision.images_of(request.get("messages") or [])
             if images:
                 # Token IDs alone would leave the pixels behind.
                 return self.vision.start(self, inner, call, request, prompt, images)
@@ -775,6 +837,16 @@ class IdStream:
                     parts.append(taken)
                 if call.first_token_at is None and call.token_ids:
                     call.first_token_at = now
+            if call.route == "generate" and (call.prompt_differs or call.placeholders_differ):
+                # The prompt of a request with images is held to the rendering
+                # before it goes out, so no conversation brings this about,
+                # the session's or a sub-agent's.
+                self._assembly.fault = (
+                    f"the server answered a request with images (call {call.index}, "
+                    f"{call.scope}) for another prompt, or other places of the images, than it "
+                    "was sent"
+                )
+                raise HarnessFaultError(self._assembly.fault)
             reason = call.finish_reason
             if reason is None:
                 return None
@@ -1003,7 +1075,8 @@ def check_token_id_route(
     extra_body: Mapping[str, Any] | None = None,
     reasoning_effort: str | None = None,
     fmt: ReplyFormat = PARAMETER_BLOCKS,
-    added_tokens: Mapping[str, int] | None = None,
+    vision: bool = False,
+    temperature: float | None = None,
 ) -> dict[str, Any]:
     """Whether the server behind *client* (an SDK client) can be sent prompts
     as token IDs, and what a run needs to know to do it.
@@ -1223,47 +1296,59 @@ def check_token_id_route(
         generation_prompt=generation_prompt,
         in_reasoning=fmt.opens_in_reasoning(in_prompt),
     )
-    # What a run needs to read the environment's text as plain text.  A
-    # server that does not let it be established passes all the same: a
-    # run then renders a conversation as it is, as before, and where the
-    # tokenizer's own tokens are named nowhere the verdict is the one it
-    # was before.
-    special = _special_text(
-        client,
-        model,
-        arguments,
-        added_tokens,
-        [*marker_ids.values(), *closing, *generation_prompt, *whole],
-    )
-    if special is not None:
-        verdict["special_text"] = special
+    if vision:
+        # Whether images can go beside the token IDs: part of the same
+        # verdict, and no failure of the route where they cannot.
+        from turnstone.rollout.vision import check_vision_route
+
+        verdict["vision"] = check_vision_route(
+            client,
+            model,
+            extra_body=extra_body,
+            reasoning_effort=reasoning_effort,
+            temperature=temperature,
+        )
     return verdict
 
 
-def _special_text(
+def check_plain_text(
     client: Any,
     model: str,
-    arguments: Mapping[str, Any],
-    added: Mapping[str, int] | None,
-    written: Sequence[int],
-) -> dict[str, Any] | None:
-    """The part of a check's verdict that says how the text of the tokenizer's
-    own tokens is read as plain text (:func:`~turnstone.rollout.plaintext.plain_text_verdict`).
-    *added* are those tokens, text to ID; ``None`` asks the server for them
-    (``/tokenizer_info``, which a server offers when it is started for it).
-    ``None`` where nothing names them: nothing was asked.  Never raises."""
+    *,
+    extra_body: Mapping[str, Any] | None = None,
+    reasoning_effort: str | None = None,
+    added_tokens: Mapping[str, int] | None = None,
+    written: Sequence[int] = (),
+) -> dict[str, Any]:
+    """How the text of the tokenizer's own tokens is read as plain text on
+    the server behind *client* (:func:`~turnstone.rollout.plaintext.plain_text_verdict`).
+
+    *added_tokens* are those tokens, text to ID, from a description of the
+    tokenizer; ``None`` asks the server for them (``/tokenizer_info``, which a
+    server offers when it is started for it).  *written* are tokens a reply's
+    reading relies on.  Never raises: what could not be established is a
+    verdict that says so.  The verdict names what it was made for."""
+    request: dict[str, Any] = {"extra_body": dict(extra_body or {})}
+    if reasoning_effort is not None:
+        request["reasoning_effort"] = reasoning_effort
+    arguments = template_arguments(request)
+    for_what = made_for(client, model)
+
+    def failed(reason: str) -> dict[str, Any]:
+        return {"ok": False, "reason": reason, **for_what}
+
+    added = added_tokens
     if added is None:
         try:
             added = added_tokens_of(client.get(_root(client) + "/tokenizer_info", cast_to=object))
-        except Exception:
-            return None
-        if not added:
-            return None
+        except Exception as error:
+            return failed(
+                "the server does not say which tokens its tokenizer has of its own "
+                f"(/tokenizer_info: {type(error).__name__}: {str(error)[:120]}): start it with "
+                "--enable-tokenizer-info-endpoint, or name them from the tokenizer's files"
+            )
     if not added:
-        return {
-            "ok": False,
-            "reason": "the description of the tokenizer names no tokens of its own",
-        }
+        return failed("the description of the tokenizer names no tokens of its own")
 
     def text_of(ids: list[int]) -> str:
         reply = client.post(
@@ -1272,7 +1357,7 @@ def _special_text(
         return str(reply.get("prompt")) if isinstance(reply, dict) else ""
 
     try:
-        return plain_text_verdict(
+        found = plain_text_verdict(
             lambda conversation, tools: render(client, model, conversation, tools, arguments),
             lambda text: text_tokens(client, model, text),
             text_of,
@@ -1280,7 +1365,5 @@ def _special_text(
             written,
         )
     except Exception as error:
-        return {
-            "ok": False,
-            "reason": f"it could not be established ({type(error).__name__}: {str(error)[:200]})",
-        }
+        return failed(f"it could not be established ({type(error).__name__}: {str(error)[:200]})")
+    return {**found, **for_what}

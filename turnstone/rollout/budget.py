@@ -306,6 +306,9 @@ class Meter:
         counted = (call.usage or {}).get("prompt_tokens")
         if counted:
             return counted
+        if call.prompt_tokens_sent is not None:
+            # Sent as token IDs: the count is exact before the server says it.
+            return call.prompt_tokens_sent
         window = self.budgets.context_window
         return min(call.prompt_bytes, window) if window else call.prompt_bytes
 

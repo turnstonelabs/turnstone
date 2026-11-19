@@ -304,6 +304,11 @@ SAMPLED: dict[str, Any] = {
     "extra_body": {"top_k": 20, "top_p": 0.95},
     "sampler_logprobs": True,
     "context_window": 200_000,
+    # The conversation rendered as it is and no images, unless a test asks:
+    # the two are tested by themselves (test_rollout_plaintext.py,
+    # test_rollout_vision.py).
+    "plain_text": False,
+    "vision": False,
 }
 
 

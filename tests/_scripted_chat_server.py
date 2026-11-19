@@ -413,7 +413,8 @@ class ScriptedChatServer:
         # can be wrong with it otherwise: ``plain_names`` (it names tokens by
         # their text), ``other_prompt`` (it writes one placeholder token too
         # many), ``other_places`` (it says the images are one token further
-        # on), ``blind`` (its replies do not depend on the images).  A reply
+        # on), ``blind`` (its replies do not depend on the images),
+        # ``no_usage`` (a streamed reply ends without its token counts).  A reply
         # to a request with images ends its text with ``saw:`` and the first
         # characters of each image's hash, as a model that sees them would
         # say something of them.
@@ -1114,6 +1115,8 @@ class ScriptedChatServer:
         """A reply of the completions route: text, token IDs, log-probabilities."""
         want_ids = bool(body.get("return_token_ids"))
         want_logprobs = body.get("logprobs") is not None
+        if "_generate" in body and self.generate_fault == "no_usage":
+            fault = "no_usage"
         groups = [ids for ids, _delta in pieces]
         if self.hide_stop_token and groups and groups[-1] in ([END], [OTHER_END]):
             groups = groups[:-1]
