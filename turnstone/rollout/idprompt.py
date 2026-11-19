@@ -61,6 +61,7 @@ from __future__ import annotations
 import copy
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -69,6 +70,12 @@ from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from turnstone.core.log import get_logger
 from turnstone.core.model_turn import ModelContextLimitError
 from turnstone.rollout.budget import ContextFullError
+from turnstone.rollout.plaintext import (
+    HarnessFaultError,
+    PlainText,
+    added_tokens_of,
+    plain_text_verdict,
+)
 from turnstone.rollout.recording import (
     _ID_PREFIX,
     PARENT,
@@ -90,6 +97,8 @@ from turnstone.rollout.verdicts import made_for
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
+
+    from turnstone.rollout.vision import Vision
 
 log = get_logger(__name__)
 
@@ -419,6 +428,19 @@ class PromptAssembly:
     # sub-agent is among the session's events.  A call is numbered here as
     # the record numbers a sub-agent's calls (``CallRecord.index``).
     subagent_events: list[dict[str, Any]] = field(default_factory=list)
+    # Sends the requests that carry images (:mod:`turnstone.rollout.vision`);
+    # ``None``, the default, sends every request to the completions route.
+    vision: Vision | None = None
+    # Reads the text of the tokenizer's own tokens as plain text wherever a
+    # conversation is rendered (:mod:`turnstone.rollout.plaintext`); ``None``
+    # renders a conversation as it is.
+    plain: PlainText | None = None
+    # The texts that were read as plain text in the session's latest request,
+    # each with how often; empty when there were none.
+    plain_seen: dict[str, int] = field(default_factory=dict)
+    # What the harness found itself at fault for, once it has: the run ends
+    # as ``harness_fault`` whatever else happens to it.
+    fault: str | None = None
     _last: _Link | None = None
     _turn: int = 0
 
@@ -436,9 +458,28 @@ class PromptAssembly:
         model = str(request.get("model"))
 
         def rendered(conversation: list[dict[str, Any]], generation_prompt: bool) -> list[int]:
-            ids = render(
-                client, model, conversation, tools, arguments, generation_prompt=generation_prompt
-            )
+            plain = self.plain
+            if plain is None:
+                ids = render(
+                    client,
+                    model,
+                    conversation,
+                    tools,
+                    arguments,
+                    generation_prompt=generation_prompt,
+                )
+            else:
+                sent, offered, replaced = plain.swap(conversation, tools)
+                ids = render(
+                    client, model, sent, offered, arguments, generation_prompt=generation_prompt
+                )
+                try:
+                    ids = plain.splice(ids, replaced)
+                except HarnessFaultError as fault:
+                    self.fault = str(fault)
+                    raise
+                if generation_prompt and call.scope == PARENT:
+                    self.plain_seen = dict(Counter(replaced))
             # The server answered: it is working on this call.
             call.heard(time.monotonic())
             return ids
@@ -488,6 +529,15 @@ class PromptAssembly:
                 f"call {call.index} did not end by itself ({call.finish_reason or call.error}); "
                 "a turn that was cut cannot be continued as it was generated"
             )
+        if call.route == "generate" and (call.prompt_differs or call.placeholders_differ):
+            # The prompt of a request with images is held to the rendering
+            # before it goes out, so this is not something a conversation
+            # can bring about.
+            self.fault = (
+                f"the server answered call {call.index}, a request with images, for another "
+                "prompt or other places of the images than it was sent"
+            )
+            raise HarnessFaultError(self.fault)
         if call.prompt_differs or call.prompt_token_ids is None:
             raise PromptAssemblyError(
                 f"the server did not report the prompt of call {call.index} as it was sent"
@@ -551,6 +601,13 @@ class PromptAssembly:
         first = self._last is None
         prompt = self.prompt(inner, call, request)
         request = self._within_window(call, request, len(prompt), first)
+        if self.vision is not None:
+            from turnstone.rollout.vision import images_of
+
+            images = images_of(request.get("messages") or [])
+            if images:
+                # Token IDs alone would leave the pixels behind.
+                return self.vision.start(self, inner, call, request, prompt, images)
         outgoing = completion_request(request, prompt)
         messages = request.get("messages") or []
         call.prompt_sent = prompt
@@ -635,6 +692,8 @@ class PromptAssembly:
         fmt = self.format
         end_of_turn = route.closing[0]
         generated = call.token_ids
+        if self.vision is not None and call.scope == PARENT:
+            self.vision.note_generated(generated)
         if end_of_turn in generated and generated.index(end_of_turn) < len(generated) - 1:
             raise PromptAssemblyError(
                 f"call {call.index}: the server went on generating after the template's "
@@ -690,12 +749,16 @@ class IdStream:
         assembly: PromptAssembly,
         tools: Sequence[Mapping[str, Any]] | None,
         model: str,
+        take: Callable[[CallRecord, Any], tuple[str, list[int]] | None] | None = None,
     ) -> None:
         self._stream = stream
         self._call = call
         self._assembly = assembly
         self._tools = tools
         self._model = model
+        # What copies the token data out of each part of the reply: the
+        # completions route's reader unless another route's is given.
+        self._take = take or take_completion
         self.reply: ParsedReply | None = None
 
     def _drain(self) -> str | None:
@@ -707,7 +770,7 @@ class IdStream:
                 now = time.monotonic()
                 call.heard(now)
                 call.chunks += 1
-                taken = take_completion(call, part)
+                taken = self._take(call, part)
                 if taken is not None:
                     parts.append(taken)
                 if call.first_token_at is None and call.token_ids:
@@ -940,6 +1003,7 @@ def check_token_id_route(
     extra_body: Mapping[str, Any] | None = None,
     reasoning_effort: str | None = None,
     fmt: ReplyFormat = PARAMETER_BLOCKS,
+    added_tokens: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Whether the server behind *client* (an SDK client) can be sent prompts
     as token IDs, and what a run needs to know to do it.
@@ -1159,4 +1223,64 @@ def check_token_id_route(
         generation_prompt=generation_prompt,
         in_reasoning=fmt.opens_in_reasoning(in_prompt),
     )
+    # What a run needs to read the environment's text as plain text.  A
+    # server that does not let it be established passes all the same: a
+    # run then renders a conversation as it is, as before, and where the
+    # tokenizer's own tokens are named nowhere the verdict is the one it
+    # was before.
+    special = _special_text(
+        client,
+        model,
+        arguments,
+        added_tokens,
+        [*marker_ids.values(), *closing, *generation_prompt, *whole],
+    )
+    if special is not None:
+        verdict["special_text"] = special
     return verdict
+
+
+def _special_text(
+    client: Any,
+    model: str,
+    arguments: Mapping[str, Any],
+    added: Mapping[str, int] | None,
+    written: Sequence[int],
+) -> dict[str, Any] | None:
+    """The part of a check's verdict that says how the text of the tokenizer's
+    own tokens is read as plain text (:func:`~turnstone.rollout.plaintext.plain_text_verdict`).
+    *added* are those tokens, text to ID; ``None`` asks the server for them
+    (``/tokenizer_info``, which a server offers when it is started for it).
+    ``None`` where nothing names them: nothing was asked.  Never raises."""
+    if added is None:
+        try:
+            added = added_tokens_of(client.get(_root(client) + "/tokenizer_info", cast_to=object))
+        except Exception:
+            return None
+        if not added:
+            return None
+    if not added:
+        return {
+            "ok": False,
+            "reason": "the description of the tokenizer names no tokens of its own",
+        }
+
+    def text_of(ids: list[int]) -> str:
+        reply = client.post(
+            _root(client) + "/detokenize", body={"model": model, "tokens": ids}, cast_to=object
+        )
+        return str(reply.get("prompt")) if isinstance(reply, dict) else ""
+
+    try:
+        return plain_text_verdict(
+            lambda conversation, tools: render(client, model, conversation, tools, arguments),
+            lambda text: text_tokens(client, model, text),
+            text_of,
+            added,
+            written,
+        )
+    except Exception as error:
+        return {
+            "ok": False,
+            "reason": f"it could not be established ({type(error).__name__}: {str(error)[:200]})",
+        }

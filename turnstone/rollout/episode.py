@@ -45,7 +45,8 @@ from openai import APIStatusError, DefaultHttpxClient, OpenAI
 
 from turnstone.core.completion_recovery import EmptyCompletionError, is_context_overflow
 from turnstone.core.log import get_logger
-from turnstone.core.model_turn import ModelContextLimitError
+from turnstone.core.memory import get_attachments, save_attachment
+from turnstone.core.model_turn import ModelContextLimitError, require_lane_capabilities
 from turnstone.core.output_guard import ControllerText
 from turnstone.core.providers._http_client import shutdown_on_close
 from turnstone.core.session import GenerationCancelled, inside_task_agent
@@ -73,6 +74,7 @@ from turnstone.rollout.idprompt import (
     check_token_id_route,
     template_arguments,
 )
+from turnstone.rollout.plaintext import HarnessFaultError, PlainText
 from turnstone.rollout.preparation import BeforeRunCommand, before_run_failure, run_before
 from turnstone.rollout.probe import SETTINGS as PROBED_SETTINGS
 from turnstone.rollout.probe import all_settings, sampler_logprobs_reported
@@ -92,7 +94,12 @@ from turnstone.rollout.settings import (
 )
 from turnstone.rollout.sidecar import RunningSidecar, Sidecar, SidecarError
 from turnstone.rollout.subagent_log import SubAgentLog
-from turnstone.rollout.tokens import build_token_record, describe_break, verify_record
+from turnstone.rollout.tokens import (
+    build_token_record,
+    describe_break,
+    rebuild_final,
+    verify_record,
+)
 from turnstone.rollout.toolset import ROLLOUT_TOOL_NAMES
 from turnstone.rollout.verdicts import check_verdict, made_at, probe_verdict
 from turnstone.rollout.verification import (
@@ -104,6 +111,15 @@ from turnstone.rollout.verification import (
     run_after,
     run_verifier,
     run_verifier_command,
+)
+from turnstone.rollout.vision import (
+    PlaceholderGeneratedError,
+    Vision,
+    VisionRoute,
+    check_vision_route,
+    generate_body,
+    image_sources,
+    vision_verdict,
 )
 
 if TYPE_CHECKING:
@@ -256,6 +272,24 @@ class RolloutConfig:
     # for the same server, model and template arguments; ``None`` checks
     # before the run.  Pass one check's verdict to a whole batch.
     token_id_route: dict[str, Any] | None = None
+    # The tokenizer's own tokens, text to ID, for a check made here
+    # (:mod:`turnstone.rollout.plaintext`); ``None`` asks the server for them.
+    added_tokens: dict[str, int] | None = None
+    # Let the model see images (:mod:`turnstone.rollout.vision`): the session's
+    # model is given vision, so an image file it reads and an image a tool of
+    # the task's servers returns reach it as images, and a request that holds
+    # one goes to the server's generate route with the images beside the token
+    # IDs.  Needs prompts as token IDs and a server that passes the check for
+    # images; one that fails it is refused.  Off: the model has no vision and
+    # no request leaves the completions route.
+    vision: bool = False
+    # The verdict of an earlier :func:`~turnstone.rollout.vision.check_vision_route`
+    # for the same server, model and template arguments; ``None`` checks
+    # before the run.  Pass one check's verdict to a whole batch.
+    vision_route: dict[str, Any] | None = None
+    # The folder the images of a run with vision are written to, each under
+    # the hash of its bytes.  Such a run names one.
+    image_dir: str | None = None
     # Seconds one tool call may run when the model names no limit of its own;
     # ``None``: the framework's ``tools.timeout``.
     tool_timeout: int | None = None
@@ -630,6 +664,7 @@ class RolloutSession(HeadlessSession):
         exact_window: bool = False,
         subagent_sidecar_tools: bool = True,
         before_acting: Callable[[], None] | None = None,
+        vision: bool = False,
         **kwargs: Any,
     ) -> None:
         if kwargs.get("judge_config") is not None:
@@ -649,6 +684,16 @@ class RolloutSession(HeadlessSession):
         )
         self._subagent_sidecar_tools = subagent_sidecar_tools
         super().__init__(**kwargs)
+        self._vision = vision
+        if vision:
+            # The model sees images.  The framework's own paths then bring one
+            # into the conversation as an image: a file the model reads, what
+            # a tool of the task's servers returns.
+            lane = self._model_binding.lane
+            seeing = replace(require_lane_capabilities(lane), supports_vision=True)
+            self._model_binding = replace(
+                self._model_binding, lane=replace(lane, capabilities=seeing)
+            )
         # Called once, before the first of the model's tool calls runs.
         self._before_acting = before_acting
         # Counts the run's tokens and time (:mod:`turnstone.rollout.budget`).
@@ -920,6 +965,8 @@ class RolloutSession(HeadlessSession):
                 if self._max_result_chars is not None:
                     calls = args[0] if args else kwargs.get("tool_calls") or []
                     results = self._bounded(calls, results, self._max_result_chars)
+                if self._vision:
+                    results = self._by_reference(results)
                 return results, feedback
             finally:
                 # Let the environment finish stopping what the batch left behind,
@@ -954,6 +1001,45 @@ class RolloutSession(HeadlessSession):
             }
         )
         return repaired
+
+    def _by_reference(self, results: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
+        """The results of one batch with their images as a conversation
+        carries them: named by the hash of their bytes, the bytes in the
+        session's store.
+
+        The framework does this where its interactive loop stores a tool
+        turn.  The headless loop a rollout runs stores the result as it
+        comes, and an image part left inline is dropped there: the model
+        would be told an image follows and get none.  So the same step is
+        taken here, with the framework's own conversion, for a run whose
+        model sees images.  An image that cannot be stored ends the run as
+        a failure of the machinery.
+        """
+        referenced: list[tuple[str, Any]] = []
+        for call_id, output in results:
+            if not isinstance(output, list):
+                referenced.append((call_id, output))
+                continue
+            content, images = self._tool_content_by_reference(output, "tool")
+            for image in images:
+                save_attachment(
+                    image.attachment_id,
+                    image.filename,
+                    image.mime_type,
+                    len(image.content),
+                    image.kind,
+                    image.content,
+                    "tool",
+                )
+            wanted = {image.attachment_id for image in images}
+            stored = {str(row.get("attachment_id")) for row in get_attachments(sorted(wanted))}
+            if wanted - stored:
+                raise RuntimeError(
+                    f"{len(wanted - stored)} images of a tool result could not be kept in the "
+                    "session's store, so the model could not be sent them"
+                )
+            referenced.append((call_id, content))
+        return referenced
 
     def _prepare_task_agent_wire(self, messages: list[dict[str, Any]], lane: Any) -> Any:
         """A sub-agent's messages as a request body can carry them: the same
@@ -1173,6 +1259,10 @@ MODEL_OUTCOMES = {
     "request_refused": (
         "the server refused a later request of the session for what the conversation held"
     ),
+    "image_token_generated": (
+        "the model generated the token an image is rendered as, and a later image could "
+        "not be sent where it belongs"
+    ),
 }
 MACHINERY_FAILURES = {
     "error": "a request of the session failed, or the harness raised",
@@ -1189,6 +1279,9 @@ MACHINERY_FAILURES = {
     "subagent_failed": "a sub-agent failed for a reason that is not its work",
     "no_model_call": "the run ended before any model call",
     "abnormal_reply": "the last reply ended in a way the harness does not know",
+    # Not to be run again without a look: what failed is the harness's own
+    # guarantee, which no conversation and no server restart changes.
+    "harness_fault": "the harness found itself at fault",
 }
 # The endings of a run that did not start: no model call was made, so nothing
 # that happened to the sandbox meanwhile is the model's doing.
@@ -1218,6 +1311,9 @@ def _finish_state(
     """
     if forced in _DID_NOT_START:
         # Whatever became of the sandbox while it was being brought up.
+        return forced
+    if forced == "harness_fault":
+        # Whatever else happened to the run: it must not pass for anything else.
         return forced
     if lost:
         # The model's doing only once the model has done something: a sandbox
@@ -1601,6 +1697,21 @@ def _build_record(
     recorder: RecordingClient | None = state.get("recorder")
     own = recorder.scoped(PARENT) if recorder is not None else []
     side = recorder.scoped(SUB_AGENT) if recorder is not None else []
+    # What the harness found itself at fault for, wherever it was found (a
+    # sub-agent's request, a reply that was the run's last): that is how the
+    # run ended, whatever it was taken for until now.
+    built: PromptAssembly | None = state.get("assembly")
+    fault = built.fault if built is not None else None
+    if fault is None and any(
+        c.route == "generate" and (c.prompt_differs or c.placeholders_differ) for c in own
+    ):
+        fault = (
+            "the server answered a request with images for another prompt, or other places "
+            "of the images, than it was sent"
+        )
+    if fault is not None:
+        forced_state, error = "harness_fault", fault
+        log.error("rollout.harness_fault", key=task.key, fault=fault)
     strict = config.require_token_id_check
     # A model turn is one of the session's own calls whose reply ended normally.
     # One cut short by the time limit or a transport failure is kept aside.
@@ -1722,6 +1833,18 @@ def _build_record(
             "the prompts were sent as token IDs and still do not form one sequence: "
             + "; ".join(describe_break(b) for b in prefix["breaks"][:3])
         )
+    seen: dict[str, Any] | None = None
+    if config.vision:
+        # The run's images: what each is, where it stands in the sequence and
+        # where it came from.  Their bytes are written now, before the record.
+        seen = {"route": state.get("vision_route"), "image_dir": config.image_dir}
+        seeing = assembly.vision if assembly is not None else None
+        if seeing is not None:
+            described, unkept = seeing.describe(
+                tokens["calls"], rebuild_final(tokens), image_sources(messages), config.image_dir
+            )
+            seen.update(described)
+            problems += unkept
     trainable = not problems
     if not trainable:
         log.error("rollout.not_trainable", key=task.key, problems=problems)
@@ -1820,7 +1943,14 @@ def _build_record(
         "prefix_ok": prefix["ok"],
         "prefix_breaks": [describe_break(b) for b in prefix["breaks"]],
         "prefix_events": snapshot["prefix_events"]
-        + (_plain(assembly.events) if assembly is not None else []),
+        + (_plain(assembly.events) if assembly is not None else [])
+        # The texts of the tokenizer's own tokens that the conversation held
+        # and the model was given as plain text.
+        + (
+            [{"event": "special_text_read_as_plain_text", "texts": dict(assembly.plain_seen)}]
+            if assembly is not None and assembly.plain_seen
+            else []
+        ),
         # Every model turn's tokens and log-probabilities are sound and were
         # sampled the way the record says: each call can be trained on.
         "trainable": trainable,
@@ -1880,6 +2010,8 @@ def _build_record(
     if config.keep_text:
         record["text"] = [c.raw_text for c in accepted]
         record["subagents"]["text"] = [c.raw_text for c in side]
+    if seen is not None:
+        record["vision"] = seen
     return record
 
 
@@ -2318,6 +2450,7 @@ def token_id_route_verdict(config: RolloutConfig) -> dict[str, Any]:
                 extra_body=config.extra_body,
                 reasoning_effort=config.reasoning_effort,
                 fmt=fmt,
+                added_tokens=config.added_tokens,
             )
     except Exception as check_error:
         return {
@@ -2365,6 +2498,65 @@ def _token_id_route(config: RolloutConfig) -> dict[str, Any]:
     verdict = token_id_route_verdict(config)
     if not verdict.get("ok"):
         raise SetupError(f"prompts cannot be sent as token IDs: {verdict.get('reason')}")
+    return dict(verdict)
+
+
+def vision_route_verdict(config: RolloutConfig) -> dict[str, Any]:
+    """Whether the server can be sent images beside prompts of token IDs: the
+    verdict of a check made now (:func:`~turnstone.rollout.vision.check_vision_route`)
+    for *config*'s server, model, template arguments and sampler settings.
+
+    Never raises for the server's sake: a check that could not be made is a
+    verdict that says so.  For a caller that checks once and passes the
+    verdict to every run of a batch (``RolloutConfig.vision_route``).
+    """
+    try:
+        with OpenAI(base_url=config.base_url, api_key=config.api_key, timeout=300.0) as probe:
+            return check_vision_route(
+                probe,
+                config.model,
+                extra_body=config.extra_body,
+                reasoning_effort=config.reasoning_effort,
+                temperature=config.temperature,
+            )
+    except Exception as check_error:
+        return {
+            "ok": False,
+            "reason": (
+                "the check of the server for images failed "
+                f"({type(check_error).__name__}: {str(check_error)[:300]})"
+            ),
+            "template_arguments": _template_arguments(config),
+            **made_at(config.base_url, config.model),
+            "checks": {},
+        }
+
+
+def _vision_route(config: RolloutConfig) -> dict[str, Any]:
+    """What the server needs to be sent images beside token IDs, checked or
+    given.
+
+    Raises :class:`~turnstone.rollout.settings.SetupError` for a server that
+    cannot, for a given verdict that is not this run's, and for a request
+    parameter of the run that the generate route has no place for: the run
+    does not start, and no image is ever sent as placeholder tokens alone.
+    """
+    try:
+        carried = {k: v for k, v in config.extra_body.items() if k != "chat_template_kwargs"}
+        generate_body({"extra_body": carried}, [0], ())
+    except RuntimeError as no_place:
+        raise SetupError(f"images cannot be sent beside token IDs: {no_place}") from None
+    given = config.vision_route
+    if given is not None:
+        return vision_verdict(
+            given,
+            model=config.model,
+            endpoint=config.base_url,
+            arguments=_template_arguments(config),
+        )
+    verdict = vision_route_verdict(config)
+    if not verdict.get("ok"):
+        raise SetupError(f"images cannot be sent beside token IDs: {verdict.get('reason')}")
     return dict(verdict)
 
 
@@ -2427,6 +2619,16 @@ def run_episode(
         )
     if verifier_command is not None:
         check_verifier_command(verifier_command, has_sidecar=task.sidecar is not None)
+    if config.vision and not config.token_id_prompts:
+        raise SetupError(
+            "vision is for prompts as token IDs (token_id_prompts), which this run does not "
+            "send: with messages the chat route takes the images itself"
+        )
+    if config.vision and not config.image_dir:
+        raise SetupError(
+            "a run with vision names the folder its images are written to (image_dir): the "
+            "record names each image by the hash of its bytes, and the bytes must be kept"
+        )
     # Before the clock starts: what the run's limits are, and which
     # log-probabilities the server reports.  Neither is the task's time.
     config, limits, sampling = effective_config(config)
@@ -2450,12 +2652,36 @@ def run_episode(
             state["assembly"] = PromptAssembly(
                 TokenIdRoute.from_verdict(state["token_id_route"]),
                 context_window=config.context_window,
+                # What the environment writes is read as plain text where the
+                # check established how; a check that did not leaves a
+                # conversation rendered as it is.
+                plain=PlainText.from_verdict(state["token_id_route"].get("special_text")),
             )
+            if config.vision and (answered or config.vision_route is not None):
+                state["vision_route"] = _vision_route(config)
+                seeing = VisionRoute.from_verdict(state["vision_route"])
+                plain = state["assembly"].plain
+                if plain is None:
+                    said = (state["token_id_route"].get("special_text") or {}).get("reason")
+                    raise SetupError(
+                        "vision needs the environment's text read as plain text, which the "
+                        f"check of the server did not establish ({said or 'not checked'}): a "
+                        "tool result that holds the text of the image placeholder would take "
+                        "the next image"
+                    )
+                if plain.stand_in_id in (seeing.placeholder, *(seeing.frame or ())):
+                    raise SetupError(
+                        "the stand-in the check of the server chose is a token the template "
+                        "writes for an image: check the server again"
+                    )
+                state["assembly"].vision = Vision(seeing)
         else:
             state["token_id_route"] = {
                 "ok": None,
                 "reason": "not checked: the run did not start",
             }
+        if config.vision and "vision_route" not in state:
+            state["vision_route"] = {"ok": None, "reason": "not checked: the run did not start"}
     if not answered and config.sampler_logprobs is None:
         state["logprobs"] = {
             "sampler_logprobs": None,
@@ -2567,6 +2793,7 @@ def run_episode(
                     exact_window="assembly" in state,
                     subagent_sidecar_tools=config.subagent_sidecar_tools,
                     before_acting=before_acting,
+                    **({"vision": True} if config.vision else {}),
                 )
                 state["session"] = session
                 # A sandbox that is gone ends the run at the next turn: nothing
@@ -2651,6 +2878,8 @@ def run_episode(
                 leave_behind()
             except ContextFullError as full:
                 forced, error = "context_full", str(full)
+            except PlaceholderGeneratedError as generated:
+                forced, error = "image_token_generated", str(generated)
             except TokenBudgetError as spent:
                 forced, error = "token_budget", str(spent)
             except _AbandonedError:
@@ -2666,6 +2895,10 @@ def run_episode(
                 ):
                     forced = "request_refused"
                     error = _refused_text("the session's", refused)
+                elif any(isinstance(c, PlaceholderGeneratedError) for c in _causes(run_error)):
+                    forced, error = "image_token_generated", str(run_error)[:500]
+                elif any(isinstance(c, HarnessFaultError) for c in _causes(run_error)):
+                    forced, error = "harness_fault", str(run_error)[:500]
                 else:
                     forced = "error"
                     error = f"{type(run_error).__name__}: {str(run_error)[:500]}"

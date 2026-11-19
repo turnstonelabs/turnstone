@@ -44,14 +44,23 @@ route alike (``refuses``, with ``no_user_query`` as the refusal a real template
 is known for); and its completions route can hand on its tokens in parts of a
 given size, markers among the other tokens (``part_tokens``), where it
 otherwise sends each marker in a part of its own.
+
+An image in a message is rendered as placeholder tokens (``content_tokens``),
+and a generate route (``/inference/v1/generate``) takes token IDs with one
+placeholder per image and the images beside them, as a server does whose
+completions route has no place for an image.
 """
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import hashlib
 import json
 import math
+import re
 import socket
+import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -69,12 +78,52 @@ MERGED, MERGED_TEXT = 900, "ab"
 # The token a model with a choice of its own writes where a prompt stops inside
 # a turn; the toy template never writes it there.
 OWN_CHOICE = 901
+# An image in a message: the toy template writes ``IMAGE``, one ``PAD`` and
+# ``IMAGE_END``, and the server then writes each image's ``PAD`` out as one per
+# patch.  The text ``<pad>`` in a message is tokenized as the ``PAD`` token
+# too, as a tokenizer treats the text of a token it knows; and as a real
+# server does, the toy one gives the first image to the first ``PAD`` it
+# finds, whatever wrote it (``expand_placeholders``).
+IMAGE, IMAGE_END, PAD = 8, 9, 10
+PAD_TEXT = "<pad>"
+# A token of the tokenizer the toy template never writes.
+SPARE = 11
 _CHAR_BASE = 1000
 _MARKERS = {THINK: "<think>", THINK_END: "</think>", CALL: "<tool_call>", CALL_END: "</tool_call>"}
 
 
 def encode(text: str) -> list[int]:
     return [_CHAR_BASE + ord(c) for c in text]
+
+
+# The tokenizer's own tokens, text to ID.  A server played with ``own_tokens``
+# writes each wherever it meets its text, in a message, a tool definition or a
+# text it is asked to tokenize, as a real tokenizer does; the toy one
+# otherwise knows the text of ``PAD`` only in a message.
+ADDED_TOKENS = {
+    "<start>": START,
+    "<end>": END,
+    "<other_end>": OTHER_END,
+    "<think>": THINK,
+    "</think>": THINK_END,
+    "<tool_call>": CALL,
+    "</tool_call>": CALL_END,
+    "<image>": 8,
+    "</image>": 9,
+    "<pad>": 10,
+    "<spare>": 11,
+}
+_ADDED = re.compile("|".join(re.escape(t) for t in sorted(ADDED_TOKENS, key=len, reverse=True)))
+
+
+def encode_text(text: str) -> list[int]:
+    """*text* as a tokenizer writes it that knows the texts of its own tokens."""
+    out: list[int] = []
+    cursor = 0
+    for match in _ADDED.finditer(text):
+        out += encode(text[cursor : match.start()]) + [ADDED_TOKENS[match.group(0)]]
+        cursor = match.end()
+    return out + encode(text[cursor:])
 
 
 def encode_merged(text: str) -> list[int]:
@@ -88,7 +137,14 @@ def encode_merged(text: str) -> list[int]:
 def decode(ids: list[int], *, special: bool = True, markers: bool = True) -> str:
     """The text of *ids*; without *special* the turn tokens are left out, and
     without *markers* the reasoning and call markers too."""
-    names = {MERGED: MERGED_TEXT, OWN_CHOICE: "~"}
+    names = {
+        MERGED: MERGED_TEXT,
+        OWN_CHOICE: "~",
+        IMAGE: "<image>",
+        IMAGE_END: "</image>",
+        PAD: PAD_TEXT,
+        SPARE: "<spare>",
+    }
     names.update(_MARKERS if markers else dict.fromkeys(_MARKERS, ""))
     if special:
         names.update({START: "<start>", END: "<end>", OTHER_END: "<other_end>"})
@@ -107,6 +163,64 @@ def _text_of(content: Any) -> str:
     if isinstance(content, list):
         return "".join(p.get("text", "") for p in content if isinstance(p, dict))
     return ""
+
+
+def image_bytes(part: dict[str, Any]) -> bytes:
+    """The bytes of an image part of a message, or of a content part of a
+    request to the generate route."""
+    given = part.get("image_url", part.get("url"))
+    url = given.get("url") if isinstance(given, dict) else given
+    return base64.b64decode(str(url).partition(";base64,")[2])
+
+
+def image_patches(data: bytes) -> int:
+    """How many placeholder tokens the toy server gives a PNG: one for every
+    square of eight pixels, at least one."""
+    width, height = struct.unpack(">II", data[16:24])
+    return max(1, ((width + 7) // 8) * ((height + 7) // 8))
+
+
+def content_tokens(
+    content: Any, images: list[bytes], spell: Callable[[str], list[int]] | None = None
+) -> list[int]:
+    """A message's content as the toy template writes it: text part by text
+    part, and each image as one placeholder token between two markers.  The
+    bytes of each image are added to *images*.  Text is tokenized by *spell*;
+    without it the text of ``PAD`` is the one text the tokenizer knows."""
+    if not isinstance(content, list):
+        content = [{"type": "text", "text": content if isinstance(content, str) else ""}]
+    out: list[int] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "image_url":
+            out += [IMAGE, PAD, IMAGE_END]
+            images.append(image_bytes(part))
+            continue
+        text = str(part.get("text", ""))
+        if spell is not None:
+            out += spell(text)
+            continue
+        for index, piece in enumerate(text.split(PAD_TEXT)):
+            out += ([PAD] if index else []) + encode(piece)
+    return out
+
+
+def expand_placeholders(ids: list[int], counts: list[int]) -> tuple[list[int], list[list[int]]]:
+    """*ids* with one placeholder token per image written out as that image's
+    run, the way a generate route does it: the first image takes the first
+    placeholder token, each further one the first after the run before.
+    Returns the prompt and each run's start and length.  Raises ``ValueError``
+    where no placeholder token is left for an image."""
+    out = list(ids)
+    places: list[list[int]] = []
+    cursor = 0
+    for count in counts:
+        start = out.index(PAD, cursor)
+        out[start : start + 1] = [PAD] * count
+        places.append([start, count])
+        cursor = start + count
+    return out, places
 
 
 def call_text(name: str, arguments: Any, raw: dict[str, str] | None = None) -> str:
@@ -147,15 +261,19 @@ def _wire_arguments(arguments: Any) -> str:
 
 
 def assistant_tokens(
-    reasoning: str, content: str, calls: list[tuple[Any, ...]], ended: bool = True
+    reasoning: str,
+    content: str,
+    calls: list[tuple[Any, ...]],
+    ended: bool = True,
+    spell: Callable[[str], list[int]] = encode,
 ) -> list[int]:
     """Tokens an assistant turn consists of after the generation prompt.
 
     *calls* are ``(name, arguments)`` or ``(name, arguments, raw spellings)``.
     """
-    out = encode(reasoning) + [THINK_END] + encode(NL + NL) + encode(content)
+    out = spell(reasoning) + [THINK_END] + encode(NL + NL) + spell(content)
     for call in calls:
-        out += [CALL] + encode(call_text(*call)) + [CALL_END]
+        out += [CALL] + spell(call_text(*call)) + [CALL_END]
     if ended:
         out.append(END)
     return out
@@ -169,10 +287,21 @@ def render_prompt(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     generation_prompt_added: bool = True,
+    own_tokens: bool = False,
 ) -> list[int]:
     """The toy chat template: conversation so far plus the generation prompt."""
     out: list[int] = []
-    if tools:
+    images: list[bytes] = []
+    spell = encode_text if own_tokens else None
+    if tools and own_tokens:
+        # A tokenizer that knows its tokens' texts meets them in a tool's
+        # description too, which this template then writes out.
+        listed = [
+            [t.get("function", {}).get("name", ""), t.get("function", {}).get("description", "")]
+            for t in tools
+        ]
+        out += [START] + encode_text("tools" + NL + json.dumps(listed)) + [END] + encode(NL)
+    elif tools:
         names = [t.get("function", {}).get("name", "") for t in tools]
         out += [START] + encode("tools" + NL + json.dumps(names)) + [END] + encode(NL)
     for message in messages:
@@ -187,13 +316,19 @@ def render_prompt(
                 for c in message.get("tool_calls") or []
             ]
             out += generation_prompt() + assistant_tokens(
-                reasoning, _text_of(message.get("content")), calls
+                reasoning, _text_of(message.get("content")), calls, spell=spell or encode
             )
             out += encode(NL)
         else:
             out += (
-                [START] + encode(role + NL + _text_of(message.get("content"))) + [END] + encode(NL)
+                [START]
+                + encode(role + NL)
+                + content_tokens(message.get("content"), images, spell)
+                + [END]
+                + encode(NL)
             )
+    if images:
+        out = expand_placeholders(out, [image_patches(image) for image in images])[0]
     return out + (generation_prompt() if generation_prompt_added else [])
 
 
@@ -266,8 +401,30 @@ class ScriptedChatServer:
         refuses: Callable[[list[dict[str, Any]]], str | None] | None = None,
         refusal_status: int = 400,
         part_tokens: int | None = None,
+        generate_status: int = 200,
+        generate_fault: str | None = None,
+        own_tokens: bool = False,
+        tokenizer_info: bool = False,
     ) -> None:
         self.script = script
+        # The generate route (``/inference/v1/generate``): token IDs with one
+        # placeholder token per image, and the images beside them.  It answers
+        # with this status (403: a server started without the route).  What
+        # can be wrong with it otherwise: ``plain_names`` (it names tokens by
+        # their text), ``other_prompt`` (it writes one placeholder token too
+        # many), ``other_places`` (it says the images are one token further
+        # on), ``blind`` (its replies do not depend on the images).  A reply
+        # to a request with images ends its text with ``saw:`` and the first
+        # characters of each image's hash, as a model that sees them would
+        # say something of them.
+        # A tokenizer that writes each of its own tokens wherever it meets the
+        # token's text (``ADDED_TOKENS``), and a server that names those tokens
+        # when it is asked (``GET /tokenizer_info``).
+        self.own_tokens = own_tokens
+        self.tokenizer_info = tokenizer_info
+        self.generate_status = generate_status
+        self.generate_fault = generate_fault
+        self.generate_requests: list[dict[str, Any]] = []
         # What ``GET /version`` answers, one entry per question and the last
         # one from then on: a JSON value, or a ``VersionFault``.  Without any,
         # the server has no such address.  ``version_requests`` notes for each
@@ -386,6 +543,13 @@ class ScriptedChatServer:
                 if self.path.split("?")[0] == "/version":
                     owner._answer_version(self)
                     return
+                if self.path.split("?")[0] == "/tokenizer_info":
+                    if not owner.tokenizer_info:
+                        owner._refuse(self, 404, "Not Found")
+                        return
+                    decoder = {str(i): {"content": t} for t, i in ADDED_TOKENS.items()}
+                    owner._send_json(self, {"added_tokens_decoder": decoder})
+                    return
                 owner._send_json(
                     self,
                     {
@@ -410,8 +574,12 @@ class ScriptedChatServer:
                 body = json.loads(self.rfile.read(length) or b"{}")
                 # A client that stops reading mid-reply is part of some tests.
                 with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                    if self.path.endswith("/tokenize"):
+                    if self.path.endswith("/detokenize"):
+                        owner._send_json(self, {"prompt": decode([int(t) for t in body["tokens"]])})
+                    elif self.path.endswith("/tokenize"):
                         owner._handle_tokenize(self, body)
+                    elif self.path.endswith("/inference/v1/generate"):
+                        owner._handle_generate(self, body)
                     else:
                         owner._handle_chat(self, body)
 
@@ -556,14 +724,14 @@ class ScriptedChatServer:
         generation_prompt_added: bool = True,
     ) -> list[int]:
         """The toy template as this server applies it, on either route."""
-        ids = render_prompt(messages, tools, generation_prompt_added)
+        ids = render_prompt(messages, tools, generation_prompt_added, self.own_tokens)
         last_turn = max(
             (i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1
         )
         if self.unstable_rendering and 0 <= last_turn < len(messages) - 1:
             # An assistant turn that is not the last message any more is
             # rendered with one character more, right at its start.
-            before = len(render_prompt(messages[:last_turn], tools, False))
+            before = len(render_prompt(messages[:last_turn], tools, False, self.own_tokens))
             ids = ids[:before] + encode("~") + ids[before:]
         return ids
 
@@ -585,8 +753,103 @@ class ScriptedChatServer:
         else:
             text = str(body.get("prompt", ""))
             by_text = {name: token for token, name in _MARKERS.items()}
-            ids = [by_text[text]] if text in by_text else encode(text)
+            if self.own_tokens:
+                ids = encode_text(text)
+            else:
+                ids = [by_text[text]] if text in by_text else encode(text)
         self._send_json(handler, {"tokens": ids, "count": len(ids), "max_model_len": 1 << 20})
+
+    def _handle_generate(self, handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> None:
+        """The generate route: the request as a completions request whose
+        prompt is the token IDs with the images' placeholders written out,
+        answered in the generate route's own shape."""
+        with self._lock:
+            self.generate_requests.append(body)
+        if self.generate_status != 200:
+            self._refuse(
+                handler,
+                self.generate_status,
+                "Scale-out endpoints are disabled.",
+                "PermissionDeniedError",
+            )
+            return
+        sampling = dict(body.get("sampling_params") or {})
+        images = [image_bytes(p) for p in body.get("content_parts") or []]
+        try:
+            prompt, places = expand_placeholders(
+                [int(t) for t in body["token_ids"]], [image_patches(i) for i in images]
+            )
+        except ValueError:
+            self._refuse(handler, 500, "Failed to apply prompt replacement for an image")
+            return
+        if self.generate_fault == "other_prompt" and places:
+            prompt.insert(places[0][0], PAD)
+        if self.generate_fault == "other_places" and places:
+            places = [[start + 1, length] for start, length in places]
+        converted = {
+            "model": body.get("model"),
+            "prompt": prompt,
+            "stream": body.get("stream"),
+            "stream_options": body.get("stream_options"),
+            "return_token_ids": bool(body.get("return_token_ids")),
+            "return_tokens_as_token_ids": self.generate_fault != "plain_names",
+            "logprobs": sampling.get("logprobs"),
+            "_generate": {
+                "places": places,
+                "saw": [hashlib.sha256(i).hexdigest()[:6] for i in images],
+            },
+        }
+        for name in (
+            "max_tokens",
+            "temperature",
+            "top_k",
+            "top_p",
+            "logit_bias",
+            "allowed_token_ids",
+        ):
+            if name in sampling:
+                converted[name] = sampling[name]
+        self._handle_chat(handler, converted)
+
+    def _as_generate(self, payload: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+        """A part of a completions reply in the generate route's shape."""
+        out: dict[str, Any] = {"request_id": payload["id"], "output_mode": "text", "choices": []}
+        if "usage" in payload:
+            out["usage"] = payload["usage"]
+        for choice in payload["choices"]:
+            given = choice.get("logprobs")
+            content = None
+            if given is not None:
+                content = [
+                    {
+                        "token": name,
+                        "logprob": value,
+                        "bytes": None,
+                        "top_logprobs": [
+                            {"token": other, "logprob": other_value, "bytes": None}
+                            for other, other_value in listed.items()
+                        ],
+                    }
+                    for name, value, listed in zip(
+                        given["tokens"], given["token_logprobs"], given["top_logprobs"], strict=True
+                    )
+                ]
+            out["choices"].append(
+                {
+                    "index": 0,
+                    "text": choice["text"],
+                    "token_ids": choice.get("token_ids"),
+                    "finish_reason": choice["finish_reason"],
+                    "logprobs": None if content is None else {"content": content},
+                }
+            )
+            if "prompt_token_ids" in choice:
+                places = body["_generate"]["places"]
+                out["prompt_token_ids"] = choice["prompt_token_ids"]
+                out["mm_placeholders"] = (
+                    {"image": [{"offset": s, "length": n} for s, n in places]} if places else None
+                )
+        return out
 
     def _handle_chat(self, handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> None:
         if self._template_refuses(handler, body, "chat"):
@@ -643,6 +906,10 @@ class ScriptedChatServer:
                 messages[0]["content"] = _text_of(messages[0].get("content")) + " (edited)"
             prompt_ids = self._render(messages, body.get("tools"))
         step = script[turn] if turn < len(script) else {"content": "done"}
+        saw = (body.get("_generate") or {}).get("saw")
+        if saw and self.generate_fault != "blind":
+            # A model that sees the images says something of them.
+            step = {**step, "content": (step.get("content") or "") + " saw:" + "+".join(saw)}
         if self.prompt_tokens_per_second:
             time.sleep(len(prompt_ids) / self.prompt_tokens_per_second)
         top_p = body.get("top_p")
@@ -735,7 +1002,12 @@ class ScriptedChatServer:
         pieces: list[tuple[list[int], dict[str, Any]]] = []
 
         def spread(text: str, key: str) -> None:
-            tokens = encode_merged(text) if step.get("merge") else encode(text)
+            # ``own_tokens`` in a step: the model "generates" the tokenizer's own
+            # tokens where the scripted text holds their text.
+            if step.get("merge"):
+                tokens = encode_merged(text)
+            else:
+                tokens = encode_text(text) if step.get("own_tokens") else encode(text)
             for i in range(0, len(tokens), size):
                 part = tokens[i : i + size]
                 pieces.append((part, {key: decode(part)}))
@@ -881,18 +1153,21 @@ class ScriptedChatServer:
                 }
             return {**base, "object": "text_completion", "choices": [choice]}
 
+        def shaped(payload: dict[str, Any]) -> dict[str, Any]:
+            return self._as_generate(payload, body) if "_generate" in body else payload
+
         parts = []
         offset = 0
         for number, ids in enumerate(groups):
-            parts.append(part(number, ids, offset, number == len(groups) - 1))
+            parts.append(shaped(part(number, ids, offset, number == len(groups) - 1)))
             offset += len(ids)
         if not parts:
-            parts.append(part(0, [], 0, True))
+            parts.append(shaped(part(0, [], 0, True)))
         if not body.get("stream"):
             whole = part(0, [t for ids in groups for t in ids], 0, True)
             if fault != "no_usage":
                 whole["usage"] = usage
-            self._send_json(handler, whole)
+            self._send_json(handler, shaped(whole))
             return
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream")
@@ -909,7 +1184,7 @@ class ScriptedChatServer:
                 time.sleep(self.chunk_delay)
             send(payload)
         if (body.get("stream_options") or {}).get("include_usage") and fault != "no_usage":
-            send({**base, "object": "text_completion", "choices": [], "usage": usage})
+            send(shaped({**base, "object": "text_completion", "choices": [], "usage": usage}))
         handler.wfile.write(("data: [DONE]" + NL + NL).encode("utf-8"))
         handler.wfile.flush()
         handler.close_connection = True

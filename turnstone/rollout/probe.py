@@ -90,7 +90,9 @@ shows neither leaves the setting without a verdict.
 A server can report differently on its two routes, so the probe asks on the
 route the run will use: with messages on the chat route, or (``route`` of
 ``"completions"``) with each probe prompt rendered by the server's tokenize
-route and sent as token IDs to the completions route.
+route and sent as token IDs to the completions route, or (``"generate"``)
+sent as token IDs to the generate route, which a run's requests with images
+go to (:mod:`turnstone.rollout.vision`).
 
 A server whose positions contradict each other has no verdict for the
 settings concerned.  What the other positions cannot show is a server that
@@ -394,8 +396,8 @@ def sampler_logprobs_reported(
     not used says how many positions the model was certain of
     (``certain_positions``).
     """
-    if route not in ("chat", "completions"):
-        raise ValueError(f"route must be 'chat' or 'completions', not {route!r}")
+    if route not in ("chat", "completions", "generate"):
+        raise ValueError(f"route must be 'chat', 'completions' or 'generate', not {route!r}")
     body = copy.deepcopy(extra_body or {})
     for key in ("top_k", "top_p", "min_p"):
         body.pop(key, None)
@@ -421,13 +423,27 @@ def sampler_logprobs_reported(
         alternatives: int = _ALTERNATIVES,
     ) -> list[Any]:
         """The log-probability entries of one reply of up to *tokens* tokens."""
-        if route == "completions":
+        if route != "chat":
             key = json.dumps(messages)
             if key not in prompts:
                 prompts[key] = render(
                     client, model, messages, None, body.get("chat_template_kwargs") or {}
                 )
             sent = {k: v for k, v in body.items() if k != "chat_template_kwargs"}
+            if route == "generate":
+                from turnstone.rollout.vision import ask_generate
+
+                settings = {
+                    **sent,
+                    "max_tokens": tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "top_k": top_k,
+                }
+                # The entries have a chat choice's shape, tokens named by ID.
+                return ask_generate(
+                    client, model, prompts[key], alternatives=alternatives, **settings
+                )[2]
             answer = client.completions.create(
                 model=model,
                 prompt=prompts[key],

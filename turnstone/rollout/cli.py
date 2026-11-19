@@ -28,7 +28,10 @@ Exit status, for a caller that starts this command as a process:
 - 2: it ran to its own end but cannot be trained on (its token data, a
   changed server version, a failed check);
 - 3: nothing was run: the command line, the task file or the configuration
-  was refused, and standard error says why.
+  was refused, and standard error says why.  Also a rollout in which the
+  harness found itself at fault (``finish_state`` ``harness_fault``): its
+  record is written, and a caller that runs many rollouts should stop, not
+  run it again.
 
 The status is read off the record.  What is printed is a summary for a reader:
 text the output cannot encode is escaped, a closed output is left alone, and
@@ -57,6 +60,7 @@ import shlex
 import shutil
 import stat
 import sys
+from dataclasses import replace
 from typing import Any, NoReturn
 
 from turnstone.core.config import config_file_path, set_config_path
@@ -68,8 +72,10 @@ from turnstone.rollout.episode import (
     logprob_verdict,
     run_episode,
     token_id_route_verdict,
+    vision_route_verdict,
 )
 from turnstone.rollout.idprompt import TokenIdRoute, template_arguments
+from turnstone.rollout.plaintext import added_tokens_of
 from turnstone.rollout.rules import RuleSet
 from turnstone.rollout.settings import (
     SetupError,
@@ -81,6 +87,7 @@ from turnstone.rollout.taskfile import check_task, load_task
 from turnstone.rollout.tokens import generated_positions
 from turnstone.rollout.verdicts import check_verdict, probe_verdict
 from turnstone.rollout.verification import check_verifier_command
+from turnstone.rollout.vision import vision_verdict
 
 _NL = chr(10)
 
@@ -374,6 +381,39 @@ def _parser() -> argparse.ArgumentParser:
         "refused",
     )
     parser.add_argument(
+        "--tokenizer-info",
+        default=None,
+        metavar="FILE",
+        help="with --probe-only and --token-id-prompts: a JSON description of the tokenizer "
+        "that names its own tokens (the model's tokenizer_config.json or tokenizer.json), "
+        "for a server that does not answer /tokenizer_info; the check then establishes how "
+        "their text is read as plain text in what the environment writes",
+    )
+    parser.add_argument(
+        "--vision",
+        action="store_true",
+        help="with --token-id-prompts: let the model see images. An image file it reads and "
+        "an image a tool of the task's servers returns reach it as images, and a request "
+        "that holds one goes to the server's generate route with the images beside the "
+        "token IDs; the server is checked for what that needs before the run",
+    )
+    parser.add_argument(
+        "--vision-route",
+        default=None,
+        metavar="VERDICT",
+        help="with --vision: the verdict of the check of the server for images, as "
+        "--probe-only printed it with --vision (a JSON object, or @FILE holding one), so "
+        "that this rollout does not check again; one made for another model, endpoint or "
+        "set of template arguments is refused",
+    )
+    parser.add_argument(
+        "--image-dir",
+        default=None,
+        metavar="FOLDER",
+        help="with --vision: the folder the rollout's images are written to, each under the "
+        "hash of its bytes (default: the --out file's name with .images added)",
+    )
+    parser.add_argument(
         "--keep-text", action="store_true", help="keep each call's generated text in the record"
     )
     parser.add_argument(
@@ -511,6 +551,8 @@ def _read_by(args: argparse.Namespace) -> list[tuple[str, str]]:
     for flag, said in (
         ("--sampler-logprobs", args.sampler_logprobs),
         ("--token-id-route", args.token_id_route),
+        ("--vision-route", args.vision_route),
+        ("--tokenizer-info", "@" + args.tokenizer_info if args.tokenizer_info else None),
     ):
         if said is not None and said.startswith("@"):
             read.append((f"{flag} reads", said[1:]))
@@ -698,6 +740,41 @@ def _route_given(
     return verdict
 
 
+def _added_tokens(args: argparse.Namespace) -> dict[str, Any]:
+    """The tokenizer's own tokens ``--tokenizer-info`` names, as the
+    configuration takes them; nothing where the flag is not given."""
+    if args.tokenizer_info is None:
+        return {}
+    named = added_tokens_of(_json_given("--tokenizer-info", "@" + args.tokenizer_info))
+    if not named:
+        raise SetupError(
+            f"--tokenizer-info: {args.tokenizer_info} names no tokens of the tokenizer's own "
+            "(added_tokens_decoder or added_tokens)"
+        )
+    return {"added_tokens": named}
+
+
+def _vision_given(
+    said: str, *, model: str, endpoint: str, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """What ``--vision-route`` says: the verdict of the check of the server
+    for images, by itself or inside what ``--probe-only`` printed.  It is held
+    against this run here, before anything is run
+    (:func:`turnstone.rollout.vision.vision_verdict`)."""
+    verdict = _json_given("--vision-route", said)
+    if isinstance(verdict, dict) and "vision_route" in verdict:
+        verdict = verdict["vision_route"]
+    if not isinstance(verdict, dict):
+        raise SetupError(
+            "--vision-route takes what --probe-only printed with --vision: a JSON object (or "
+            "@FILE holding one) with the verdict of the check of the server for images"
+        )
+    try:
+        return vision_verdict(verdict, model=model, endpoint=endpoint, arguments=arguments)
+    except SetupError as error:
+        raise SetupError(f"--vision-route: {error}") from None
+
+
 def _template_arguments(args: argparse.Namespace, extra_body: dict[str, Any]) -> dict[str, Any]:
     """The chat-template arguments this run's requests will carry, worked out
     the way the run works them out: the model definition's under the command's."""
@@ -831,12 +908,30 @@ def _probe_only(args: argparse.Namespace, api_key: str, extra_body: dict[str, An
         # Asked on the route those rollouts will use: a server can report
         # differently per route.
         token_id_prompts=args.token_id_prompts,
+        **_added_tokens(args),
     )
     route = token_id_route_verdict(config) if args.token_id_prompts else None
     verdict = logprob_verdict(config)
     if route is not None:
         verdict = {**verdict, "token_id_route": route}
     usable = verdict.get("sampler_logprobs") is True and (route is None or route.get("ok") is True)
+    if args.vision:
+        # The check for images, made under the sampler settings the rollouts
+        # of the batch will carry, and printed with the others.
+        seeing = vision_route_verdict(replace(config, temperature=sampling["temperature"].value))
+        verdict = {**verdict, "vision_route": seeing}
+        usable = usable and seeing.get("ok") is True
+    if route is not None and route.get("ok") and not (route.get("special_text") or {}).get("ok"):
+        # Said, not decided: the verdict and the status are what they were.
+        why = (route.get("special_text") or {}).get("reason") or (
+            "the server does not name its tokenizer's own tokens; start it with "
+            "--enable-tokenizer-info-endpoint or give --tokenizer-info"
+        )
+        _put(
+            sys.stderr,
+            "turnstone-rollout: note: the text of the tokenizer's own tokens in what the "
+            f"environment writes will reach the model as those tokens ({why}){_NL}",
+        )
     # The status is the verdict's, whatever becomes of printing it.
     status = 0 if usable else 2
     line = _json_text(verdict)
@@ -889,6 +984,14 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
         if not os.environ.get(args.api_key_env):
             raise SetupError(f"--api-key-env: the environment has no {args.api_key_env}")
         api_key = os.environ[args.api_key_env]
+    if args.vision and not args.token_id_prompts:
+        raise SetupError("--vision is for --token-id-prompts, which is not given")
+    if not args.vision:
+        for flag, said in (("--vision-route", args.vision_route), ("--image-dir", args.image_dir)):
+            if said is not None:
+                raise SetupError(f"{flag} is for --vision, which is not given")
+    if args.tokenizer_info is not None and not (args.probe_only and args.token_id_prompts):
+        raise SetupError("--tokenizer-info is for --probe-only with --token-id-prompts")
     if args.probe_only:
         return _probe_only(args, api_key, extra_body)
     task = _task(args, given)
@@ -918,6 +1021,22 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
             endpoint=args.base_url,
             arguments=_template_arguments(args, extra_body),
         )
+    seeing: dict[str, Any] = {}
+    if args.vision:
+        image_dir = args.image_dir or (f"{args.out}.images" if args.out else None)
+        if image_dir is None:
+            raise SetupError(
+                "--vision needs a place for the rollout's images: --out, beside which they "
+                "are written, or --image-dir"
+            )
+        seeing = {"vision": True, "image_dir": image_dir}
+        if args.vision_route is not None:
+            seeing["vision_route"] = _vision_given(
+                args.vision_route,
+                model=args.model,
+                endpoint=args.base_url,
+                arguments=_template_arguments(args, extra_body),
+            )
     config = RolloutConfig(
         base_url=args.base_url,
         model=args.model,
@@ -949,6 +1068,7 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
         min_prompt_tokens_per_second=args.min_prompt_tokens_per_second,
         server_version_url=args.server_version_url,
         server_version_field=args.server_version_field,
+        **seeing,
     )
     check: dict[str, Any] = {}
     if verifier_command is not None:
@@ -956,6 +1076,12 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
         if args.verifier_timeout is not None:
             check["verifier_timeout"] = args.verifier_timeout
     record = run_episode(task, config, **check)
+    if args.out and isinstance(record.get("vision"), dict):
+        # Where the images are, from the record's own folder: the two are
+        # moved together.
+        record["vision"]["image_dir"] = os.path.relpath(
+            record["vision"]["image_dir"], os.path.dirname(os.path.abspath(args.out))
+        )
     # The status is read off the record, before anything is written or
     # printed: nothing that happens to the summary below can change it.
     status = _status(record)
@@ -963,6 +1089,12 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
         # The rollout is lost with its record; no caller may take it for one
         # that is there.
         return 1
+    if record["finish_state"] == "harness_fault":
+        _put(
+            sys.stderr,
+            f"turnstone-rollout: HARNESS FAULT, do not run this rollout again without a look: "
+            f"{_shown(record['error'])}{_NL}",
+        )
     try:
         summary = _NL.join(_summary(record)) + _NL
     except Exception as error:  # the summary is for a reader and decides nothing
@@ -978,6 +1110,9 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
 
 def _status(record: dict[str, Any]) -> int:
     """The exit status a record stands for."""
+    if record["finish_state"] == "harness_fault":
+        # Not a rollout to run again: whoever runs many is to stop.
+        return REFUSED
     if record["finish_cause"] == "machinery":
         return 1
     return 0 if record["trainable"] else 2
@@ -1068,6 +1203,12 @@ def _summary(record: dict[str, Any]) -> list[str]:
     if record["server_version"] is not None:
         say("server version:", _shown(json.dumps(record["server_version"])))
     say("prompts sent as:", record["prompt_mode"])
+    for image in (record.get("vision") or {}).get("images") or []:
+        say(
+            f"  image {image['index']}: {image['width']}x{image['height']}, {image['tokens']} "
+            f"tokens at {image['start']}, first in call {image['first_call']}, "
+            f"{image['sha256'][:12]}"
+        )
     for call in tokens["calls"]:
         logprobs = "none" if call["logprobs"] is None else len(call["logprobs"])
         say(

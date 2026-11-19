@@ -116,12 +116,18 @@ class CallRecord:
     window_left: int | None = None
     window_cut: bool = False
     # The route the request went out on: ``"chat"`` with messages,
-    # ``"completions"`` with the prompt as token IDs.
+    # ``"completions"`` with the prompt as token IDs, ``"generate"`` with the
+    # prompt as token IDs and images beside it.
     route: str = "chat"
     # With a prompt sent as token IDs: the IDs sent, until the server has
     # reported the prompt it used, and whether that was another one.
     prompt_sent: list[int] | None = None
     prompt_differs: bool = False
+    # With images beside the token IDs: where the prompt's images are (start
+    # and length of each run of placeholder tokens), and whether the server
+    # said it put them elsewhere.
+    placeholders_sent: list[list[int]] | None = None
+    placeholders_differ: bool = False
     # Whether the reply ended by itself (the model stopped), as opposed to
     # being cut at a limit.  Known for a prompt sent as token IDs.
     ended_by_itself: bool | None = None
@@ -161,6 +167,8 @@ class CallRecord:
             found.append("no prompt token IDs returned")
         if self.prompt_differs:
             found.append("the server reported another prompt than the token IDs it was sent")
+        if self.placeholders_differ:
+            found.append("the server did not place the images where the prompt holds them")
         if not self.token_ids:
             found.append("no generated token IDs returned")
         if not self.aligned:
