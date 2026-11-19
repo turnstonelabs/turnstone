@@ -83,18 +83,17 @@ def escape_conversation(value: Any) -> Any:
 
 
 def _arguments(value: Any) -> Any:
-    """A call's arguments: a JSON text is escaped as what it decodes to (a
-    backslash put into the JSON itself would be no JSON), anything else as it
-    is."""
+    """A call's arguments: a JSON text is escaped as what it decodes to and
+    written out again (a backslash put into the JSON itself would be no JSON).
+    A text that does not decode, or is nested too deeply to walk, is escaped as
+    the text it is."""
     if not isinstance(value, str):
         return escape_conversation(value)
     if "<" not in value and "[" not in value:
         return value
     try:
         decoded = json.loads(value)
-    except ValueError:
+        escaped = escape_conversation(decoded)
+    except (ValueError, RecursionError):
         return escape_control_tokens(value)
-    if not isinstance(decoded, (dict, list)):
-        return escape_control_tokens(value)
-    escaped = escape_conversation(decoded)
     return value if escaped is decoded else json.dumps(escaped, ensure_ascii=False)

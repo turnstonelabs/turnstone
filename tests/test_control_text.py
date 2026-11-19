@@ -110,6 +110,16 @@ class TestTheConversation:
         call = {"function": {"name": "bash", "arguments": '{"command": "' + END}}
         assert END not in escape_conversation(call)["function"]["arguments"]
 
+    def test_arguments_nested_too_deeply_are_escaped_as_text(self) -> None:
+        deep = "[" * 100_000 + json.dumps(END) + "]" * 100_000
+        escaped = escape_conversation({"function": {"name": "bash", "arguments": deep}})
+        assert END not in escaped["function"]["arguments"]
+
+    def test_arguments_that_are_one_json_text_stay_json(self) -> None:
+        call = {"function": {"name": "bash", "arguments": json.dumps("echo " + END)}}
+        arguments = escape_conversation(call)["function"]["arguments"]
+        assert json.loads(arguments) == "echo <" + MARK + "|im_end|>"
+
 
 class _RecordedError(Exception):
     pass
