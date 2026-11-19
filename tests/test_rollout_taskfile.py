@@ -1554,18 +1554,42 @@ class TestProbingOnce:
         assert os.listdir(tmp_path) == ["server.json"]
         capsys.readouterr()
 
+    @pytest.mark.parametrize(
+        "flags",
+        [
+            ["--extra-body", "{no json"],
+            ["--vision", "--no-vision"],
+            ["--token-id-prompts"],
+            ["--token-id-prompts", "--no-plain-text"],
+            ["--token-id-prompts", "--tokenizer-info", "/no/such/file.json"],
+            ["--tokenizer-info", "server"],
+            ["--api-key-env", "TURNSTONE_ROLLOUT_NO_SUCH_VARIABLE"],
+        ],
+    )
+    def test_a_probe_refused_for_its_command_line_leaves_the_earlier_verdict(
+        self, monkeypatch, tmp_path, capsys, flags
+    ):
+        """A command that is refused probed nothing: what an earlier probe
+        found still stands, and the rollouts of a batch under way go on
+        reading it.  Nothing is asked of the server."""
+        verdict = tmp_path / "server.json"
+        verdict.write_text('{"earlier": true}', encoding="ascii")
+        monkeypatch.setattr(cli, "logprob_verdict", _never)
+        monkeypatch.setattr(cli, "token_id_route_verdict", _never)
+        base = ["--base-url", "http://127.0.0.1:9/v1", "--model", "m", "--probe-only"]
+        assert cli.main([*base, "--out", str(verdict), *flags]) == 3
+        assert verdict.read_text(encoding="ascii") == '{"earlier": true}'
+        assert os.listdir(tmp_path) == ["server.json"]
+        assert "turnstone-rollout:" in capsys.readouterr().err
+
     def test_a_probe_that_ends_without_a_verdict_leaves_no_earlier_one(
         self, monkeypatch, tmp_path, capsys
     ):
-        """When the command has ended, the file is its verdict or is not there."""
+        """When a command that probed has ended, the file is its verdict or is
+        not there."""
         verdict = tmp_path / "server.json"
         base = ["--base-url", "http://127.0.0.1:9/v1", "--model", "m", "--probe-only"]
         base += ["--out", str(verdict)]
-        # Refused: nothing is asked of the server.
-        verdict.write_text("{}", encoding="ascii")
-        monkeypatch.setattr(cli, "logprob_verdict", _never)
-        assert cli.main([*base, "--extra-body", "{no json"]) == 3
-        assert not verdict.exists()
 
         # It died.
         def dies(_config: Any) -> Any:

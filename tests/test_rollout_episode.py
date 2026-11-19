@@ -352,6 +352,17 @@ def both_ways(request: Any) -> Any:
     _DEFAULTS_ON["on"] = False
 
 
+@pytest.fixture(params=["messages", "token IDs", "token IDs, plain text and vision"])
+def token_id_prompts(request: Any) -> Any:
+    """Runs a test three times: with messages, with prompts as token IDs as
+    the test is written, and with prompts as token IDs and both of the
+    command's defaults on (:func:`both_ways`).  Its value says whether the
+    prompts go out as token IDs."""
+    _DEFAULTS_ON["on"] = request.param == "token IDs, plain text and vision"
+    yield request.param != "messages"
+    _DEFAULTS_ON["on"] = False
+
+
 def _handed_the_defaults(server: ScriptedChatServer, settings: dict[str, Any]) -> dict[str, Any]:
     """What a run with *settings* is handed to have plain text and vision on:
     the verdicts as a batch gets them, made for this server and this run.
@@ -524,6 +535,7 @@ class TestEpisodeRecord:
             "reason": "switched off for the model (escape_control_tokens)",
             "tokens_from": None,
             "escaped": {},
+            "requests": 0,
         }
         with (
             ScriptedChatServer(script) as server,
@@ -565,7 +577,6 @@ class TestEpisodeRecord:
         assert plain["text"] is None
         assert len(record["text"]) == 3 and record["text"][2].endswith("All done.<end>")
 
-    @pytest.mark.parametrize("token_id_prompts", [False, True])
     def test_a_message_holds_the_keys_the_guide_names_and_no_others(self, token_id_prompts):
         """The session keeps bookkeeping of its own on a turn, under keys that begin
         with an underscore.  The record holds none of it: a turn's reasoning is
@@ -1030,7 +1041,6 @@ class TestEndings:
 
         return refuses
 
-    @pytest.mark.parametrize("token_id_prompts", [False, True])
     def test_a_later_request_the_server_refuses_is_the_models_outcome(self, token_id_prompts):
         """The model reads a file, and the server will not take the conversation
         that now holds it.  The request before was taken, so what this one adds is
@@ -1502,7 +1512,6 @@ class TestSubAgents:
 
     TOOL_RESPONSE = NL.join(["<tool_response>", "status: ok", "</tool_response>"])
 
-    @pytest.mark.parametrize("token_id_prompts", [False, True])
     def test_a_prompt_the_servers_template_refuses_is_an_ordinary_failed_delegation(
         self, token_id_prompts
     ):
@@ -2302,7 +2311,6 @@ class TestWhatTheToolLogSaysOfACall:
         task.max_generated_tokens = token_budget
         return run_episode(task, RolloutConfig(**settings), sandbox_factory=lambda _t, _c: box)
 
-    @pytest.mark.parametrize("token_id_prompts", [False, True])
     def test_a_last_reply_cut_inside_a_call_costs_the_earlier_entries_nothing(
         self, token_id_prompts
     ):
@@ -2550,7 +2558,6 @@ class TestTextNoRequestCanCarry:
     LONE = chr(0xD800)
     REPLACED = chr(0xFFFD)
 
-    @pytest.mark.parametrize("token_id_prompts", [False, True])
     def test_a_tool_result_that_holds_one_does_not_end_the_run(self, token_id_prompts):
         """The next request could not be sent at all, and the run ended as a
         failure of the machinery over a text the model chose.  The half is

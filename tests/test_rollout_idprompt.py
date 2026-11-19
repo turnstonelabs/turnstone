@@ -47,6 +47,7 @@ from turnstone.rollout.idprompt import (
     TokenIdRoute,
     check_token_id_route,
     completion_request,
+    take_completion,
     template_arguments,
 )
 from turnstone.rollout.probe import sampler_logprobs_reported
@@ -786,6 +787,29 @@ class TestTheChain:
                 ask(recorder, [*MESSAGES, {"role": "user", "content": "more"}])
             assert len(server.requests) == 1
         assert "PromptAssemblyError" in recorder.calls[1].error
+
+    def test_a_part_that_cannot_be_read_costs_the_call_no_token(self) -> None:
+        """The IDs are the call's as soon as they are read.  What follows
+        them in the part (here log-probabilities that are no list) costs the
+        call its log-probabilities and marks it; it does not take the tokens
+        out of the sequence the next prompt is built from."""
+        call = CallRecord(index=0, streamed=True, request={})
+        broken = _part("ok", [5, 6])
+        broken.choices[0].logprobs = SimpleNamespace(token_logprobs=5, tokens=[])
+        assert take_completion(call, broken) is None
+        assert call.token_ids == [5, 6] and call.unreadable is not None
+        assert call.aligned is False and call.logprobs == []
+
+    def test_no_prompt_is_built_on_a_reply_that_could_not_be_read(self) -> None:
+        """A part that could not be read may have held tokens that are not
+        among the call's: the sequence does not go on from there."""
+        with ScriptedChatServer([STEP, {"content": "done"}]) as server:
+            recorder = recorder_for(server)
+            first = ask(recorder, MESSAGES)
+            recorder.calls[0].unreadable = "TypeError: a value of the wrong kind"
+            with pytest.raises(PromptAssemblyError, match="could not be read"):
+                ask(recorder, [*MESSAGES, turn_of(first), result_of(first, "out")])
+            assert len(server.requests) == 1
 
     def test_a_cut_turn_is_not_continued(self) -> None:
         with ScriptedChatServer([STEP, {"content": "done"}], keep_reply_limit=True) as server:

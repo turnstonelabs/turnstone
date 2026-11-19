@@ -61,14 +61,19 @@ from turnstone.rollout.idprompt import (
     PromptAssemblyError,
     _root,
     completion_request,
-    note_reported_prompt,
-    pair_tokens,
     render,
     template_arguments,
-    unreadable,
 )
 from turnstone.rollout.plaintext import HarnessFaultError
-from turnstone.rollout.recording import _ID_PREFIX, PARENT, CallRecord, _usage_dict
+from turnstone.rollout.recording import (
+    _ID_PREFIX,
+    PARENT,
+    CallRecord,
+    _usage_dict,
+    note_reported_prompt,
+    pair_tokens,
+    unreadable,
+)
 from turnstone.rollout.settings import SetupError
 from turnstone.rollout.tokens import common_prefix_len
 
@@ -128,7 +133,11 @@ class PlaceholderGeneratedError(Exception):
     """The model generated the token an image is rendered as, and a later
     request holds an image.  A server gives the image to the first such token
     it finds, so the image cannot be sent where it belongs.  The run ends
-    there, as the model's own outcome (``image_token_generated``)."""
+    there, as the model's own outcome (``image_token_generated``).
+
+    Raised only for a placeholder token that stands in a stretch of the
+    sequence the model generated.  One that stands anywhere else was put
+    there by the template or by this code, and is the harness's fault."""
 
 
 @dataclass(frozen=True)
@@ -210,7 +219,11 @@ def collapsed(prompt: Sequence[int], places: Sequence[tuple[int, int]]) -> list[
 
 
 def find_places(
-    prompt: list[int], images: int, placeholder: int, frame: tuple[int, int]
+    prompt: list[int],
+    images: int,
+    placeholder: int,
+    frame: tuple[int, int],
+    generated: Sequence[tuple[int, int]] = (),
 ) -> list[tuple[int, int]]:
     """Where the *images* images of a conversation stand in *prompt*, its
     rendering: the runs of placeholder tokens the template wrote, each
@@ -219,14 +232,24 @@ def find_places(
     A server gives the first image the first placeholder token it finds, the
     next image the first after that image's run, and so on.  So the prompt
     can be sent with each run cut to one token only when the template's
-    places are the first placeholder tokens there are.  Raises
-    :class:`PromptAssemblyError` where they are not: the prompt holds another
-    number of places than the conversation has images, or a placeholder token
-    that is no image's stands before one.  With the conversation's text read
-    as plain text neither comes from what the environment wrote.
+    places are the first placeholder tokens there are.
+
+    *generated* are the stretches of *prompt* the model generated itself
+    (where each begins and ends).  A placeholder token there is the model's,
+    whatever stands around it, and is no place of an image.  Everything else
+    was written by the template from what the environment wrote, which is
+    read as plain text and holds no such token.  So:
+
+    - :class:`PromptAssemblyError` where what lies outside *generated* does
+      not hold exactly the images' places: another number of places than the
+      conversation has images, or a placeholder token that is no image's
+      before one.  The model did not do that;
+    - :class:`PlaceholderGeneratedError` where it does, and a placeholder
+      token the model generated stands before an image.
     """
     places: list[tuple[int, int]] = []
     loose: list[int] = []
+    models: list[int] = []
     at = 0
     size = len(prompt)
     while at < size:
@@ -236,7 +259,9 @@ def find_places(
         end = at
         while end < size and prompt[end] == placeholder:
             end += 1
-        if at and prompt[at - 1] == frame[0] and end < size and prompt[end] == frame[1]:
+        if any(begins <= at < ends for begins, ends in generated):
+            models.append(at)
+        elif at and prompt[at - 1] == frame[0] and end < size and prompt[end] == frame[1]:
             places.append((at, end - at))
         else:
             loose.append(at)
@@ -248,8 +273,13 @@ def find_places(
         )
     if places and loose and loose[0] < places[-1][0]:
         raise PromptAssemblyError(
-            f"a placeholder token that is no image's stands at position {loose[0]}, before an "
-            "image: the server would give the image to it"
+            f"a placeholder token that is no image's and that the model did not generate stands "
+            f"at position {loose[0]}, before an image: the server would give the image to it"
+        )
+    if places and models and models[0] < places[-1][0]:
+        raise PlaceholderGeneratedError(
+            "the model generated the token an image is rendered as (position "
+            f"{models[0]} of the sequence), and the server would give a later image to it"
         )
     return places
 
@@ -313,7 +343,9 @@ def take_generate(record: CallRecord, part: Any) -> tuple[str, list[int]] | None
     The prompt the server reports is held against the one it was to arrive at
     (``record.prompt_sent``, the tokenize route's rendering), and the places
     it reports for the images against the runs found there
-    (``record.placeholders_sent``).
+    (``record.placeholders_sent``).  Places that cannot be read count as
+    other places: the reply does not show that the images stood where they
+    belong.
     """
     try:
         if not isinstance(part, dict):
@@ -323,12 +355,17 @@ def take_generate(record: CallRecord, part: Any) -> tuple[str, list[int]] | None
             note_reported_prompt(record, part.get("prompt_token_ids"))
             and record.placeholders_sent is not None
         ):
+            # Not where they belong until they are read and found there:
+            # places that cannot be read are not the places that were sent.
+            record.placeholders_differ = True
             places = _image_places(part.get("mm_placeholders"))
             record.placeholders_differ = places != record.placeholders_sent
         for choice in part.get("choices") or []:
             if choice.get("index", 0) != 0:
                 continue
             ids = [int(i) for i in (choice.get("token_ids") or [])]
+            # Among the call's tokens before anything else of the part is read.
+            record.token_ids.extend(ids)
             text = choice.get("text") or ""
             record.raw.extend(text.encode("utf-8", errors="replace"))
             entries = list((choice.get("logprobs") or {}).get("content") or [])
@@ -401,14 +438,127 @@ def ask_generate(
 # -- what a check established ------------------------------------------------------
 
 
+# The image formats a server opens: vLLM 0.32, ``vllm/multimodal/image.py``,
+# ``ALLOWED_IMAGE_FORMATS``, copied.
+_SERVER_FORMATS = (
+    "AVIF",
+    "BLP",
+    "BMP",
+    "CUR",
+    "DCX",
+    "DDS",
+    "DIB",
+    "FITS",
+    "FLI",
+    "FTEX",
+    "GBR",
+    "GIF",
+    "ICNS",
+    "ICO",
+    "IM",
+    "IMT",
+    "IPTC",
+    "JPEG",
+    "JPEG2000",
+    "MCIDAS",
+    "MSP",
+    "PCD",
+    "PCX",
+    "PIXAR",
+    "PNG",
+    "PPM",
+    "PSD",
+    "QOI",
+    "SGI",
+    "SPIDER",
+    "SUN",
+    "TGA",
+    "TIFF",
+    "WEBP",
+    "XBM",
+    "XPM",
+    "XVTHUMB",
+)
+
+
+def server_image_size(data: bytes) -> tuple[int, int]:
+    """Width and height of the image *data* holds as a server works from it:
+    turned the way the server turns it, by the server's own steps in the
+    server's order (vLLM 0.32, ``ImageMediaIO.load_bytes``): open, turn
+    upright with Pillow's ``ImageOps.exif_transpose`` and go on with the
+    image as it is where that raises, decode.
+
+    The one place in the package that calls Pillow's own reading of an
+    orientation, and it must.  The framework's reader
+    (:func:`turnstone.core.images.exif_orientation`) is deliberately not
+    Pillow's: it turns a picture whose EXIF holds a tag in a type Pillow
+    fails on, and it reads the EXIF block only.  A server does what Pillow
+    does: it leaves such a picture as it is, and it turns one whose
+    orientation stands outside the EXIF block (in XMP, in a PNG's text).
+    The number of placeholder tokens is the same either way round, so
+    nothing would show that the two disagree, and the record would name
+    the image's grid on its side.  The size is therefore taken with the
+    server's call, and no other.
+
+    No limit of the framework's is applied either (pixels, JPEG scans): the
+    server applied none to an image it rendered, and an image it rendered
+    is sized here.  Raises whatever Pillow raises for bytes it cannot open
+    or decode.
+    """
+    from PIL import Image as _Pil
+    from PIL import ImageOps
+
+    with _Pil.open(io.BytesIO(data), formats=_SERVER_FORMATS) as opened:
+        image: _Pil.Image = opened
+        with contextlib.suppress(Exception):
+            image = ImageOps.exif_transpose(opened)
+        image.load()
+        width, height = image.size
+    return int(width), int(height)
+
+
+def smart_resize(
+    height: int, width: int, factor: int, min_pixels: int, max_pixels: int
+) -> tuple[int, int]:
+    """The height and width the model's image processor resizes an image of
+    *height* by *width* to: both divisible by *factor*, the area within
+    *min_pixels* and *max_pixels*, the proportions kept as nearly as that
+    allows.
+
+    An exact copy of the processor's own function (transformers 5.19,
+    ``models/qwen2_vl/image_processing_qwen2_vl.py``, ``smart_resize``),
+    statement for statement, the refusal of an image more than 200 times
+    longer than wide included.  Not a description of it: a side that rounds
+    to nothing is left at nothing here as it is there, which sends a thin
+    image through the branch for small ones.
+    """
+    if max(height, width) / min(height, width) > 200:
+        raise ValueError(
+            "absolute aspect ratio must be smaller than 200, got "
+            f"{max(height, width) / min(height, width)}"
+        )
+    h_bar = round(height / factor) * factor
+    w_bar = round(width / factor) * factor
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    return h_bar, w_bar
+
+
 @dataclass(frozen=True)
 class ResizeRule:
-    """How a server sizes an image before it cuts it into patches, as far as
-    the number of placeholder tokens shows it: each side is rounded to a
-    multiple of *multiple* pixels, the whole is scaled to hold at least
-    *min_pixels* and at most *max_pixels*, and one token stands for a square
-    of *multiple* pixels.  The rule of the Qwen image processors; a check
-    says whether the server at hand follows it."""
+    """How a server sizes an image before it cuts it into patches: the
+    function of the model's image processor (:func:`smart_resize`) with the
+    processor's numbers.  Each side becomes a multiple of *multiple* pixels,
+    the area is kept within *min_pixels* and *max_pixels*, a patch is a
+    square of *patch* pixels and one token stands for a square of *multiple*.
+    A check holds the server at hand to it on a set of sizes, and a run
+    holds every image to it."""
 
     multiple: int = 32
     min_pixels: int = 65536
@@ -417,17 +567,7 @@ class ResizeRule:
 
     def size(self, width: int, height: int) -> tuple[int, int]:
         """The width and height an image of *width* by *height* is resized to."""
-        m = self.multiple
-        high = max(m, round(height / m) * m)
-        wide = max(m, round(width / m) * m)
-        if high * wide > self.max_pixels:
-            beta = math.sqrt(height * width / self.max_pixels)
-            high = max(m, math.floor(height / beta / m) * m)
-            wide = max(m, math.floor(width / beta / m) * m)
-        elif high * wide < self.min_pixels:
-            beta = math.sqrt(self.min_pixels / (height * width))
-            high = math.ceil(height * beta / m) * m
-            wide = math.ceil(width * beta / m) * m
+        high, wide = smart_resize(height, width, self.multiple, self.min_pixels, self.max_pixels)
         return wide, high
 
     def tokens(self, width: int, height: int) -> int:
@@ -528,20 +668,61 @@ class Vision:
     # The most images one request of a sub-agent carried: counted, not kept.
     # Nothing of a sub-agent is part of the rollout's sequence.
     subagent_images: int = 0
-    # Whether the model itself generated the placeholder token in one of the
-    # session's own turns.
-    generated: bool = False
     # Each image by the text that carried it: decoded and hashed once.
     _known: dict[str, Image] = field(default_factory=dict)
+    # What the server makes of each image, by the hash of its bytes: sized
+    # once, by the server's own steps.
+    _sizes: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def images_of(self, messages: Sequence[Mapping[str, Any]]) -> list[Image]:
         """The images a request's messages carry, in order."""
         return images_of(messages, self._known)
 
-    def note_generated(self, tokens: Sequence[int]) -> None:
-        """Note what one of the session's own replies holds."""
-        if self.route.placeholder in tokens:
-            self.generated = True
+    def _sized(self, assembly: PromptAssembly, image: Image, length: int) -> None:
+        """Size *image* here, by the server's own steps, and hold the result
+        against the *length* placeholder tokens the server rendered it as.
+
+        The sizing here is the server's own code (:func:`server_image_size`,
+        :func:`smart_resize`) with the numbers a check held the server to.
+        So another number of tokens than the server's, or an image the
+        server rendered that cannot be sized here, is no property of the
+        image: the code here is not the server's (another version of a
+        library, another processor).  The record could not say what the
+        server made of the image, and nothing says the next one would fare
+        better, so it is the harness's alarm."""
+        sized = self._sizes.get(image.sha256)
+        if sized is None:
+            rule = self.route.resize
+            try:
+                width, height = server_image_size(image.data)
+                wide, high = rule.size(width, height)
+            except Exception as error:
+                assembly.fault = (
+                    f"an image the server rendered as {length} placeholder tokens could not be "
+                    f"sized here ({type(error).__name__}: {str(error)[:200]}): the image code "
+                    "here is not the server's"
+                )
+                raise HarnessFaultError(assembly.fault) from None
+            sized = {
+                "width": width,
+                "height": height,
+                "tokens": (wide // rule.multiple) * (high // rule.multiple),
+                "processed": {
+                    "width": wide,
+                    "height": high,
+                    # Frames, rows and columns of patches, before they are merged.
+                    "grid": [1, high // rule.patch, wide // rule.patch],
+                },
+            }
+            self._sizes[image.sha256] = sized
+        if sized["tokens"] != length:
+            assembly.fault = (
+                f"an image of {sized['width']}x{sized['height']} stands as {length} placeholder "
+                f"tokens in the server's rendering, and the sizing here gives {sized['tokens']}: "
+                "the image code here is not the server's, or the server's image processor is "
+                "not the one the check before the run found"
+            )
+            raise HarnessFaultError(assembly.fault)
 
     def start(
         self,
@@ -558,18 +739,25 @@ class Vision:
         model = str(request.get("model"))
         arguments = template_arguments(request)
         try:
-            places = find_places(prompt, len(images), self.route.placeholder, self.route.frame)
+            # A placeholder token in a turn the model generated is the model's
+            # own doing (``PlaceholderGeneratedError``, which goes on up).  A
+            # sub-agent's prompt is a rendering throughout, so nothing in it
+            # is taken for generated.
+            places = find_places(
+                prompt,
+                len(images),
+                self.route.placeholder,
+                self.route.frame,
+                assembly.generated if call.scope == PARENT else (),
+            )
         except PromptAssemblyError as misplaced:
             # The environment's text holds no placeholder token: it is read as
-            # plain text.  So either the model generated one, which is its
-            # own doing, or this code is at fault.
-            if call.scope == PARENT and self.generated:
-                raise PlaceholderGeneratedError(
-                    "the model generated the token an image is rendered as, and the server "
-                    f"would give a later image to it ({misplaced})"
-                ) from None
+            # plain text.  What stands outside the model's own turns was
+            # written by the template and by this code.
             assembly.fault = f"an image has no place in a prompt the harness built: {misplaced}"
             raise HarnessFaultError(assembly.fault) from None
+        for image, (_start, length) in zip(images, places, strict=True):
+            self._sized(assembly, image, length)
         if call.scope == PARENT:
             self._keep(images, places)
         else:
@@ -666,27 +854,14 @@ class Vision:
                     f"image {index}: the final sequence does not hold its placeholder tokens "
                     f"at {placed.start}..{end}"
                 )
-            width, height = image_size(image.data)
-            processed: dict[str, Any] | None = None
-            rule = self.route.resize
-            if not width or not height:
+            # Sized when it was first sent, and held against its run then.
+            sized = self._sizes.get(image.sha256) or {}
+            if sized.get("tokens") != placed.length:
                 problems.append(
-                    f"image {index}: its size could not be read here, so the record cannot "
-                    "say what the server made of it"
+                    f"image {index}: what the server made of it is not known here, so the "
+                    "record cannot say it"
                 )
-            elif rule.tokens(width, height) != placed.length:
-                problems.append(
-                    f"image {index}: {width}x{height} stands as {placed.length} placeholder "
-                    f"tokens, and the server's resize rule gives {rule.tokens(width, height)}"
-                )
-            else:
-                wide, high = rule.size(width, height)
-                processed = {
-                    "width": wide,
-                    "height": high,
-                    # Frames, rows and columns of patches, before they are merged.
-                    "grid": [1, high // rule.patch, wide // rule.patch],
-                }
+                sized = {}
             entries.append(
                 {
                     "index": index,
@@ -694,13 +869,13 @@ class Vision:
                     "file": image.file,
                     "media_type": image.media_type,
                     "bytes": len(image.data),
-                    "width": width,
-                    "height": height,
+                    "width": sized.get("width"),
+                    "height": sized.get("height"),
                     # Where its placeholder tokens stand in the final sequence.
                     "start": placed.start,
                     "end": end,
                     "tokens": placed.length,
-                    "processed": processed,
+                    "processed": sized.get("processed"),
                     # The first call whose prompt holds it.
                     "first_call": next(n for n, size in enumerate(prompt_lens) if size >= end),
                     "source": _source(sources, index, image),
@@ -733,27 +908,6 @@ def _source(
     if source is None or source.get("sha256") not in (None, image.sha256):
         return None
     return {name: value for name, value in source.items() if name != "sha256"}
-
-
-def image_size(data: bytes) -> tuple[int | None, int | None]:
-    """Width and height of the image *data* holds, turned the way its
-    orientation tag says: the size a server works from, which turns the image
-    upright before it resizes it."""
-    try:
-        from PIL import Image as _Pil
-
-        from turnstone.core.images import exif_orientation, too_many_jpeg_scans
-
-        if too_many_jpeg_scans(data):
-            return None, None
-        with _Pil.open(io.BytesIO(data)) as opened:
-            width, height = opened.size
-            # Orientations 5 to 8 lay the picture on its side.
-            if exif_orientation(opened) >= 5:
-                width, height = height, width
-            return int(width), int(height)
-    except Exception:
-        return None, None
 
 
 def write_image(folder: str | None, image: Image) -> str | None:
@@ -840,8 +994,18 @@ def png(width: int, height: int, colour: tuple[int, int, int]) -> bytes:
 
 
 # The sizes whose placeholder counts a check asks for: small ones the server
-# scales up, sides it has to round, a common screen, and one above any limit.
-_SIZES = ((64, 64), (37, 53), (640, 480), (801, 601), (1280, 800), (390, 844), (5000, 4000))
+# scales up, sides it has to round, a common screen, one above any limit, and
+# a strip so thin that one side rounds to nothing.
+_SIZES = (
+    (64, 64),
+    (37, 53),
+    (640, 480),
+    (801, 601),
+    (1280, 800),
+    (390, 844),
+    (5000, 4000),
+    (2400, 12),
+)
 _RED, _BLUE = (220, 30, 30), (30, 60, 220)
 _QUESTION = "What colour fills this image? Answer with one word."
 # Positions at which the two routes' distributions are compared.
@@ -863,6 +1027,12 @@ _CHECK_TOOL = {
         },
     },
 }
+
+
+def _pillow_version() -> str:
+    import PIL
+
+    return str(PIL.__version__)
 
 
 def _status_words(error: BaseException) -> str:
@@ -901,9 +1071,12 @@ def check_vision_route(
       distribution as the completions route at the same place.
 
     ``sizes`` lists how many placeholder tokens the server gives images of a
-    few sizes, and ``resize_rule`` the rule those counts follow.  A server
-    whose counts do not follow the rule known here fails the check: the
-    record could not say what such a server makes of an image.
+    few sizes, and ``resize_rule`` the numbers of the model's image
+    processor those counts follow.  A server whose counts are not what the
+    sizing on this side gives (:func:`server_image_size`,
+    :func:`smart_resize`) fails the check: the record could not say what
+    such a server makes of an image.  A run then holds every image to the
+    same sizing, and a difference there is the harness's alarm.
     """
     from turnstone.rollout.probe import sampler_logprobs_reported
 
@@ -1001,27 +1174,39 @@ def check_vision_route(
     checks["image_is_a_run_of_one_token"] = True
 
     # 3. How many tokens images of a few sizes take, and the rule behind it.
+    # The sizing a run does for every image, done here for each of them.
+    rule = ResizeRule()
+    samples = [Image.of(png(width, height, _BLUE), "image/png") for width, height in _SIZES]
     sizes: list[dict[str, int]] = []
     try:
-        for width, height in _SIZES:
-            ids = rendered(shows(Image.of(png(width, height, _BLUE), "image/png")))
+        for (width, height), sample in zip(_SIZES, samples, strict=True):
+            ids = rendered(shows(sample))
             sizes.append({"width": width, "height": height, "tokens": ids.count(placeholder)})
     except Exception as error:
         return failed(
             f"the tokenize route does not render every image size ({_status_words(error)})"
         )
     verdict["sizes"] = sizes
-    rule = ResizeRule()
-    for size in sizes:
-        by_rule = rule.tokens(size["width"], size["height"])
+    try:
+        here = [rule.tokens(*server_image_size(sample.data)) for sample in samples]
+    except Exception as error:
+        return failed(
+            "the images of the check could not be sized on this side "
+            f"({type(error).__name__}: {str(error)[:200]})"
+        )
+    for size, by_rule in zip(sizes, here, strict=True):
         if by_rule != size["tokens"]:
             return failed(
-                "the server does not size images by the rule known here (sides rounded to "
-                f"multiples of {rule.multiple}, the area kept within {rule.min_pixels} to "
-                f"{rule.max_pixels} pixels): {size['width']}x{size['height']} takes "
-                f"{size['tokens']} placeholder tokens, the rule gives {by_rule}"
+                "the server does not size images as the model's image processor does with the "
+                f"numbers known here (sides made multiples of {rule.multiple}, the area kept "
+                f"within {rule.min_pixels} to {rule.max_pixels} pixels): "
+                f"{size['width']}x{size['height']} takes {size['tokens']} placeholder tokens, "
+                f"the sizing here gives {by_rule}"
             )
     verdict["resize_rule"] = rule.describe()
+    # The library the images are opened and turned with on this side: a
+    # server turns an image with its own copy of it.
+    verdict["sized_with"] = {"pillow": _pillow_version()}
 
     # 4. The generate route expands the placeholders to the very rendering.
     red = Image.of(png(96, 96, _RED), "image/png")

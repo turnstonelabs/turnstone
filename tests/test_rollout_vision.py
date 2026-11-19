@@ -43,6 +43,7 @@ from turnstone.rollout.settings import SetupError
 from turnstone.rollout.tokens import build_token_record, rebuild_final
 from turnstone.rollout.vision import (
     Image,
+    PlaceholderGeneratedError,
     ResizeRule,
     Vision,
     VisionRoute,
@@ -50,10 +51,11 @@ from turnstone.rollout.vision import (
     collapsed,
     find_places,
     generate_body,
-    image_size,
     image_sources,
     images_of,
     png,
+    server_image_size,
+    smart_resize,
     take_generate,
     write_image,
 )
@@ -123,8 +125,9 @@ class TestTheImagesOfARequest:
             images_of([message])
 
     def test_the_png_made_for_the_check_is_an_image(self) -> None:
-        assert image_size(png(40, 24, (1, 2, 3))) == (40, 24)
-        assert image_size(b"no image") == (None, None)
+        assert server_image_size(png(40, 24, (1, 2, 3))) == (40, 24)
+        with pytest.raises(OSError):
+            server_image_size(b"no image")
 
     def test_an_images_data_does_not_count_as_prompt_text(self) -> None:
         """Its size in bytes says nothing about the tokens it becomes."""
@@ -150,7 +153,7 @@ class TestThePlacesOfTheImages:
     def test_a_placeholder_that_is_no_images_before_an_image_is_refused(self) -> None:
         """The server would give the image to the first placeholder it finds."""
         prompt = [1, PAD, 7, IMAGE, PAD, PAD, PAD, IMAGE_END]
-        with pytest.raises(PromptAssemblyError, match="no image's stands at position 1"):
+        with pytest.raises(PromptAssemblyError, match="did not generate stands at position 1"):
             find_places(prompt, 1, PAD, FRAME)
 
     def test_another_number_of_places_than_images_is_refused(self) -> None:
@@ -159,6 +162,31 @@ class TestThePlacesOfTheImages:
             find_places(prompt, 1, PAD, FRAME)
         with pytest.raises(PromptAssemblyError, match="0 places .* 1 images"):
             find_places([1, 2, 3], 1, PAD, FRAME)
+
+    def test_a_placeholder_the_model_generated_before_an_image_is_the_models_doing(self) -> None:
+        """Only one that stands in a stretch the model generated: the same
+        token anywhere else was written by the template or by the harness."""
+        prompt = [1, PAD, 7, IMAGE, PAD, PAD, PAD, IMAGE_END]
+        with pytest.raises(PlaceholderGeneratedError, match="position 1 of the sequence"):
+            find_places(prompt, 1, PAD, FRAME, [(1, 3)])
+        # Whatever the model wrote around it: a place the model spelled out
+        # token by token is no place of an image.
+        spelled = [1, IMAGE, PAD, IMAGE_END, 7, IMAGE, PAD, PAD, IMAGE_END]
+        with pytest.raises(PlaceholderGeneratedError):
+            find_places(spelled, 1, PAD, FRAME, [(1, 4)])
+        # After the last image the server gives it nothing: the prompt is sent.
+        late = [1, IMAGE, PAD, PAD, IMAGE_END, 7, IMAGE, PAD, IMAGE_END, PAD]
+        assert find_places(late, 1, PAD, FRAME, [(6, 10)]) == [(2, 2)]
+
+    def test_a_stray_placeholder_outside_what_the_model_generated_is_not_the_models(self) -> None:
+        """The model generated one somewhere, and another stands where it
+        generated nothing: that one is not explained by the model."""
+        prompt = [1, PAD, 7, PAD, 8, IMAGE, PAD, PAD, IMAGE_END]
+        with pytest.raises(PromptAssemblyError, match="did not generate stands at position 1"):
+            find_places(prompt, 1, PAD, FRAME, [(3, 5)])
+        # A place that is missing outside the model's turns is not explained either.
+        with pytest.raises(PromptAssemblyError, match="0 places .* 1 images"):
+            find_places([1, PAD, 7], 1, PAD, FRAME, [(1, 2)])
 
 
 class TestTheRequest:
@@ -225,6 +253,104 @@ class TestTheResizeRule:
         assert rule.size(1920, 1080) == (1920, 1088)
         assert rule.size(128, 128) == (256, 256)
 
+    def test_it_is_the_processors_own_function_also_where_a_side_rounds_to_nothing(self) -> None:
+        """A strip 12 pixels high: its height rounds to no multiple of 32 at
+        all, the area counts as nothing, and the processor scales the image
+        up from its true size.  A rule that put a least side in first gave
+        75 tokens for it; the processor gives 114."""
+        assert smart_resize(12, 2400, 32, 65536, 16777216) == (32, 3648)
+        assert ResizeRule().tokens(2400, 12) == 114
+        # As the processor: more than 200 times longer than wide is refused.
+        with pytest.raises(ValueError, match="aspect ratio"):
+            smart_resize(10, 2400, 32, 65536, 16777216)
+
+
+def _turned_pictures() -> dict[str, bytes]:
+    """One picture, 48 by 16, as files that say in different places that it
+    is to be shown turned on its side."""
+    import io
+    import struct
+
+    from PIL import Image as Pil
+    from PIL import PngImagePlugin
+
+    from tests._exif_helpers import exif_block, jpeg_with_exif, orientation_entry, png_with_exif
+
+    picture = Pil.new("RGB", (48, 16), (10, 20, 30))
+
+    def saved(fmt: str, **options: Any) -> bytes:
+        out = io.BytesIO()
+        picture.save(out, fmt, **options)
+        return out.getvalue()
+
+    exif = Pil.Exif()
+    exif[0x0112] = 6
+    xmp = (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description tiff:Orientation="6"/>'
+        "</rdf:RDF></x:xmpmeta>"
+    )
+    text = PngImagePlugin.PngInfo()
+    text.add_itxt("XML:com.adobe.xmp", xmp)
+    turned = exif_block([orientation_entry(6)])
+    # A second tag stored in a type Pillow's rewriting of the EXIF fails on.
+    resolution_unit = (0x0128, 4, 1, struct.pack("<L", 70000))
+    return {
+        "plain": saved("PNG"),
+        "exif in a jpeg": saved("JPEG", exif=exif),
+        "exif in a png": saved("PNG", exif=exif),
+        "exif in a webp": saved("WEBP", exif=exif, lossless=True),
+        "exif after a png's pixels": png_with_exif(turned, picture, after_pixels=True),
+        "xmp only, in a png": saved("PNG", pnginfo=text),
+        "xmp only, in a jpeg": saved("JPEG", xmp=xmp.encode("ascii")),
+        "oddly typed exif": jpeg_with_exif(
+            exif_block([orientation_entry(6), resolution_unit]), picture
+        ),
+    }
+
+
+class TestTheSizeAServerWorksFrom:
+    """The size is taken by the server's own steps: Pillow's reading of an
+    orientation, wherever Pillow finds one, and the image as it is where
+    Pillow's turning fails."""
+
+    def test_it_is_what_pillows_own_turning_gives(self) -> None:
+        import io
+
+        from PIL import Image as Pil
+        from PIL import ImageOps
+
+        pictures = _turned_pictures()
+        for name, data in pictures.items():
+            with Pil.open(io.BytesIO(data)) as opened:
+                try:
+                    expected = ImageOps.exif_transpose(opened).size
+                except Exception:
+                    expected = opened.size
+            assert server_image_size(data) == expected, name
+        assert server_image_size(pictures["plain"]) == (48, 16)
+        # Turned, wherever the file says so: in its EXIF, or outside it.
+        for name in ("exif in a jpeg", "exif in a png", "exif in a webp", "xmp only, in a png"):
+            assert server_image_size(pictures[name]) == (16, 48), name
+
+    def test_the_frameworks_own_reader_is_not_the_servers(self) -> None:
+        """Why the size is not taken with the framework's reader: it reads
+        the EXIF block only, so an image turned by its XMP is upright to it,
+        and the record would name the grid a server made of it on its side
+        with the very same number of tokens."""
+        import io
+
+        from PIL import Image as Pil
+
+        from turnstone.core.images import exif_orientation
+
+        data = _turned_pictures()["xmp only, in a png"]
+        with Pil.open(io.BytesIO(data)) as opened:
+            assert exif_orientation(opened) == 1
+        assert server_image_size(data) == (16, 48)
+        rule = ResizeRule()
+        assert rule.tokens(16, 48) == rule.tokens(48, 16)
+        assert rule.size(16, 48) != rule.size(48, 16)
+
 
 class TestTheCheck:
     def check(self, **faults: Any) -> dict[str, Any]:
@@ -282,7 +408,7 @@ class TestTheCheck:
             ({"tokenize_status": 404}, "the tokenize route does not render messages"),
             # A server that sizes images another way: the record could not say
             # what it makes of one.
-            ({"own_image_sizes": True}, "does not size images by the rule known here"),
+            ({"own_image_sizes": True}, "does not size images as the model's image processor does"),
         ],
     )
     def test_a_server_that_cannot_is_told_why(self, fault: dict[str, Any], reason: str) -> None:
@@ -557,6 +683,24 @@ class TestPromptsWithImages:
         assert take_generate(call, "no object") is None
         assert call.unreadable is not None and call.aligned is False
 
+    def test_a_part_whose_values_cannot_be_read_costs_the_call_no_token(self) -> None:
+        """The IDs are the call's as soon as they are read: a value after
+        them that cannot be read costs the log-probabilities, not a token the
+        next prompt would then be built without."""
+        call = CallRecord(index=0, streamed=True, request={})
+        part = {"choices": [{"index": 0, "token_ids": [5, 6], "text": "ab", "logprobs": {"content": [7, 8]}}]}  # fmt: skip
+        assert take_generate(call, part) is None
+        assert call.token_ids == [5, 6] and call.unreadable is not None
+        assert call.aligned is False and call.logprobs == []
+
+    def test_places_that_cannot_be_read_are_not_the_places_that_were_sent(self) -> None:
+        call = CallRecord(index=0, streamed=True, request={}, route="generate")
+        call.prompt_sent, call.placeholders_sent = [1, 2, 3], [[1, 1]]
+        part = {"prompt_token_ids": [1, 2, 3], "mm_placeholders": {"image": [{"offset": "x"}]}}
+        assert take_generate(call, part) is None
+        assert call.placeholders_differ is True and call.unreadable is not None
+        assert "did not place the images" in " ".join(call.problems())
+
 
 class TestThePromptsLength:
     def test_the_servers_speed_is_held_against_the_tokens_sent_not_the_bytes(self) -> None:
@@ -740,7 +884,7 @@ class TestWholeRollouts:
         [
             # The image check of the server did not pass.
             ({}, {"generate_status": 403}, "--enable-scale-out"),
-            ({}, {"own_image_sizes": True}, "does not size images by the rule"),
+            ({}, {"own_image_sizes": True}, "does not size images as the model's image processor"),
             # Plain text is off.
             ({"plain_text": False}, {}, "needs the conversation's text read as plain text"),
             # No folder for the images.
@@ -886,19 +1030,38 @@ class TestWholeRollouts:
             with pytest.raises(SetupError, match="template_arguments missing"):
                 _run(server, plain_text_verdict=unsaid, **handed)
 
-    def test_an_image_whose_size_is_not_the_rules_makes_the_record_untrainable(
+    def test_sizing_that_is_not_the_servers_is_a_harness_fault(
         self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Never a record that is trainable and does not say what the server
-        made of an image."""
+        """The sizing here is the server's own code.  Another number of
+        tokens than the server's, or an image the server rendered that cannot
+        be sized here, is no property of an image: the run stops, loudly,
+        before the request with the image goes out."""
         import turnstone.rollout.vision as vision_module
 
-        for size, why in (((None, None), "its size could not be read"), ((640, 480), "resize rule gives")):  # fmt: skip
-            monkeypatch.setattr(vision_module, "image_size", lambda _data, size=size: size)
+        real = vision_module.server_image_size
+
+        # The run's own image only: the images of the check before the run
+        # are sized as they are.
+        def other(data: bytes) -> tuple[int, int]:
+            return (640, 480) if data == RED.data else real(data)
+
+        def cannot(data: bytes) -> tuple[int, int]:
+            if data == RED.data:
+                raise OSError("cannot identify image file")
+            return real(data)
+
+        for sizing, why in (
+            (other, "the sizing here gives 300"),
+            (cannot, "could not be sized here (OSError: cannot identify image file)"),
+        ):
+            monkeypatch.setattr(vision_module, "server_image_size", sizing)
             record = self.run(tmp_path, image_dir=str(tmp_path / "i"))
-            assert record["trainable"] is False and record["finish_state"] == "completed"
-            assert any(why in said for said in record["problems"])
-            assert all(image["processed"] is None for image in record["vision"]["images"])
+            assert record["finish_state"] == "harness_fault", record["error"]
+            assert why in record["error"] and cli._status(record) == cli.FAULT
+            assert record["trainable"] is False and record["vision"]["images"] == []
+            # The request with the run's image never went out.
+            assert not [r for r in self.generate_requests if RED.url in json.dumps(r)]
 
     def test_a_sub_agent_sees_the_image_too_and_none_of_it_is_the_rollouts(
         self, tmp_path: Any
@@ -1159,3 +1322,114 @@ class TestTheCommand:
         assert os.listdir(str(out) + ".images") == [RED.sha256 + ".png"]
         # What the probe said of plain text is not passed on as the probe's own.
         assert "plain_text" not in record["logprobs"]
+
+    def test_a_probe_from_a_tokenizer_file_without_images_drives_a_rollout_without_them(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """What a text-only gym runs: the probe is handed the model's
+        tokenizer file and --no-vision, and each rollout --no-vision and the
+        probe's file.  Plain text is applied, nothing is asked about images."""
+        described = tmp_path / "tokenizer_config.json"
+        decoder = {str(token): {"content": text} for text, token in ADDED_TOKENS.items()}
+        described.write_text(json.dumps({"added_tokens_decoder": decoder}))
+        server_json = tmp_path / "server.json"
+        out = tmp_path / "episode.json"
+        with ScriptedChatServer(LOOK, sampler_logprobs=True, **SERVED) as server:
+            base = ["--base-url", server.base_url, "--model", "m", "--top-k", "20", "--top-p", "0.95",
+                    "--token-id-prompts", "--no-vision"]  # fmt: skip
+            probed = cli.main(
+                [
+                    *base,
+                    "--probe-only",
+                    "--tokenizer-info",
+                    str(described),
+                    "--out",
+                    str(server_json),
+                ]
+            )
+            verdict = json.loads(server_json.read_text())
+            real = cli.run_episode
+            monkeypatch.setattr(
+                cli,
+                "run_episode",
+                lambda task, config, **check: real(
+                    task,
+                    config,
+                    sandbox_factory=lambda _t, _c: _ImageSandbox(),
+                    allow_host_execution=True,
+                    **check,
+                ),
+            )
+            status = cli.main(
+                [*base, "--prompt", "look at shot.png", "--context-window", "200000",
+                 "--sampler-logprobs", "@" + str(server_json), "--token-id-route", "@" + str(server_json),
+                 "--out", str(out)]
+            )  # fmt: skip
+            asked = len(server.generate_requests)
+            # The same file without --no-vision: refused, it asked nothing about images.
+            refused = cli.main(
+                [*base[:-1], "--prompt", "look at shot.png", "--context-window", "200000",
+                 "--sampler-logprobs", "@" + str(server_json), "--token-id-route", "@" + str(server_json),
+                 "--out", str(tmp_path / "never.json")]
+            )  # fmt: skip
+        assert probed == 0 and "vision" not in verdict["route"]
+        assert verdict["plain_text"]["tokenizer_info"] == {
+            "source": "named",
+            "compared_with_server": True,
+        }
+        record = json.loads(out.read_text())
+        assert status == 0 and asked == 0 and refused == cli.REFUSED
+        assert record["trainable"] is True and record["one_sequence"] is True
+        assert record["plain_text"]["applied"] is True
+        assert record["vision"] == {"applied": False, "reason": "switched off"}
+        assert record["control_text_escape"]["applied"] is False
+        assert not os.path.exists(str(out) + ".images")
+
+    @pytest.mark.parametrize("layout", [1, 3, "2", True, None])
+    def test_a_file_laid_out_by_another_build_is_refused_by_both_flags(
+        self, tmp_path: Any, capsys: Any, layout: Any
+    ) -> None:
+        """Both readers go by the layout's number: the one this build writes
+        is read, a file without the key is read as an earlier build wrote
+        it, and any other number is refused, whatever else the file holds."""
+        status, verdict, _asked = self.probe(tmp_path, "--tokenizer-info", "server")
+        assert status == 0
+        capsys.readouterr()
+        other = tmp_path / "other.json"
+        # Everything a reader could go by is there, twice over: under this
+        # build's keys and where an earlier build kept it.
+        other.write_text(
+            json.dumps(
+                {
+                    **verdict["probe"],
+                    "token_id_route": verdict["route"],
+                    **verdict,
+                    "server_check": layout,
+                }
+            )
+        )
+        base = ["--base-url", "http://127.0.0.1:9/v1", "--model", "m", "--prompt", "p",
+                "--token-id-prompts", "--no-vision", "--no-plain-text"]  # fmt: skip
+        for flags in (
+            ["--sampler-logprobs", f"@{other}"],
+            ["--sampler-logprobs", "yes", "--token-id-route", f"@{other}"],
+        ):
+            assert cli.main([*base, *flags]) == cli.REFUSED
+            said = capsys.readouterr().err
+            assert "made by another build" in said and flags[-2] in said
+
+    def test_a_parameter_the_generate_route_has_no_place_for_is_refused_before_anything_is_asked(
+        self, tmp_path: Any
+    ) -> None:
+        """It is known from the run's own settings, so the server is asked
+        nothing for a run that will be refused."""
+        with ScriptedChatServer(LOOK, sampler_logprobs=True, **SERVED) as server:
+            with pytest.raises(SetupError, match="'guided_json' has no place"):
+                _run(
+                    server,
+                    sandbox=_ImageSandbox(),
+                    **{**SEES, "image_dir": str(tmp_path / "i")},
+                    extra_body={"top_k": 20, "top_p": 0.95, "guided_json": {"type": "object"}},
+                )
+            assert server.requests == [] and server.tokenize_requests == []
+            assert server.generate_requests == [] and server.version_requests == []

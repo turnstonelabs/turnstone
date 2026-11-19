@@ -24,10 +24,12 @@ from tests._scripted_chat_server import (
 )
 from tests.test_rollout_episode import _no_configuration_file, _run  # noqa: F401
 from tests.test_rollout_idprompt import MESSAGES, ROUTE, STEP, TOOLS, ask, make_client, turn_of
+from turnstone.core.control_text import added_tokens_of, can_meet
+from turnstone.core.text_walk import apply_edits
 from turnstone.rollout import cli
 from turnstone.rollout.episode import Task
 from turnstone.rollout.idprompt import PromptAssembly, check_plain_text
-from turnstone.rollout.plaintext import HarnessFaultError, PlainText, added_tokens_of, can_meet
+from turnstone.rollout.plaintext import HarnessFaultError, PlainText
 from turnstone.rollout.recording import RecordingClient
 from turnstone.rollout.settings import SetupError
 from turnstone.rollout.tokens import build_token_record, rebuild_final
@@ -58,13 +60,25 @@ class TestCutAndStrip:
 
     def test_the_stand_in_goes_after_the_first_character_of_every_text(self) -> None:
         seen: Counter[str] = Counter()
+        text = "a <end> b <end><think>"
         assert (
-            PLAIN.cut("a <end> b <end><think>", seen)
+            apply_edits(text, PLAIN.cut_edits(text, seen))
             == "a <<spare>end> b <<spare>end><<spare>think>"
         )
         assert seen == {"<end>": 2, "<think>": 1}
         # The stand-in's own text is a text like any other.
-        assert PLAIN.cut("<spare>", Counter()) == "<<spare>spare>"
+        assert apply_edits("<spare>", PLAIN.cut_edits("<spare>", Counter())) == "<<spare>spare>"
+
+    def test_a_cut_in_a_key_of_a_text_part_is_counted_once(self) -> None:
+        """A text part can hold more than its text.  A key of it that is a
+        token's text is cut once and counted once: a cut counted twice would
+        let one stand-in token too many pass the alarm."""
+        part = {"type": "text", "text": "plain", "<end>": "<pad>"}
+        cut = PLAIN.swap([{"role": "user", "content": [part]}], None)
+        assert cut.per_message == [2] and cut.environment == {"<end>": 1, "<pad>": 1}
+        assert cut.messages[0]["content"] == [
+            {"type": "text", "text": "plain", "<<spare>end>": "<<spare>pad>"}
+        ]
 
     def test_every_text_of_a_conversation_is_cut_wherever_it_stands(self) -> None:
         conversation = [
@@ -240,7 +254,9 @@ class TestCutAndStrip:
 class TestTheCheck:
     def test_it_is_established_from_the_tokens_the_caller_names(self) -> None:
         with ScriptedChatServer([STEP], **OWN) as server:
-            found = check_plain_text(make_client(server), "m", added_tokens=ADDED_TOKENS)
+            found = check_plain_text(
+                make_client(server), "m", uncompared=True, added_tokens=ADDED_TOKENS
+            )
             endpoint = server.base_url
         assert found["ok"] is True and found["reason"] is None
         # The one token the template writes nowhere.
@@ -251,6 +267,31 @@ class TestTheCheck:
         assert found["model"] == "m" and found["endpoint"] == endpoint.rstrip("/")
         assert PlainText.from_verdict(found).stand_in_id == SPARE
         assert json.loads(json.dumps(found)) == found
+
+    def test_the_checks_own_conversation_holds_the_texts_wherever_a_conversation_can(self) -> None:
+        """In a system message, a user message, a tool's description, a tool
+        result and both parts of a content list of two text parts, with one
+        text begun in the first part and ended in the second: each of them
+        cut, none of them left as the token's text."""
+        with ScriptedChatServer([STEP], tokenizer_info=True, **OWN) as server:
+            found = check_plain_text(make_client(server), "m", added_tokens=ADDED_TOKENS)
+            loaded = [r for r in server.tokenize_requests if "<<spare>" in json.dumps(r.get("messages"))][-1]  # fmt: skip
+        assert found["ok"] is True
+        every = " ".join("<<spare>" + text[1:] for text in found["texts"])
+        by_role = {m["role"]: m["content"] for m in loaded["messages"] if m["role"] != "user"}
+        users = [m["content"] for m in loaded["messages"] if m["role"] == "user"]
+        assert every in by_role["system"] and every in by_role["tool"]
+        assert every in loaded["tools"][0]["function"]["description"]
+        assert isinstance(users[0], str) and every in users[0]
+        first, second = users[1]
+        assert every in first["text"] and every in second["text"]
+        # The text that begins in one part and ends in the other is cut in the
+        # part it begins in.
+        split = max(found["texts"], key=len)
+        half = len(split) // 2
+        assert first["text"].endswith(" <<spare>" + split[1:half])
+        assert second["text"].startswith(split[half:] + " ")
+        assert split not in first["text"] + second["text"]
 
     def test_it_is_established_from_what_the_server_says_when_that_is_asked_for(self) -> None:
         with ScriptedChatServer([STEP], tokenizer_info=True, **OWN) as server:
@@ -265,7 +306,7 @@ class TestTheCheck:
     def test_a_token_the_server_does_not_write_for_its_text_is_left_out(self) -> None:
         named = {**ADDED_TOKENS, "<nothing>": 999}
         with ScriptedChatServer([STEP], **OWN) as server:
-            found = check_plain_text(make_client(server), "m", added_tokens=named)
+            found = check_plain_text(make_client(server), "m", uncompared=True, added_tokens=named)
         assert found["ok"] is True and found["left_out"] == ["<nothing>"]
 
     def test_a_description_of_another_tokenizer_fails_it(self) -> None:
@@ -273,7 +314,7 @@ class TestTheCheck:
         the file is not of this server's tokenizer."""
         stale = {**ADDED_TOKENS, "<end>": ADDED_TOKENS["<think>"]}
         with ScriptedChatServer([STEP], **OWN) as server:
-            found = check_plain_text(make_client(server), "m", added_tokens=stale)
+            found = check_plain_text(make_client(server), "m", uncompared=True, added_tokens=stale)
         assert found["ok"] is False and "not of this server's tokenizer" in found["reason"]
         assert "'<end>'" in found["reason"]
 
@@ -286,6 +327,7 @@ class TestTheCheck:
                 found = check_plain_text(
                     client,
                     "m",
+                    uncompared=True,
                     added_tokens=partial,
                     written=[*ROUTE.marker_ids.values(), *ROUTE.closing, *ROUTE.generation_prompt],
                     required=[*ROUTE.marker_ids.values(), ROUTE.closing[0]],
@@ -305,16 +347,62 @@ class TestTheCheck:
             other = check_plain_text(make_client(server), "m", added_tokens=ADDED_TOKENS)
         assert other["ok"] is False and "is not the server's own" in other["reason"]
         assert "'<extra>'" in other["reason"]
-        # A server that offers none: said, and no failure.
+
+    def test_a_description_that_cannot_be_compared_does_not_pass_unless_that_is_accepted(
+        self,
+    ) -> None:
+        """A file that is stale or leaves a token out reads that token's text
+        as a control token, and nothing the template shows need give it away.
+        On a server that offers nothing to hold the file against, the check
+        fails, loudly, unless the caller takes the file as it is."""
         with ScriptedChatServer([STEP], **OWN) as server:
             unasked = check_plain_text(make_client(server), "m", added_tokens=ADDED_TOKENS)
-        assert unasked["ok"] is True and unasked["tokenizer_info"]["compared_with_server"] is False
+            taken = check_plain_text(
+                make_client(server), "m", added_tokens=ADDED_TOKENS, uncompared=True
+            )
+        assert unasked["ok"] is False and "could not be compared" in unasked["reason"]
+        assert "--tokenizer-info-uncompared" in unasked["reason"]
+        assert unasked["tokenizer_info"] == {
+            "source": "named",
+            "compared_with_server": False,
+            "why_not": "the server does not offer /tokenizer_info (404)",
+            "accepted_uncompared": False,
+        }
+        assert taken["ok"] is True
+        assert taken["tokenizer_info"] == {**unasked["tokenizer_info"], "accepted_uncompared": True}
+        # A token left out of the file, one the template does not write: what
+        # the comparison is for.  Uncompared it passes, and that is what the
+        # caller accepted.
+        partial = {text: token for text, token in ADDED_TOKENS.items() if text != "<pad>"}
+        with ScriptedChatServer([STEP], **OWN) as server:
+            passes = check_plain_text(
+                make_client(server), "m", added_tokens=partial, uncompared=True
+            )
+        with ScriptedChatServer([STEP], tokenizer_info=True, **OWN) as server:
+            caught = check_plain_text(make_client(server), "m", added_tokens=partial)
+        assert passes["ok"] is True and "<pad>" not in passes["texts"]
+        assert caught["ok"] is False and "'<pad>'" in caught["reason"]
+
+    @pytest.mark.parametrize("status", [500, 503, 401])
+    def test_only_a_404_means_the_server_does_not_offer_its_description(self, status: int) -> None:
+        """Any other failure to get it says nothing about the server's
+        tokens: the check fails, whatever the caller accepts, and never
+        passes as "not compared"."""
+        with ScriptedChatServer([STEP], tokenizer_info_status=status, **OWN) as server:
+            client = make_client(server)
+            named = check_plain_text(client, "m", added_tokens=ADDED_TOKENS, uncompared=True)
+            asked = check_plain_text(client, "m")
+        for found in (named, asked):
+            assert found["ok"] is False and "could not be had" in found["reason"]
+            assert f"{status}" in found["reason"]
+            assert found["tokenizer_info"]["asked"] is False
 
     def test_the_verdict_names_the_template_arguments_it_was_made_with(self) -> None:
         with ScriptedChatServer([STEP], **OWN) as server:
             found = check_plain_text(
                 make_client(server),
                 "m",
+                uncompared=True,
                 added_tokens=ADDED_TOKENS,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 reasoning_effort="low",
@@ -324,9 +412,15 @@ class TestTheCheck:
     def test_the_stand_in_is_none_of_the_tokens_it_is_told_are_written(self) -> None:
         with ScriptedChatServer([STEP], **OWN) as server:
             client = make_client(server)
-            other = check_plain_text(client, "m", added_tokens=ADDED_TOKENS, written=[SPARE])
+            other = check_plain_text(
+                client, "m", uncompared=True, added_tokens=ADDED_TOKENS, written=[SPARE]
+            )
             none = check_plain_text(
-                client, "m", added_tokens=ADDED_TOKENS, written=list(ADDED_TOKENS.values())
+                client,
+                "m",
+                uncompared=True,
+                added_tokens=ADDED_TOKENS,
+                written=list(ADDED_TOKENS.values()),
             )
         # Told that the template writes the one it would take, it takes another.
         assert other["ok"] is True and other["stand_in_id"] not in (SPARE, *ROUTE.closing)
@@ -335,7 +429,9 @@ class TestTheCheck:
     def test_a_tokenizer_that_knows_none_of_the_texts_fails_it(self) -> None:
         # This server's tokenizer writes a text as its characters, whatever it is.
         with ScriptedChatServer([STEP]) as server:
-            found = check_plain_text(make_client(server), "m", added_tokens={"<spare>": SPARE})
+            found = check_plain_text(
+                make_client(server), "m", uncompared=True, added_tokens={"<spare>": SPARE}
+            )
         assert found["ok"] is False and "writes none of the named tokens" in found["reason"]
 
 
@@ -440,7 +536,9 @@ class TestWholeRollouts:
         return record
 
     def test_a_file_that_holds_the_texts_reaches_the_model_as_characters(self) -> None:
-        record = self.run(plain_text=True, added_tokens=ADDED_TOKENS)
+        record = self.run(
+            plain_text=True, added_tokens=ADDED_TOKENS, tokenizer_info_uncompared=True
+        )
         assert record["trainable"] is True and record["one_sequence"] is True
         assert record["plain_text"] == {
             "applied": True,
@@ -463,6 +561,118 @@ class TestWholeRollouts:
             "special_text" not in record["token_id_route"]
             and "plain_text" not in record["token_id_route"]
         )
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"plain_text": False},
+            {"plain_text": True, "added_tokens": ADDED_TOKENS, "tokenizer_info_uncompared": True},
+        ],
+        ids=["rendered as it is", "plain text"],
+    )
+    def test_a_sub_agent_that_reads_the_texts_is_sent_them_without_a_backslash(
+        self, config: dict[str, Any]
+    ) -> None:
+        """With prompts as token IDs nothing is escaped, for the session or
+        for a sub-agent: no request to the tokenize route and no prompt holds
+        a backslash the file does not hold, and the sub-agent's prompt carries
+        the file's text exactly."""
+        from tests.test_rollout_episode import SPAWN
+
+        parent = [{"tool_calls": [SPAWN]}, {"content": "done"}]
+        agent = [
+            {"tool_calls": [{"name": "read_file", "arguments": {"path": "seed.txt"}}]},
+            {"content": "It holds the texts."},
+        ]
+        mark = chr(92)
+
+        def strings(value: Any) -> list[str]:
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, dict):
+                return [s for k, v in value.items() for s in (*strings(k), *strings(v))]
+            if isinstance(value, list):
+                return [s for item in value for s in strings(item)]
+            return []
+
+        with ScriptedChatServer(parent, agent_script=agent, sampler_logprobs=True, **OWN) as server:
+            record, _box = _run(
+                server,
+                task=Task(prompt="read seed.txt", key="t1", setup_files={"seed.txt": SEED}),
+                token_id_prompts=True,
+                **config,
+            )
+            rendered = list(server.tokenize_requests)
+            sent = list(server.requests)
+            agent_prompts = [decode(r["prompt"]) for r in server.agent_requests]
+        assert record["finish_state"] == "completed", record["error"]
+        assert record["subagents"]["model_calls"] == 2 and len(agent_prompts) == 2
+        # No text of a token with a backslash in it, in any request of either:
+        # not in what the tokenize route was given, not in a prompt.
+        escaped = [text[0] + mark + text[1:] for text in ADDED_TOKENS]
+        assert mark not in SEED
+        assert not [
+            text
+            for request in rendered
+            for text in strings(request)
+            if any(e in text for e in escaped)
+        ]
+        prompts = [decode(r["prompt"]) for r in sent if isinstance(r.get("prompt"), list)]
+        assert len(prompts) >= 4 and not [p for p in prompts if any(e in p for e in escaped)]
+        assert not [text for r in sent for text in strings(r) if any(e in text for e in escaped)]
+        # The sub-agent read the file, and its next prompt holds the file's
+        # lines as they are (read_file numbers them).
+        lines = SEED.split(NL)
+        assert not [line for line in lines if line in agent_prompts[0]]
+        assert all(line in agent_prompts[1] for line in lines)
+        if not config["plain_text"]:
+            # Rendered as it is: the tokenize route was given the very text.
+            assert [text for request in rendered for text in strings(request) if lines[0] in text]
+        assert record["control_text_escape"] == {
+            "applied": False,
+            "reason": "prompts are sent as token IDs: nothing is escaped (the lane says: "
+            "switched off for the model (escape_control_tokens))",
+            "tokens_from": None,
+            "escaped": {},
+            "requests": 0,
+        }
+
+    def test_an_escape_in_a_run_with_prompts_as_token_ids_is_a_harness_fault(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It cannot come about by a conversation: the session switches the
+        escape off for its lane.  Where a lane has it on all the same (here
+        one whose switch is taken away), nothing is escaped and nothing is
+        sent: the run ends as the harness's alarm."""
+        import dataclasses
+
+        from turnstone.core import model_turn as model_turn_module
+
+        real = model_turn_module.lane_control_tokens
+
+        def switched_on(lane: Any, cfg: Any, client: Any = None) -> Any:
+            capabilities = dataclasses.replace(lane.capabilities, escape_control_tokens=True)
+            return real(dataclasses.replace(lane, capabilities=capabilities), cfg, client)
+
+        monkeypatch.setattr(model_turn_module, "lane_control_tokens", switched_on)
+        with ScriptedChatServer(READ, sampler_logprobs=True, **OWN) as server:
+            record, _box = _run(
+                server,
+                task=Task(prompt="read seed.txt", key="t1", setup_files={"seed.txt": SEED}),
+                token_id_prompts=True,
+                plain_text=False,
+            )
+            sent, rendered = list(server.requests), list(server.tokenize_requests)
+        assert record["finish_state"] == "harness_fault", record["error"]
+        assert "about to be escaped" in record["error"] and cli._status(record) == cli.FAULT
+        assert "switched the escape on" in record["error"]
+        assert record["control_text_escape"]["applied"] is True
+        assert record["control_text_escape"]["escaped"] == {}
+        # Found before the first request's text was touched: no model call
+        # of the session's was made.
+        assert record["turns"] == 0 and record["calls"] == []
+        assert not [r for r in sent if "read seed.txt" in decode(r.get("prompt") or [])]
+        del rendered
 
     def test_switched_off_the_run_is_what_it_was_and_the_record_says_so(self) -> None:
         record = self.run(plain_text=False)
@@ -491,14 +701,39 @@ class TestWholeRollouts:
 
     def test_a_verdict_made_for_another_server_is_refused(self) -> None:
         with ScriptedChatServer(READ, sampler_logprobs=True, **OWN) as server:
-            found = check_plain_text(make_client(server), "other", added_tokens=ADDED_TOKENS)
+            found = check_plain_text(
+                make_client(server), "other", uncompared=True, added_tokens=ADDED_TOKENS
+            )
             with pytest.raises(SetupError, match="made for the model"):
                 _run(server, token_id_prompts=True, plain_text=True, plain_text_verdict=found)
+
+    def test_a_verdict_that_was_not_compared_and_does_not_say_it_was_accepted_is_refused(
+        self,
+    ) -> None:
+        """What a build before the rule let pass: a file's tokens taken
+        without the server's own to hold them against, and no word of it."""
+        with ScriptedChatServer(READ, sampler_logprobs=True, **OWN) as server:
+            found = check_plain_text(
+                make_client(server), "scripted", added_tokens=ADDED_TOKENS, uncompared=True
+            )
+            assert found["ok"] is True
+            earlier = {
+                **found,
+                "tokenizer_info": {"source": "named", "compared_with_server": False},
+            }
+            with pytest.raises(SetupError, match="was not held against the server's own"):
+                _run(server, token_id_prompts=True, plain_text=True, plain_text_verdict=earlier)
+            record, _box = _run(
+                server, token_id_prompts=True, plain_text=True, plain_text_verdict=found
+            )
+        assert record["plain_text"]["applied"] is True
 
     def test_what_the_model_writes_itself_is_never_a_fault(self) -> None:
         """The stand-in's text, a token's text and an escaped one, in the
         model's reasoning, text and call: the run goes on and is trained on."""
-        record = self.run(WRITES, plain_text=True, added_tokens=ADDED_TOKENS)
+        record = self.run(
+            WRITES, plain_text=True, added_tokens=ADDED_TOKENS, tokenizer_info_uncompared=True
+        )
         assert record["finish_state"] == "completed" and record["problems"] == []
         assert record["trainable"] is True and record["one_sequence"] is True
         # Only what the environment wrote is counted: here nothing.
@@ -522,11 +757,44 @@ class TestTheCommand:
         described = tmp_path / "tokenizer_config.json"
         decoder = {str(token): {"content": text} for text, token in ADDED_TOKENS.items()}
         described.write_text(json.dumps({"added_tokens_decoder": decoder}))
-        status, verdict = self.probe(tmp_path, "--tokenizer-info", str(described))
+        status, verdict = self.probe(tmp_path, "--tokenizer-info", str(described), tokenizer_info=True)  # fmt: skip
         assert status == 0
         # Beside the route's verdict, not in it.
         assert verdict["plain_text"]["stand_in"] == "<spare>"
         assert "plain_text" not in verdict["route"]
+        assert verdict["plain_text"]["tokenizer_info"]["compared_with_server"] is True
+
+    def test_a_description_that_cannot_be_compared_fails_the_probe_unless_accepted(
+        self, tmp_path: Any, capsys: Any
+    ) -> None:
+        described = tmp_path / "tokenizer_config.json"
+        decoder = {str(token): {"content": text} for text, token in ADDED_TOKENS.items()}
+        described.write_text(json.dumps({"added_tokens_decoder": decoder}))
+        status, verdict = self.probe(tmp_path, "--tokenizer-info", str(described))
+        assert status == 2 and verdict["plain_text"]["ok"] is False
+        assert verdict["plain_text"]["tokenizer_info"]["compared_with_server"] is False
+        status, verdict = self.probe(
+            tmp_path, "--tokenizer-info", str(described), "--tokenizer-info-uncompared"
+        )
+        assert status == 0 and verdict["plain_text"]["ok"] is True
+        assert verdict["plain_text"]["tokenizer_info"]["accepted_uncompared"] is True
+        # A server that has the route and fails on it: no flag makes that pass.
+        status, verdict = self.probe(
+            tmp_path,
+            "--tokenizer-info",
+            str(described),
+            "--tokenizer-info-uncompared",
+            tokenizer_info_status=500,
+        )
+        assert status == 2 and "could not be had" in verdict["plain_text"]["reason"]
+        capsys.readouterr()
+        # The flag is for a named file.
+        for flags in (["--tokenizer-info", "server"], ["--no-plain-text"]):
+            assert cli.main(["--base-url", "http://127.0.0.1:9/v1", "--model", "m", "--token-id-prompts", "--probe-only", "--no-vision", "--tokenizer-info-uncompared", *flags]) == 3  # fmt: skip
+            assert (
+                "--tokenizer-info-uncompared is for --tokenizer-info FILE"
+                in capsys.readouterr().err
+            )
 
     def test_the_probe_asks_the_server_only_when_told_to(self, tmp_path: Any) -> None:
         status, verdict = self.probe(tmp_path, "--tokenizer-info", "server", tokenizer_info=True)

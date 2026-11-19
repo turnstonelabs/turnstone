@@ -180,16 +180,17 @@ _OWN_IMAGE_SIZES = False
 
 
 def image_patches(data: bytes) -> int:
-    """How many placeholder tokens the toy server gives a PNG.  By the rule
-    the image processors of the served models follow: each side rounded to a
-    multiple of 32 pixels, the whole scaled to hold 65,536 to 16,777,216
-    pixels, one token for every square of 32 pixels."""
+    """How many placeholder tokens the toy server gives a PNG.  As the image
+    processors of the served models size it: each side rounded to a multiple
+    of 32 pixels (to nothing, where it is less than half of that), the whole
+    scaled to hold 65,536 to 16,777,216 pixels, one token for every square
+    of 32 pixels."""
     width, height = struct.unpack(">II", data[16:24])
     if _OWN_IMAGE_SIZES:
         return max(1, ((width + 7) // 8) * ((height + 7) // 8))
     side, least, most = 32, 65536, 16777216
-    high = max(side, round(height / side) * side)
-    wide = max(side, round(width / side) * side)
+    high = round(height / side) * side
+    wide = round(width / side) * side
     if high * wide > most:
         scale = math.sqrt(height * width / most)
         high = max(side, math.floor(height / scale / side) * side)
@@ -427,9 +428,13 @@ class ScriptedChatServer:
         own_tokens: bool = False,
         tokenizer_info: bool = False,
         tokenizer_info_names: dict[str, int] | None = None,
+        tokenizer_info_status: int = 200,
         own_image_sizes: bool = False,
     ) -> None:
         self.script = script
+        # What ``GET /tokenizer_info`` answers with where it is not an answer:
+        # a server that has the route and fails on it (500, 503).
+        self.tokenizer_info_status = tokenizer_info_status
         # A server that sizes images its own way, not by the rule a check
         # knows; and what ``GET /tokenizer_info`` names where that is to be
         # something else than the tokenizer's tokens (``ADDED_TOKENS``).
@@ -576,6 +581,9 @@ class ScriptedChatServer:
                     owner._answer_version(self)
                     return
                 if self.path.split("?")[0] == "/tokenizer_info":
+                    if owner.tokenizer_info_status != 200:
+                        owner._refuse(self, owner.tokenizer_info_status, "no answer here")
+                        return
                     if not owner.tokenizer_info:
                         owner._refuse(self, 404, "Not Found")
                         return

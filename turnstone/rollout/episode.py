@@ -76,7 +76,7 @@ from turnstone.rollout.idprompt import (
     check_token_id_route,
     template_arguments,
 )
-from turnstone.rollout.plaintext import PlainText
+from turnstone.rollout.plaintext import HarnessFaultError, PlainText
 from turnstone.rollout.preparation import BeforeRunCommand, before_run_failure, run_before
 from turnstone.rollout.probe import SETTINGS as PROBED_SETTINGS
 from turnstone.rollout.probe import all_settings, sampler_logprobs_reported
@@ -292,6 +292,12 @@ class RolloutConfig:
     plain_text_verdict: dict[str, Any] | None = None
     added_tokens: dict[str, int] | None = None
     tokenizer_info_from_server: bool = False
+    # ``added_tokens`` is held against the server's own description of its
+    # tokenizer, and a check on a server that does not offer one fails: a
+    # description that is stale or leaves a token out would pass unnoticed.
+    # ``True`` takes ``added_tokens`` as it is on such a server, and the
+    # verdict says so.
+    tokenizer_info_uncompared: bool = False
     # Let the model see images (:mod:`turnstone.rollout.vision`): the session's
     # model is given vision, so an image file it reads and an image a tool of
     # the task's servers returns reach it as images, and a request that holds
@@ -651,6 +657,23 @@ def _refused_text(whose: str, refusal: APIStatusError) -> str:
     )
 
 
+def _escape_breach(assembly: PromptAssembly) -> Callable[[str], None]:
+    """What a session with prompts as token IDs is told when control-token
+    text was about to be escaped in one of its requests: the harness's
+    alarm.  The prompt assembly is told, so that nothing more is sent and
+    the run ends as ``harness_fault``."""
+
+    def breach(what: str) -> None:
+        assembly.fault = (
+            "control-token text was about to be escaped in a request of a run whose prompts "
+            f"go out as token IDs ({what}): the prompt would have been built from text that "
+            "no file holds"
+        )
+        raise HarnessFaultError(assembly.fault)
+
+    return breach
+
+
 class RolloutSession(HeadlessSession):
     """The headless session of a rollout: sub-agents counted and watched, and
     the context window kept.
@@ -692,6 +715,7 @@ class RolloutSession(HeadlessSession):
         before_acting: Callable[[], None] | None = None,
         vision: bool = False,
         token_ids: bool = False,
+        escape_breach: Callable[[str], None] | None = None,
         escape_control_text: bool | None = None,
         **kwargs: Any,
     ) -> None:
@@ -715,13 +739,21 @@ class RolloutSession(HeadlessSession):
         self._vision = vision
         lane = self._model_binding.lane
         capabilities = require_lane_capabilities(lane)
+        # What became of the escape in the session's requests, for the record.
+        self.control_text_log = EscapeLog()
         if token_ids:
             # The prompts are built here, token by token, from the conversation as
             # it is: read as plain text (plaintext.py) or, where that is switched
             # off, rendered as it stands.  The framework's escape of control-token
             # text in what is sent is for the routes that take text, and would
-            # put a character into the prompt that no file holds.
+            # put a character into the prompt that no file holds.  Switched off
+            # here, and held to on every request: the log refuses a call whose
+            # lane has it on all the same, and so does the look at each lane a
+            # request is about to go out on (``_as_it_is``).
             capabilities = replace(capabilities, escape_control_tokens=False)
+            self.control_text_log = EscapeLog(
+                never_because="prompts are sent as token IDs", on_breach=escape_breach
+            )
         elif escape_control_text is not None:
             # The run's own word, where the lane's rule is not to decide.
             capabilities = replace(capabilities, escape_control_tokens=escape_control_text)
@@ -730,8 +762,6 @@ class RolloutSession(HeadlessSession):
             # into the conversation as an image: a file the model reads, what
             # a tool of the task's servers returns.
             capabilities = replace(capabilities, supports_vision=True)
-        # What became of the escape in the session's requests, for the record.
-        self.control_text_log = EscapeLog()
         self._model_binding = replace(
             self._model_binding,
             lane=replace(lane, capabilities=capabilities, control_text_log=self.control_text_log),
@@ -784,7 +814,26 @@ class RolloutSession(HeadlessSession):
 
     # -- context window ------------------------------------------------------
 
+    def _as_it_is(self, lane: Any) -> None:
+        """With prompts as token IDs: hold *lane*, the one a request is about
+        to go out on, to being the session's own with the escape of
+        control-token text switched off.  Any other lane (another model's,
+        one resolved anew) would decide the escape by its own rule, and its
+        requests would not be told to this session's log.  That is a fault
+        of the harness, found before the request's text is touched."""
+        log_ = self.control_text_log
+        if log_.never_because is None:
+            return
+        switched = getattr(getattr(lane, "capabilities", None), "escape_control_tokens", None)
+        if switched is False and getattr(lane, "control_text_log", None) is log_:
+            return
+        log_.breach(
+            "a request was about to go out on a lane that is not the session's own with the "
+            "escape switched off"
+        )
+
     def _check_stable_prefix(self, wire: list[dict[str, Any]], lane: Any) -> None:
+        self._as_it_is(lane)
         super()._check_stable_prefix(wire, lane)
         if self._meter is not None and self._meter.left() == 0:
             # Nothing of the episode's token budget is left for a reply.
@@ -1087,6 +1136,7 @@ class RolloutSession(HeadlessSession):
         """A sub-agent's messages as a request body can carry them: the same
         replacement, made on the way out, for what its own tools hand back and
         for the prompt it was given."""
+        self._as_it_is(lane)
         wire: list[dict[str, Any]] = super()._prepare_task_agent_wire(messages, lane)
         sendable: list[dict[str, Any]] = []
         for message in wire:
@@ -2058,19 +2108,15 @@ def _build_record(
     record["plain_text"] = plain_text
     record["vision"] = seen
     # Whether control-token text was escaped in what was sent as messages
-    # (:mod:`turnstone.core.control_text`), and which texts in the latest
-    # request.
+    # (:mod:`turnstone.core.control_text`), and which texts: what the
+    # session's log says, added up over every model call.  With prompts as
+    # token IDs the log itself refuses an escape (``harness_fault``), so the
+    # record never says "nothing was escaped" on this function's word.
     session = state.get("session")
     escape = getattr(session, "control_text_log", None)
     record["control_text_escape"] = (
-        escape.describe() if isinstance(escape, EscapeLog) else EscapeLog().describe()
-    )
-    if config.token_id_prompts:
-        record["control_text_escape"]["reason"] = (
-            "prompts are sent as token IDs: nothing is escaped"
-            if escape is not None and escape.applied is not None
-            else "no model call was made"
-        )
+        escape if isinstance(escape, EscapeLog) else EscapeLog()
+    ).describe()
     return record
 
 
@@ -2598,6 +2644,7 @@ def plain_text_check(
                 added_tokens=config.added_tokens,
                 written=written,
                 required=required,
+                uncompared=config.tokenizer_info_uncompared,
             )
     except Exception as check_error:
         return {
@@ -2636,7 +2683,27 @@ def _plain_text(
                 f"({json.dumps(verdict['template_arguments'], sort_keys=True)[:300]}) than the "
                 f"run's: {again}"
             )
+        compared = verdict.get("tokenizer_info")
+        if (
+            isinstance(compared, dict)
+            and compared.get("compared_with_server") is False
+            and compared.get("accepted_uncompared") is not True
+        ):
+            # What a build before this rule let pass.
+            raise SetupError(
+                f"the given {what} took a description of the tokenizer that was not held "
+                "against the server's own, and does not say that this was accepted "
+                f"(tokenizer_info): {again}"
+            )
     return PlainText.from_verdict(verdict), verdict
+
+
+def _cannot_see(why: str) -> SetupError:
+    return SetupError(
+        f"the model is to see images and cannot: {why}. Make it possible (the check of "
+        "the server says what is missing), or run without images (vision=False, "
+        "--no-vision)"
+    )
 
 
 def _seeing(
@@ -2645,17 +2712,12 @@ def _seeing(
     """What a run with *config* sends its images with; ``None`` where the
     run says it wants none.  A run that is to see images and cannot is
     refused with :class:`SetupError`, whatever the reason: it never goes on
-    without them."""
+    without them.  What can be told without the server (plain text switched
+    off, no folder for the images, a request parameter the generate route
+    has no place for) was refused before the server was asked anything."""
     if config.vision is False:
         return None
-
-    def refused(why: str) -> SetupError:
-        return SetupError(
-            f"the model is to see images and cannot: {why}. Make it possible (the check of "
-            "the server says what is missing), or run without images (vision=False, "
-            "--no-vision)"
-        )
-
+    refused = _cannot_see
     found = route.get("vision")
     if not isinstance(found, dict):
         raise refused(
@@ -2663,16 +2725,10 @@ def _seeing(
         )
     if found.get("ok") is not True:
         raise refused(f"the image check of the server did not pass: {found.get('reason')}")
-    if plain is None:
-        raise refused("the conversation's text is not read as plain text")
-    if not config.image_dir:
-        raise refused("the run names no folder for its images (image_dir)")
     seeing = VisionRoute.from_verdict(found)
-    try:
-        carried = {k: v for k, v in config.extra_body.items() if k != "chat_template_kwargs"}
-        generate_body({"extra_body": carried}, [0], ())
-    except RuntimeError as no_place:
-        raise refused(str(no_place)) from None
+    # A run that is to see images reads its text as plain text: one that
+    # does not was refused before anything was asked of the server.
+    assert plain is not None
     if plain.stand_in_id in (seeing.placeholder, *seeing.frame):
         raise refused(
             "the stand-in for plain text is a token the template writes for an image (the "
@@ -2785,6 +2841,16 @@ def run_episode(
     # Before the clock starts: what the run's limits are, and which
     # log-probabilities the server reports.  Neither is the task's time.
     config, limits, sampling = effective_config(config)
+    if config.token_id_prompts and config.vision is not False:
+        # Every parameter the run's requests carry needs a place on the
+        # generate route, which drops what it does not know without a word.
+        # The parameters are known now, and the server is asked nothing for a
+        # run that will be refused.
+        try:
+            carried = {k: v for k, v in config.extra_body.items() if k != "chat_template_kwargs"}
+            generate_body({"extra_body": carried}, [0], ())
+        except RuntimeError as no_place:
+            raise _cannot_see(str(no_place)) from None
     assert config.max_tokens is not None and config.tool_timeout is not None
     assert config.context_window is not None and config.subagent_max_turns is not None
     assert config.max_output_chars is not None
@@ -2948,13 +3014,12 @@ def run_episode(
                     exact_window="assembly" in state,
                     subagent_sidecar_tools=config.subagent_sidecar_tools,
                     before_acting=before_acting,
-                    **({"vision": True} if state["vision"]["applied"] else {}),
-                    **({"token_ids": True} if config.token_id_prompts else {}),
-                    **(
-                        {"escape_control_text": config.escape_control_text}
-                        if config.escape_control_text is not None
-                        else {}
+                    vision=bool(state["vision"]["applied"]),
+                    token_ids=bool(config.token_id_prompts),
+                    escape_breach=(
+                        _escape_breach(state["assembly"]) if config.token_id_prompts else None
                     ),
+                    escape_control_text=config.escape_control_text,
                 )
                 state["session"] = session
                 # A sandbox that is gone ends the run at the next turn: nothing

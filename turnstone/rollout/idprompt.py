@@ -64,24 +64,22 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from openai import APIStatusError
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
+from turnstone.core.control_text import added_tokens_of
 from turnstone.core.log import get_logger
 from turnstone.core.model_turn import ModelContextLimitError
 from turnstone.rollout.budget import ContextFullError
-from turnstone.rollout.plaintext import (
-    HarnessFaultError,
-    PlainText,
-    added_tokens_of,
-    plain_text_verdict,
-)
+from turnstone.rollout.plaintext import HarnessFaultError, PlainText, plain_text_verdict
 from turnstone.rollout.recording import (
-    _ID_PREFIX,
     PARENT,
     CallRecord,
-    _misaligned,
     _usage_dict,
     extra_field,
+    note_reported_prompt,
+    pair_tokens,
+    unreadable,
 )
 from turnstone.rollout.replyformat import (
     PARAMETER_BLOCKS,
@@ -209,48 +207,12 @@ def completion_request(request: Mapping[str, Any], prompt: list[int]) -> dict[st
     return out
 
 
-def note_reported_prompt(record: CallRecord, reported: Any) -> bool:
-    """Note the prompt a server reports for *record*'s call, the first time
-    it does, and hold it against the one that was sent; ``True`` where this
-    was that first time."""
-    if reported is None or record.prompt_token_ids is not None:
-        return False
-    prompt = [int(i) for i in reported]
-    if record.prompt_sent is not None and prompt == record.prompt_sent:
-        # One list for both: a long run holds every prompt.
-        prompt = record.prompt_sent
-    elif record.prompt_sent is not None:
-        record.prompt_differs = True
-    record.prompt_token_ids = prompt
-    record.prompt_sent = None
-    return True
-
-
-def pair_tokens(
-    record: CallRecord, ids: list[int], values: Sequence[Any], named: Sequence[str]
-) -> None:
-    """Add one part's generated tokens to *record*: *ids*, their
-    log-probabilities *values* and the names the server gave the values'
-    tokens.  IDs and values are kept only one to one, and where the server
-    names each value's token by ID the two channels are compared token by
-    token."""
-    record.token_ids.extend(ids)
-    if len(ids) != len(values):
-        _misaligned(record)
-    elif record.aligned:
-        if named and all(n.startswith(_ID_PREFIX) for n in named):
-            record.ids_checked = True
-            if list(named) != [f"{_ID_PREFIX}{i}" for i in ids]:
-                _misaligned(record)
-        if record.aligned:
-            record.logprobs.extend(float(v) for v in values)
-
-
 def take_completion(record: CallRecord, part: Any) -> tuple[str, list[int]] | None:
     """Copy token data out of one part of a completions reply into *record*;
     return the part's text and token IDs.  Never raises.
 
-    The same pairing rules as for a chat reply (:func:`pair_tokens`).
+    The same pairing rules as for a chat reply
+    (:func:`~turnstone.rollout.recording.pair_tokens`).
     """
     try:
         taken: tuple[str, list[int]] | None = None
@@ -259,6 +221,8 @@ def take_completion(record: CallRecord, part: Any) -> tuple[str, list[int]] | No
                 continue
             note_reported_prompt(record, extra_field(choice, "prompt_token_ids"))
             ids = [int(i) for i in (extra_field(choice, "token_ids") or [])]
+            # Among the call's tokens before anything else of the part is read.
+            record.token_ids.extend(ids)
             text = getattr(choice, "text", None) or ""
             record.raw.extend(text.encode("utf-8", errors="replace"))
             given = getattr(choice, "logprobs", None)
@@ -279,14 +243,6 @@ def take_completion(record: CallRecord, part: Any) -> tuple[str, list[int]] | No
     except Exception as error:
         unreadable(record, error)
         return None
-
-
-def unreadable(record: CallRecord, error: Exception) -> None:
-    """Mark *record* for a part of its reply that could not be read."""
-    record.unreadable = f"{type(error).__name__}: {str(error)[:200]}"
-    if record.aligned:
-        _misaligned(record)
-    log.warning("rollout.recording_unreadable", call=record.index, error=record.unreadable)
 
 
 @dataclass(frozen=True)
@@ -489,6 +445,10 @@ class PromptAssembly:
     # What the harness found itself at fault for, once it has: the run ends
     # as ``harness_fault`` whatever else happens to it.
     fault: str | None = None
+    # The stretches of the session's sequence that the model generated, each
+    # by where it begins and ends: every turn a later prompt was built on.
+    # What stands there is the model's own, whatever token it is.
+    generated: list[tuple[int, int]] = field(default_factory=list)
     _last: _Link | None = None
     _turn: int = 0
 
@@ -558,6 +518,8 @@ class PromptAssembly:
         else:
             prompt, differs, made = self._extended(last, messages, rendered)
             self._turn += 1
+            begins = len(last.call.prompt_token_ids or ())
+            self.generated.append((begins, begins + len(last.call.token_ids)))
         self._last = _Link(copy.deepcopy(messages), prompt, call, differs, made)
         return prompt
 
@@ -612,6 +574,14 @@ class PromptAssembly:
         if call.prompt_differs or call.prompt_token_ids is None:
             raise PromptAssemblyError(
                 f"the server did not report the prompt of call {call.index} as it was sent"
+            )
+        if call.unreadable:
+            # A part that could not be read may have held tokens that are not
+            # among the call's: the sequence would go on without them.
+            raise PromptAssemblyError(
+                f"a part of the reply of call {call.index} could not be read "
+                f"({call.unreadable}), so the tokens it generated are not certain to be all there "
+                "and no prompt can be built on them"
             )
         closing = list(route.closing)
         opening = list(route.generation_prompt)
@@ -829,8 +799,6 @@ class PromptAssembly:
         fmt = self.format
         end_of_turn = route.closing[0]
         generated = call.token_ids
-        if self.vision is not None and call.scope == PARENT:
-            self.vision.note_generated(generated)
         if end_of_turn in generated and generated.index(end_of_turn) < len(generated) - 1:
             raise PromptAssemblyError(
                 f"call {call.index}: the server went on generating after the template's "
@@ -1415,6 +1383,7 @@ def check_plain_text(
     added_tokens: Mapping[str, int] | None = None,
     written: Sequence[int] = (),
     required: Sequence[int] = (),
+    uncompared: bool = False,
 ) -> dict[str, Any]:
     """How the text of the tokenizer's own tokens is read as plain text on
     the server behind *client* (:func:`~turnstone.rollout.plaintext.plain_text_verdict`).
@@ -1425,10 +1394,17 @@ def check_plain_text(
     reading relies on or the template writes for an image, and *required*
     those of them the description must name.
 
-    A description from a file is held against the server's own wherever the
-    server offers it: one that names other tokens than the server's
-    tokenizer has fails the check, and the verdict says whether the
-    comparison could be made (``tokenizer_info``).
+    A description from a file is held against the server's own: one that
+    names other tokens than the server's tokenizer has fails the check.  A
+    file that is stale or leaves a token out reads that token's text as a
+    control token, and nothing the template shows need give it away, so the
+    comparison is not left out quietly: on a server that does not offer its
+    own description (the route answers 404) the check FAILS, unless the
+    caller says with *uncompared* that the file is to be taken as it is.
+    The verdict then says so (``tokenizer_info``: ``compared_with_server``
+    false, ``accepted_uncompared`` true).  Only a 404 means "not offered":
+    any other failure to get the server's description fails the check,
+    whatever *uncompared* says, and so does an answer that names no tokens.
 
     Never raises: what could not be established is a verdict that says so.
     The verdict names what it was made for, the template arguments
@@ -1443,28 +1419,52 @@ def check_plain_text(
         return {"ok": False, "reason": reason, **more, **for_what}
 
     served: dict[str, int] | None = None
-    not_offered: str | None = None
     try:
         served = added_tokens_of(client.get(_root(client) + "/tokenizer_info", cast_to=object))
     except Exception as error:
-        not_offered = f"{type(error).__name__}: {str(error)[:120]}"
+        said = f"{type(error).__name__}: {str(error)[:120]}"
+        if not (isinstance(error, APIStatusError) and error.status_code == 404):
+            # The server may well offer it: nothing is known of its tokens,
+            # and nothing passes on that.
+            return failed(
+                "the server's own description of its tokenizer could not be had "
+                f"(/tokenizer_info: {said}), so nothing could be held against it: ask again",
+                tokenizer_info={"asked": False, "why_not": said},
+            )
+    else:
+        if not served:
+            return failed(
+                "the server's own description of its tokenizer (/tokenizer_info) names no "
+                "tokens of the tokenizer's own, so nothing could be held against it",
+                tokenizer_info={"asked": True, "why_not": "the server's answer names no tokens"},
+            )
     added = added_tokens
     compared: dict[str, Any]
     if added is None:
         if served is None:
             return failed(
                 "the server does not say which tokens its tokenizer has of its own "
-                f"(/tokenizer_info: {not_offered}): start it with "
+                "(/tokenizer_info answers 404): start it with "
                 "--enable-tokenizer-info-endpoint, or name them from the tokenizer's files"
             )
         added = served
         compared = {"source": "server"}
-    elif not served:
+    elif served is None:
         compared = {
             "source": "named",
             "compared_with_server": False,
-            "why_not": not_offered or "the server's answer names no tokens",
+            "why_not": "the server does not offer /tokenizer_info (404)",
+            "accepted_uncompared": bool(uncompared),
         }
+        if not uncompared:
+            return failed(
+                "the named description of the tokenizer could not be compared with the "
+                "server's own: the server does not offer /tokenizer_info (404). A file that is "
+                "stale or leaves a token out would pass unnoticed. Start the server with "
+                "--enable-tokenizer-info-endpoint, or say that the file is to be taken as it is "
+                "(--tokenizer-info-uncompared, tokenizer_info_uncompared)",
+                tokenizer_info=compared,
+            )
     else:
         compared = {"source": "named", "compared_with_server": True}
         apart = sorted(set(added.items()) ^ set(served.items()))

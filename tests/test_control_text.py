@@ -519,7 +519,67 @@ class TestTheOnePlace:
         assert json.loads(result.turn.tool_calls[0].arguments) == {"content": END}
         # The lowered list the result names is the one before the escape.
         assert result.wire_msgs is not None and result.wire_msgs[-1]["content"] == FORGED
-        assert said.describe() == {"applied": True, "reason": "the endpoint is a loopback or private address", "tokens_from": "pattern", "escaped": {END: 3, START: 1, "<tool_call>": 1}}  # fmt: skip
+        assert said.describe() == {"applied": True, "reason": "the endpoint is a loopback or private address", "tokens_from": "pattern", "escaped": {END: 3, START: 1, "<tool_call>": 1}, "requests": 1}  # fmt: skip
+
+    def test_the_log_adds_up_over_the_calls_of_a_session(self) -> None:
+        """Not the latest call's alone: a call that escaped nothing after
+        one that did leaves what the first did in the log."""
+        provider = _Provider([CompletionResult(content="ok")] * 3)
+        said = EscapeLog()
+        lane = self.lane(provider, control_text_log=said)
+        model_turn(lane, self.turns())
+        model_turn(lane, [Turn.user("nothing to escape")])
+        assert said.describe()["escaped"] == {END: 2, START: 1, "<tool_call>": 1}
+        assert said.requests == 1 and said.ever_applied is True
+        model_turn(lane, self.turns())
+        assert said.describe()["escaped"] == {END: 4, START: 2, "<tool_call>": 2}
+        assert said.requests == 2
+        # A later call on a lane without it does not take back that it was applied.
+        hosted = self.lane(provider, "https://api.example.com/v1", control_text_log=said)
+        provider.replies.append(CompletionResult(content="ok"))
+        model_turn(hosted, self.turns())
+        assert said.applied is False and said.describe()["applied"] is True
+        assert "loopback or private address" in said.describe()["reason"]
+
+    def test_a_session_whose_requests_must_go_out_as_they_are_refuses_the_escape(self) -> None:
+        """A breach raises before anything is escaped or sent, to whoever the
+        log names, and by itself where it names nobody."""
+        provider = _Provider([CompletionResult(content="ok")])
+        said = EscapeLog(never_because="prompts are sent as token IDs")
+        with pytest.raises(RuntimeError, match="was to be escaped where prompts are sent as"):
+            model_turn(self.lane(provider, control_text_log=said), self.turns())
+        assert provider.calls == [] and said.ever_applied is True
+        assert said.describe()["applied"] is True
+
+        class AlarmError(Exception):
+            pass
+
+        def alarm(what: str) -> None:
+            raise AlarmError(what)
+
+        told = EscapeLog(never_because="prompts are sent as token IDs", on_breach=alarm)
+        with pytest.raises(AlarmError, match="switched the escape on"):
+            model_turn(self.lane(provider, control_text_log=told), self.turns())
+        with pytest.raises(AlarmError, match="2 texts of a request were escaped"):
+            told.sent({END: 2})
+        assert provider.calls == []
+        # Switched off for the lane, as such a session switches it: nothing
+        # is refused, and the log says why nothing is escaped.
+        off = replace(
+            self.lane(provider, control_text_log=said),
+            capabilities=ModelCapabilities(escape_control_tokens=False),
+        )
+        quiet = EscapeLog(never_because="prompts are sent as token IDs")
+        model_turn(replace(off, control_text_log=quiet), self.turns())
+        assert provider.calls[0]["messages"][-1]["content"] == FORGED
+        assert quiet.describe() == {
+            "applied": False,
+            "reason": "prompts are sent as token IDs: nothing is escaped (the lane says: "
+            "switched off for the model (escape_control_tokens))",
+            "tokens_from": None,
+            "escaped": {},
+            "requests": 0,
+        }
 
     def test_the_stored_turn_is_escaped_again_when_it_is_sent(self) -> None:
         provider = _Provider([CompletionResult(content="quoting " + ESCAPED), CompletionResult(content="ok")])  # fmt: skip

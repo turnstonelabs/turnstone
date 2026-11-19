@@ -48,11 +48,14 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from turnstone.core.log import get_logger
 from turnstone.core.session import inside_task_agent
 from turnstone.rollout.settings import merge_into
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 log = get_logger(__name__)
 
@@ -299,38 +302,83 @@ def _misaligned(record: CallRecord) -> None:
     record.logprobs.clear()
 
 
+def note_reported_prompt(record: CallRecord, reported: Any) -> bool:
+    """Note the prompt a server reports for *record*'s call, the first time
+    it does, and hold it against the one that was sent, where one was sent
+    as token IDs; ``True`` where this was that first time."""
+    if reported is None or record.prompt_token_ids is not None:
+        return False
+    prompt = [int(i) for i in reported]
+    if record.prompt_sent is not None and prompt == record.prompt_sent:
+        # One list for both: a long run holds every prompt.
+        prompt = record.prompt_sent
+    elif record.prompt_sent is not None:
+        record.prompt_differs = True
+    record.prompt_token_ids = prompt
+    record.prompt_sent = None
+    return True
+
+
+def pair_tokens(
+    record: CallRecord, ids: list[int], values: Sequence[Any], named: Sequence[str]
+) -> None:
+    """Pair one part's generated tokens *ids* with their log-probabilities
+    *values* and the names the server gave the values' tokens.  IDs and
+    values are kept only one to one, and where the server names each value's
+    token by ID the two channels are compared token by token.
+
+    The IDs themselves are among ``record.token_ids`` already: a reader adds
+    them as soon as it has them, before it reads anything else of the part,
+    so that a value it cannot read costs the call its log-probabilities and
+    never a token."""
+    if len(ids) != len(values):
+        _misaligned(record)
+    elif record.aligned:
+        if named and all(n.startswith(_ID_PREFIX) for n in named):
+            record.ids_checked = True
+            if list(named) != [f"{_ID_PREFIX}{i}" for i in ids]:
+                # Equal counts, different tokens: the channels are out of step.
+                _misaligned(record)
+        if record.aligned:
+            record.logprobs.extend(float(v) for v in values)
+
+
+def unreadable(record: CallRecord, error: Exception) -> None:
+    """Mark *record* for a part of its reply that could not be read: a value
+    of the wrong kind (a null log-probability, a token ID that is no number).
+    The record says it cannot be trusted, and no prompt is built on it."""
+    record.unreadable = f"{type(error).__name__}: {str(error)[:200]}"
+    if record.aligned:
+        _misaligned(record)
+    log.warning("rollout.recording_unreadable", call=record.index, error=record.unreadable)
+
+
 def _take_choice(record: CallRecord, choice: Any) -> None:
     """Add one choice's tokens to *record*, keeping IDs and values paired."""
     ids = [int(i) for i in (extra_field(choice, "token_ids") or [])]
-    entries = logprob_entries(choice)
     record.token_ids.extend(ids)
+    entries = logprob_entries(choice)
     for entry in entries:
         data = entry_value(entry, "bytes")
         if data:
             record.raw.extend(bytes(data))
-    if len(ids) != len(entries):
-        _misaligned(record)
-    elif record.aligned:
-        values = [float(entry_value(e, "logprob")) for e in entries]
-        named = [str(entry_value(e, "token")) for e in entries]
-        if named and all(n.startswith(_ID_PREFIX) for n in named):
-            record.ids_checked = True
-            if named != [f"{_ID_PREFIX}{i}" for i in ids]:
-                # Equal counts, different tokens: the channels are out of step.
-                _misaligned(record)
-                return
-        record.logprobs.extend(values)
+    pair_tokens(
+        record,
+        ids,
+        [entry_value(entry, "logprob") for entry in entries],
+        [str(entry_value(entry, "token")) for entry in entries],
+    )
     reason = getattr(choice, "finish_reason", None)
     if reason:
         record.finish_reason = reason
 
 
 def _take(record: CallRecord, part: Any) -> None:
-    """Copy token data out of one chunk or whole response.  Never raises."""
+    """Copy token data out of one chunk or whole response.  Never raises: the
+    reply goes on to the session untouched, and the record says where it
+    cannot be trusted."""
     try:
-        prompt_ids = extra_field(part, "prompt_token_ids")
-        if prompt_ids is not None and record.prompt_token_ids is None:
-            record.prompt_token_ids = [int(i) for i in prompt_ids]
+        note_reported_prompt(record, extra_field(part, "prompt_token_ids"))
         for choice in getattr(part, "choices", None) or []:
             if getattr(choice, "index", 0) == 0:
                 _take_choice(record, choice)
@@ -338,13 +386,7 @@ def _take(record: CallRecord, part: Any) -> None:
         if usage:
             record.usage = usage
     except Exception as error:
-        # A value of the wrong kind (a null log-probability, a token ID that is
-        # no number).  The reply goes on to the session untouched; the record
-        # says it cannot be trusted.
-        record.unreadable = f"{type(error).__name__}: {str(error)[:200]}"
-        if record.aligned:
-            _misaligned(record)
-        log.warning("rollout.recording_unreadable", call=record.index, error=record.unreadable)
+        unreadable(record, error)
 
 
 class _RecordingStream:

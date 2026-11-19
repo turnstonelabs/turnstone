@@ -598,30 +598,79 @@ def forget_lanes() -> None:
 @dataclass
 class EscapeLog:
     """What became of the escape in one session's requests, for a caller
-    that records it (a rollout): attached to the session's lane and filled
-    in by every model call."""
+    that records it (a rollout): attached to the session's lane and told of
+    every model call made on it, the session's own and its sub-agents'.
+
+    It adds up over the calls.  ``applied`` is the latest call's decision;
+    ``ever_applied`` says whether any call's lane had the escape on, and the
+    reason and the source of the tokens are then that call's.  ``escaped``
+    sums the texts escaped in all requests, and ``requests`` counts the
+    requests that held one.
+
+    A session whose requests must go out as they are says so with
+    ``never_because`` (a rollout that sends its prompts as token IDs: the
+    prompt is built from the request's text, and an escape would put a
+    character into it that no file holds).  A call whose lane has the escape
+    on all the same is then a breach: ``on_breach`` is told and raises, and
+    where it does not, this raises itself.  Nothing is escaped and nothing
+    is sent.
+    """
 
     applied: bool | None = None
+    ever_applied: bool = False
     reason: str = "no model call was made"
     # Where the lane's control tokens are known from.
     tokens_from: str | None = None
-    # The texts escaped in the latest request, each with how often.
+    # The texts escaped in all requests so far, each with how often.
     escaped: dict[str, int] = field(default_factory=dict)
     # How many requests held a text that was escaped.
     requests: int = 0
+    # Why nothing may ever be escaped in this session's requests, in words
+    # that go before ": nothing is escaped"; ``None`` where the lane's rule
+    # is free to decide.
+    never_because: str | None = None
+    # Told of a breach, with what happened.  It raises.
+    on_breach: Callable[[str], None] | None = None
 
     def note(self, applied: bool, reason: str, tokens: ControlTokens | None) -> None:
-        self.applied, self.reason = applied, reason
-        self.tokens_from = tokens.source if tokens is not None else None
+        """Note the decision for one model call: whether its lane has the
+        escape on, and why."""
+        self.applied = applied
+        if applied and not self.ever_applied:
+            self.ever_applied = True
+            self.reason = reason
+            self.tokens_from = tokens.source if tokens is not None else None
+        elif not self.ever_applied:
+            self.reason = (
+                reason
+                if self.never_because is None
+                else f"{self.never_because}: nothing is escaped (the lane says: {reason})"
+            )
+        if applied and self.never_because is not None:
+            self.breach(f"the lane's rule switched the escape on: {reason}")
 
     def sent(self, escaped: dict[str, int]) -> None:
-        self.escaped = dict(escaped)
+        """Note the texts that were escaped in one request."""
+        for text, count in escaped.items():
+            self.escaped[text] = self.escaped.get(text, 0) + count
         self.requests += bool(escaped)
+        if escaped and self.never_because is not None:
+            self.breach(f"{sum(escaped.values())} texts of a request were escaped")
+
+    def breach(self, what: str) -> None:
+        """Refuse what was about to happen to a request that must go out as it
+        is.  Always raises."""
+        if self.on_breach is not None:
+            self.on_breach(what)
+        raise RuntimeError(
+            f"control-token text was to be escaped where {self.never_because} ({what})"
+        )
 
     def describe(self) -> dict[str, Any]:
         return {
-            "applied": bool(self.applied),
+            "applied": self.ever_applied,
             "reason": self.reason,
             "tokens_from": self.tokens_from,
             "escaped": dict(self.escaped),
+            "requests": self.requests,
         }

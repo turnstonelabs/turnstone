@@ -54,24 +54,14 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
-from turnstone.core.control_text import added_tokens_of, can_meet
-from turnstone.core.text_walk import apply_edits, map_message, map_strings
+from turnstone.core.control_text import can_meet
+from turnstone.core.text_walk import map_message, map_strings
 from turnstone.rollout.settings import SetupError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from turnstone.core.text_walk import Edit
-
-__all__ = [
-    "HarnessFaultError",
-    "PlainText",
-    "Swapped",
-    "added_tokens_of",
-    "can_meet",
-    "plain_text_verdict",
-]
-
 
 # What a control token's text looks like where nothing else says that a
 # token is one: a word in angle or square brackets.
@@ -168,10 +158,6 @@ class PlainText:
 
         return rule
 
-    def cut(self, text: str, seen: Counter[str]) -> str:
-        """*text* with every text of a token cut."""
-        return apply_edits(text, self.cut_edits(text, seen))
-
     def swap(
         self,
         messages: Sequence[Mapping[str, Any]],
@@ -260,13 +246,16 @@ def plain_text_verdict(
       the server writes as that one token), is named.  A description that
       leaves one out is incomplete or stale, and its text would go uncut;
     - a stand-in among them that the template writes nowhere in a
-      conversation with a system message, tools, a call and its result;
+      conversation with a system message, tools, a call, its result and a
+      message of two text parts;
     - that a cut keeps the texts apart (``cut_checked``): none can come about
       across a cut by the texts themselves (:func:`can_meet`), and for each
       one the server, given the cut text, writes the stand-in once, no other
       token of the set, and tokens that read as the text;
     - the whole of it once: a conversation with every text in a system
-      message, a tool's description and a tool result comes out with the
+      message, a user message, a tool's description, a tool result and both
+      parts of a content list of two text parts, and with one text begun in
+      the first of those parts and ended in the second, comes out with the
       tokens the template writes and no others, and reads as the texts.
     """
     left_out: list[str] = []
@@ -310,6 +299,15 @@ def plain_text_verdict(
             ],
         },
         {"role": "tool", "tool_call_id": "call_check", "content": "alpha: first letter"},
+        # A message whose content is a list of two text parts, which a
+        # template writes one after the other.
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "And the next word,"},
+                {"type": "text", "text": " beta."},
+            ],
+        },
     ]
     plain = render(conversation, [_TOOL])
     taken = set(written) | set(plain)
@@ -346,7 +344,17 @@ def plain_text_verdict(
     every = " ".join(known)
     loaded = [dict(m) for m in conversation]
     loaded[0]["content"] = "Be brief. " + every
+    loaded[1]["content"] = "Look up alpha. " + every
     loaded[3]["content"] = "alpha: " + every + " first letter"
+    # In both parts of the list, and one text begun in the first part and
+    # ended in the second: a template that writes the parts one after the
+    # other makes the token's text of the two halves.
+    split = max(known, key=len)
+    half = len(split) // 2
+    loaded[4]["content"] = [
+        {"type": "text", "text": "And the next word, " + every + " " + split[:half]},
+        {"type": "text", "text": split[half:] + " " + every + " beta."},
+    ]
     loaded_tool = {
         **_TOOL,
         "function": {**_TOOL["function"], "description": "Look a word up. " + every},
@@ -361,7 +369,9 @@ def plain_text_verdict(
             "a rendering with the texts cut does not hold the tokens the template writes and "
             "no others"
         )
-    if text_of(stripped).count(every) != 3:
+    # The system message, the user message, the tool's description, the tool
+    # result and the two parts of the list.
+    if text_of(stripped).count(every) != 6:
         return failed("a rendering with the texts cut does not read as the texts")
     verdict.update(
         ok=True,

@@ -66,6 +66,7 @@ from dataclasses import replace
 from typing import Any, NoReturn
 
 from turnstone.core.config import config_file_path, set_config_path
+from turnstone.core.control_text import added_tokens_of
 from turnstone.rollout.container import ContainerSpec
 from turnstone.rollout.episode import (
     DEFAULT_SYSTEM_PROMPT,
@@ -78,7 +79,6 @@ from turnstone.rollout.episode import (
     token_id_route_verdict,
 )
 from turnstone.rollout.idprompt import TokenIdRoute, template_arguments
-from turnstone.rollout.plaintext import added_tokens_of
 from turnstone.rollout.rules import RuleSet
 from turnstone.rollout.settings import (
     SetupError,
@@ -407,6 +407,14 @@ def _parser() -> argparse.ArgumentParser:
         "tokenizer.json), or the word 'server' to ask the server's /tokenizer_info",
     )
     parser.add_argument(
+        "--tokenizer-info-uncompared",
+        action="store_true",
+        help="with --tokenizer-info FILE: take the file as it is where the server does not "
+        "offer its own description of its tokenizer to hold it against (/tokenizer_info "
+        "answers 404). Without this flag such a check fails: a file that is stale or leaves "
+        "a token out would pass unnoticed",
+    )
+    parser.add_argument(
         "--no-plain-text",
         action="store_true",
         help="with --token-id-prompts: render a conversation as it is; needs --no-vision "
@@ -723,6 +731,24 @@ def _json_given(flag: str, said: str) -> Any:
         return None
 
 
+def _in_this_layout(flag: str, given: Any) -> bool:
+    """Whether *given*, what *flag* was handed, is what ``--probe-only`` prints
+    with ``--token-id-prompts`` in this build's layout (:data:`SERVER_CHECK`).
+    An object without the key is what an earlier build printed and is read
+    that way.  One that names another layout was made by another build:
+    refused, because nothing here knows where that build keeps what."""
+    if not isinstance(given, dict) or SERVER_CHECK not in given:
+        return False
+    layout = given[SERVER_CHECK]
+    if isinstance(layout, bool) or layout != SERVER_CHECK_LAYOUT:
+        raise SetupError(
+            f"{flag}: the given check of the server was made by another build (its layout is "
+            f"{_shown(json.dumps(layout)[:40])}, this build reads {SERVER_CHECK_LAYOUT}): check "
+            "the server again with this build"
+        )
+    return True
+
+
 def _verdict_given(
     said: str, *, model: str, endpoint: str, route: str
 ) -> bool | dict[str, Any] | None:
@@ -736,7 +762,7 @@ def _verdict_given(
     if said in ("probe", "yes", "no"):
         return {"probe": None, "yes": True, "no": False}[said]
     verdict = _json_given("--sampler-logprobs", said)
-    if isinstance(verdict, dict) and SERVER_CHECK in verdict and "reflects" not in verdict:
+    if _in_this_layout("--sampler-logprobs", verdict):
         # What --probe-only printed with --token-id-prompts: the probe is one
         # of the verdicts in it.
         verdict = verdict.get("probe")
@@ -766,7 +792,7 @@ def _route_given(
     """
     verdict = _json_given("--token-id-route", said)
     plain: dict[str, Any] | None = None
-    if isinstance(verdict, dict) and SERVER_CHECK in verdict and "ok" not in verdict:
+    if _in_this_layout("--token-id-route", verdict):
         # What --probe-only prints with --token-id-prompts.
         found = verdict.get("plain_text")
         plain = found if isinstance(found, dict) else None
@@ -797,17 +823,19 @@ def _route_given(
 def _tokenizer_source(args: argparse.Namespace) -> dict[str, Any]:
     """Where ``--tokenizer-info`` says the tokenizer's own tokens are named, as
     the configuration takes it; nothing where the flag is not given."""
-    if args.tokenizer_info is None:
-        return {}
-    if args.tokenizer_info == "server":
-        return {"tokenizer_info_from_server": True}
+    if args.tokenizer_info is None or args.tokenizer_info == "server":
+        if args.tokenizer_info_uncompared:
+            raise SetupError(
+                "--tokenizer-info-uncompared is for --tokenizer-info FILE, which is not given"
+            )
+        return {} if args.tokenizer_info is None else {"tokenizer_info_from_server": True}
     named = added_tokens_of(_json_given("--tokenizer-info", "@" + args.tokenizer_info))
     if not named:
         raise SetupError(
             f"--tokenizer-info: {args.tokenizer_info} names no tokens of the tokenizer's own "
             "(added_tokens_decoder or added_tokens)"
         )
-    return {"added_tokens": named}
+    return {"added_tokens": named, "tokenizer_info_uncompared": args.tokenizer_info_uncompared}
 
 
 def _wants(args: argparse.Namespace) -> dict[str, Any]:
@@ -822,6 +850,7 @@ def _wants(args: argparse.Namespace) -> dict[str, Any]:
             ("--vision", args.vision),
             ("--no-plain-text", args.no_plain_text),
             ("--tokenizer-info", args.tokenizer_info is not None),
+            ("--tokenizer-info-uncompared", args.tokenizer_info_uncompared),
         ):
             if given:
                 raise SetupError(f"{flag} is for --token-id-prompts, which is not given")
@@ -968,7 +997,24 @@ def main(argv: list[str] | None = None) -> int:
         _settle(sys.stderr)
 
 
-def _probe_only(args: argparse.Namespace, api_key: str, extra_body: dict[str, Any]) -> int:
+def _probe_wants(args: argparse.Namespace) -> dict[str, Any]:
+    """What the flags of a ``--probe-only`` command say about plain text and
+    vision.  Refuses flags that do not go together and a check that would
+    have nothing to read plain text with: all of it from the command line
+    and the files it names, before anything is asked of anyone."""
+    wants = _wants(args)
+    if wants.get("plain_text") and args.tokenizer_info is None:
+        raise SetupError(
+            "the rollouts will read the text of the tokenizer's own tokens as plain text, and "
+            "the check needs those tokens named: give --tokenizer-info FILE (the model's "
+            "tokenizer_config.json), --tokenizer-info server, or --no-plain-text"
+        )
+    return wants
+
+
+def _probe_only(
+    args: argparse.Namespace, api_key: str, extra_body: dict[str, Any], wants: dict[str, Any]
+) -> int:
     """Probe the server and print the verdict, for a caller that probes once
     and hands the verdict to every rollout of a batch.
 
@@ -982,14 +1028,10 @@ def _probe_only(args: argparse.Namespace, api_key: str, extra_body: dict[str, An
     will use is there: the probe, the route, plain text unless
     ``--no-plain-text``, and images unless ``--no-vision``.  Anything else is
     2: a rollout handed such a verdict would be refused.
+
+    *wants* is what the flags say about plain text and vision
+    (:func:`_probe_wants`).
     """
-    wants = _wants(args)
-    if wants.get("plain_text") and args.tokenizer_info is None:
-        raise SetupError(
-            "the rollouts will read the text of the tokenizer's own tokens as plain text, and "
-            "the check needs those tokens named: give --tokenizer-info FILE (the model's "
-            "tokenizer_config.json), --tokenizer-info server, or --no-plain-text"
-        )
     sampling = resolve_sampling(
         model=args.model,
         base_url=args.base_url,
@@ -1052,25 +1094,34 @@ def _probe_only(args: argparse.Namespace, api_key: str, extra_body: dict[str, An
 
 
 def _main(args: argparse.Namespace, given: set[str]) -> int:
+    if not args.probe_only:
+        if args.out is not None:
+            # First of all: whatever is refused or fails from here on, no file
+            # of an earlier run is left where this run's record belongs.
+            _claim(args.out, _read_by(args))
+        return _command(args, given)
     # A probe's verdict is read by the rollouts of a batch that is under way.
     # The one an earlier probe left stays readable until the new one takes
-    # its place in one step, and is removed when this command ends with none.
-    replacing = bool(args.probe_only and args.out is not None)
-    if args.out is not None:
-        # First of all: whatever is refused or fails from here on, no file of
-        # an earlier run is left where this run's record belongs.
-        _claim(args.out, _read_by(args), remove=not replacing)
-    if not replacing:
-        return _command(args, given)
+    # its place in one step.  It is removed only when this command made a
+    # check and ends without a verdict to put there.  A command that is
+    # refused (its flags, a file it names, the configuration) checked
+    # nothing: what an earlier probe found still stands, and stays.
+    wants = _probe_wants(args)
+    if args.out is None:
+        return _command(args, given, wants)
+    _claim(args.out, _read_by(args), remove=False)
     try:
-        return _command(args, given)
+        return _command(args, given, wants)
+    except SetupError:
+        raise
     except BaseException:
         _gone(args.out)
         raise
 
 
-def _command(args: argparse.Namespace, given: set[str]) -> int:
-    """What the command does once its ``--out`` is looked at."""
+def _command(args: argparse.Namespace, given: set[str], wants: dict[str, Any] | None = None) -> int:
+    """What the command does once its ``--out`` is looked at.  *wants* is
+    what a ``--probe-only`` command's flags say (:func:`_probe_wants`)."""
     if args.config is not None:
         set_config_path(args.config)
     # Read now, so that a configuration file that cannot be used is refused
@@ -1092,7 +1143,7 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
             raise SetupError(f"--api-key-env: the environment has no {args.api_key_env}")
         api_key = os.environ[args.api_key_env]
     if args.probe_only:
-        return _probe_only(args, api_key, extra_body)
+        return _probe_only(args, api_key, extra_body, wants if wants is not None else {})
     task = _task(args, given)
     verifier_command: list[str] | None = None
     if args.verifier_command is not None:

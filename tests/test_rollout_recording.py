@@ -250,6 +250,37 @@ class TestWhatMakesACallUntrustworthy:
         assert record.logprobs == []
         assert any("did not arrive one to one" in p for p in record.problems())
 
+    def test_a_part_out_of_step_still_says_how_the_reply_ended(self):
+        """Its tokens are the call's, its log-probabilities are dropped, and the
+        finish reason it carries is noted, as on the routes for token IDs."""
+        from types import SimpleNamespace
+
+        from turnstone.rollout.recording import CallRecord, _take
+
+        record = CallRecord(index=0, streamed=True, request={})
+        entry = {"token": "token_id:9", "logprob": -0.1, "bytes": [97]}
+        choice = SimpleNamespace(
+            index=0, token_ids=[5], logprobs={"content": [entry]}, finish_reason="stop"
+        )
+        _take(record, SimpleNamespace(choices=[choice], usage=None, prompt_token_ids=[1, 2]))
+        assert record.ids_checked is True and record.aligned is False and record.logprobs == []
+        assert record.token_ids == [5] and record.prompt_token_ids == [1, 2]
+        assert record.finish_reason == "stop"
+
+    def test_a_part_whose_values_cannot_be_read_costs_the_call_no_token(self):
+        from types import SimpleNamespace
+
+        from turnstone.rollout.recording import CallRecord, _take
+
+        record = CallRecord(index=0, streamed=True, request={})
+        entry = {"token": "token_id:5", "logprob": None, "bytes": [97]}
+        choice = SimpleNamespace(
+            index=0, token_ids=[5], logprobs={"content": [entry]}, finish_reason=None
+        )
+        _take(record, SimpleNamespace(choices=[choice], usage=None, prompt_token_ids=None))
+        assert record.token_ids == [5] and record.unreadable is not None
+        assert record.aligned is False and record.logprobs == []
+
     def test_no_usage_means_no_check(self):
         with ScriptedChatServer([STEP], faults={0: "no_usage"}) as server:
             record = record_one(server)
