@@ -370,8 +370,10 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   A probe that is refused for its command line leaves the verdict an earlier
   probe wrote.
   With images on, `read_file` hands the model an image only if it can be
-  sized (the server's own limits); for any other the call fails and the
-  model is told why.
+  sized (the server's own limits), has no more than 40 megapixels and, for
+  a JPEG, no more than 100 scans; for any other the call fails and the
+  model is told why. A harness whose Pillow cannot decode PNG, JPEG and
+  WebP fails the check of the server and runs nothing with images.
   See [the rollout guide](docs/rollout.md#the-text-of-the-tokenizers-own-tokens).
 
 ### Fixed

@@ -126,6 +126,7 @@ from turnstone.rollout.vision import (
     VisionRoute,
     generate_body,
     image_sources,
+    pillow_lacks,
 )
 
 if TYPE_CHECKING:
@@ -1055,11 +1056,18 @@ class RolloutSession(HeadlessSession):
     ) -> tuple[str, str | list[dict[str, Any]]]:
         """An image file as ``read_file`` hands it on, for the session and for
         a sub-agent.  In a run whose model sees images, an image that cannot
-        be sized here is not put into the conversation: the server would not
-        take it either, and can answer it as a failure of its own, which is
-        no outcome a file the model wrote may bring about.  The call fails
-        instead, and the model is told why.  The bytes looked at are the
-        very ones the result carries."""
+        be sized here, or is more than the harness decodes for a model (a
+        JPEG of too many scans, more than 40 megapixels), is not put into
+        the conversation: the server would not take it, can answer it as a
+        failure of its own, or would take minutes over it, and none of these
+        is an outcome a file the model wrote may bring about.  The call fails
+        instead, and the model is told why.
+
+        The bytes looked at are the ones the result carries and the
+        conversation keeps.  A sub-agent sends them as they are.  The
+        session's own requests send them as they are too, except an image
+        its EXIF turns: that one goes out turned upright and encoded anew,
+        and is sized again when it is first sent."""
         found = super()._exec_read_image(call_id, path, resolved)
         output = found[1]
         if self._image_check is None or not isinstance(output, list):
@@ -2750,10 +2758,20 @@ def _seeing(
     refused with :class:`SetupError`, whatever the reason: it never goes on
     without them.  What can be told without the server (plain text switched
     off, no folder for the images, a request parameter the generate route
-    has no place for) was refused before the server was asked anything."""
+    has no place for) was refused before the server was asked anything.
+    A harness whose Pillow cannot decode a format a file read hands on is
+    refused here, whatever the check of the server says: the check may have
+    been made by another machine."""
     if config.vision is False:
         return None
     refused = _cannot_see
+    # This process sizes the run's images, whoever checked the server.
+    lacks = pillow_lacks()
+    if lacks is not None:
+        raise refused(
+            f"{lacks}, so every image of that format would be refused to the model, whatever "
+            "it holds"
+        )
     found = route.get("vision")
     if not isinstance(found, dict):
         raise refused(

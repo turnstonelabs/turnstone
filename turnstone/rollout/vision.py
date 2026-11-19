@@ -54,6 +54,12 @@ from typing import TYPE_CHECKING, Any
 
 from openai import APIStatusError, Stream
 
+from turnstone.core.images import (
+    _MAX_IMAGE_PIXELS,
+    MAX_JPEG_SCANS,
+    _flatten_slot,
+    too_many_jpeg_scans,
+)
 from turnstone.core.log import get_logger
 from turnstone.core.session import ChatSession
 from turnstone.rollout.idprompt import (
@@ -532,6 +538,83 @@ def server_image_size(data: bytes) -> tuple[int, int]:
     return int(width), int(height)
 
 
+# The most pixels of an image the model opens itself: the framework's own
+# bound on an image it decodes (``turnstone.core.images``), which an image
+# from one of the task's servers is held to where it is taken.  Lower than
+# what a server loads (:data:`SERVER_MAX_IMAGE_PIXELS`), and meant to be:
+# sizing an image decodes it, in the process that runs the episode, on a
+# machine that runs the sandboxes too, and what a decode holds grows with the
+# pixels, whatever the file's size.  The model loses nothing it would have
+# seen: the image processor brings every image above its ``max_pixels`` (about
+# 16.8 million) down to that.
+OPENED_MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
+
+# What the Pillow on this side must have been built with, by the name Pillow
+# checks it under, and the format each decodes: the three a file read hands on.
+_NEEDED_DECODERS = {"zlib": "PNG", "jpg": "JPEG", "webp": "WebP"}
+
+
+def pillow_lacks() -> str | None:
+    """What the Pillow on this side lacks of what a run's images need, in
+    words; ``None`` where it lacks nothing.
+
+    A Pillow built without a decoder opens no image of that format, so a run
+    would refuse the model every such image, whatever it holds, and go on:
+    nothing would show it but the model's tool errors.  Asked by the check of
+    a server and by every run that is to see images, which fail on it."""
+    try:
+        import PIL
+        from PIL import features
+    except ImportError as error:
+        return f"Pillow cannot be imported on this side ({str(error)[:200]})"
+    lacking = [
+        f"{decodes} ({name})"
+        for name, decodes in _NEEDED_DECODERS.items()
+        if not features.check(name)
+    ]
+    if not lacking:
+        return None
+    return (
+        f"the Pillow on this side ({PIL.__version__}) was built without what decodes "
+        f"{', '.join(lacking)}"
+    )
+
+
+def refused_undecoded(data: bytes) -> str | None:
+    """Why the image *data* holds is not decoded for a model that opened it,
+    told from its bytes and its header alone; ``None`` where it may be.
+
+    The two limits the framework puts on an image before it decodes one
+    (``turnstone.core.images``), which the server's own sizing
+    (:func:`server_image_size`) leaves out on purpose:
+
+    - a JPEG saved in more scans than an encoder writes
+      (:func:`~turnstone.core.images.too_many_jpeg_scans`): each scan costs a
+      pass over the whole picture, so such a file takes minutes to decode at
+      a size a file read admits, here and again on the server with every
+      request that carries it;
+    - more pixels than :data:`OPENED_MAX_IMAGE_PIXELS`, read off the header.
+
+    Nothing is decoded: the scans are counted in the bytes, and the size is
+    what the header says.  Raises what Pillow raises for bytes it cannot
+    open."""
+    from PIL import Image as _Pil
+
+    if too_many_jpeg_scans(data):
+        return (
+            f"it is a JPEG saved in more than {MAX_JPEG_SCANS} scans, which takes too long to "
+            "decode"
+        )
+    with _Pil.open(io.BytesIO(data), formats=_SERVER_FORMATS) as opened:
+        wide, high = opened.size
+    if wide * high > OPENED_MAX_IMAGE_PIXELS:
+        return (
+            f"it has {wide * high} pixels ({wide}x{high}), and an image opened here may have "
+            f"{OPENED_MAX_IMAGE_PIXELS} at most"
+        )
+    return None
+
+
 def smart_resize(
     height: int, width: int, factor: int, min_pixels: int, max_pixels: int
 ) -> tuple[int, int]:
@@ -696,9 +779,15 @@ class Vision:
     def _size(self, data: bytes) -> dict[str, Any]:
         """What the server makes of the image *data* holds, worked out here
         with the server's own code.  Raises what that code raises for an
-        image it does not take."""
+        image it does not take.
+
+        Sizing decodes the image, and a process decodes one image at a time:
+        the framework's own turn for it (``turnstone.core.images``), which
+        the tool calls of an episode, its sub-agents and everything else in
+        the process that decodes an image wait for."""
         rule = self.route.resize
-        width, height = server_image_size(data)
+        with _flatten_slot:
+            width, height = server_image_size(data)
         wide, high = rule.size(width, height)
         return {
             "width": width,
@@ -714,24 +803,41 @@ class Vision:
 
     def unshowable(self, data: bytes) -> str | None:
         """Why the image *data* holds cannot be shown to the model, ``None``
-        where it can: asked where an image is about to enter a conversation.
+        where it can: asked where the model opens an image, before it enters
+        a conversation.
 
-        The image is sized here as it will be when it is sent, with the
-        server's own code and so with the server's own limits: bytes Pillow
-        cannot open or decode (a file cut short), more pixels than the
-        server loads (:data:`SERVER_MAX_IMAGE_PIXELS`, which is also where
-        Pillow, left at its default, refuses to open an image at all), an
-        image more than 200 times longer than wide, which the image
-        processor refuses.  A server refuses such an image, and not always as a
-        request it will not take: one answers the largest of them as a
+        First what can be told without decoding it
+        (:func:`refused_undecoded`): a JPEG of more scans than an encoder
+        writes, and more pixels than :data:`OPENED_MAX_IMAGE_PIXELS`.  Then
+        the image is sized as it is when it is sent, with the server's own
+        code and so with the server's own limits: bytes Pillow cannot open or
+        decode (a file cut short), an image more than 200 times longer than
+        wide, which the image processor refuses.  The server's limit on
+        pixels (:data:`SERVER_MAX_IMAGE_PIXELS`) is above the one here, and
+        Pillow's own, lower in some process, refuses at the open.
+
+        A server refuses what the sizing refuses, and not always as a
+        request it will not take: one answers the largest images as a
         failure of its own, which would end the run as a failure of the
-        machinery over a picture the model made.  So it is kept out of the
-        conversation, and the model is told why instead.  An image that is
-        let in is sized already when it is sent."""
+        machinery over a picture the model made.  The two limits before it
+        keep the check itself from being one: its time and the memory it
+        holds are bounded by them, whatever the file.  So such an image is
+        kept out of the conversation, and the model is told why instead.
+
+        An image that is let in is not sized again where the very bytes
+        that were checked are sent.  That is every image a sub-agent opened,
+        and the session's own unless its EXIF turns it: such an image goes
+        out turned upright and encoded anew
+        (:func:`~turnstone.core.images.normalize_image_orientation`), other
+        bytes, which are sized when they are first sent, as an image is that
+        came another way."""
         sha256 = hashlib.sha256(data).hexdigest()
         if sha256 in self._sizes:
             return None
         try:
+            why = refused_undecoded(data)
+            if why is not None:
+                return why
             self._sizes[sha256] = self._size(data)
         except Exception as error:
             return f"{type(error).__name__}: {str(error)[:200]}"
@@ -1253,6 +1359,12 @@ def check_vision_route(
     # The library the images are opened and turned with on this side: a
     # server turns an image with its own copy of it.
     verdict["sized_with"] = {"pillow": _pillow_version()}
+    # The check's own images are PNG.  A run's model opens JPEG and WebP too.
+    lacks = pillow_lacks()
+    if lacks is not None:
+        return failed(
+            f"{lacks}: a run would refuse the model every image of that format, whatever it holds"
+        )
 
     # 4. The generate route expands the placeholders to the very rendering.
     red = Image.of(png(96, 96, _RED), "image/png")

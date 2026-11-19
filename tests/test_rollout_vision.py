@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from tests._jpeg_helpers import jpeg_with_scans
 from tests._scripted_chat_server import (
     ADDED_TOKENS,
     IMAGE,
@@ -32,6 +33,7 @@ from tests.test_rollout_episode import (  # noqa: F401
     _run,
 )
 from tests.test_rollout_idprompt import MESSAGES, ROUTE, STEP, ask, make_client, turn_of
+from turnstone.core.images import MAX_JPEG_SCANS
 from turnstone.rollout import cli
 from turnstone.rollout.budget import Budgets, Meter
 from turnstone.rollout.episode import Task, token_id_route_verdict
@@ -53,6 +55,7 @@ from turnstone.rollout.vision import (
     generate_body,
     image_sources,
     images_of,
+    pillow_lacks,
     png,
     server_image_size,
     smart_resize,
@@ -485,6 +488,37 @@ class TestTheCheck:
             verdict = self.check()
             assert verdict["ok"] is False and why in verdict["reason"]
 
+    @pytest.mark.parametrize(
+        ("missing", "named"),
+        [
+            (("jpg",), "JPEG (jpg)"),
+            (("webp",), "WebP (webp)"),
+            (("zlib",), "PNG (zlib)"),
+            (("jpg", "webp"), "JPEG (jpg), WebP (webp)"),
+        ],
+    )
+    def test_a_pillow_without_a_decoder_a_run_needs_fails_the_check(
+        self, monkeypatch: pytest.MonkeyPatch, missing: tuple[str, ...], named: str
+    ) -> None:
+        """The check's own images are PNG, so it would pass on a harness
+        that can open no JPEG or WebP, and a run would then refuse the model
+        every such image and still be trainable."""
+        import PIL
+
+        assert pillow_lacks() is None
+        _without(monkeypatch, *missing)
+        assert named in str(pillow_lacks())
+        verdict = self.check()
+        assert verdict["ok"] is False
+        assert verdict["reason"] == (
+            f"the Pillow on this side ({PIL.__version__}) was built without what decodes {named}: "
+            "a run would refuse the model every image of that format, whatever it holds"
+        )
+        # Which Pillow that was is said beside it, and no run takes the verdict.
+        assert verdict["sized_with"] == {"pillow": PIL.__version__}
+        with pytest.raises(SetupError, match="the server cannot be sent images"):
+            VisionRoute.from_verdict(verdict)
+
     def test_a_verdict_must_hold_what_a_passed_check_found(self) -> None:
         verdict = self.check()
         for key, why in (
@@ -837,12 +871,33 @@ UNSHOWABLE: dict[str, bytes] = {
 }
 
 
+# Files a server would take, and the harness does not decode for a model: a
+# JPEG of more scans than an encoder writes (each costs a pass over the whole
+# picture), and an image of more than 40 megapixels.  The second says so in
+# its header and holds no pixel data to speak of: nothing that decoded it
+# would get through.
+TOO_MUCH: dict[str, bytes] = {
+    "slow.jpg": jpeg_with_scans(MAX_JPEG_SCANS + 50),
+    "big.png": _png_of(8000, 5001, bytes(4)),
+}
+SLOW_WHY = f"it is a JPEG saved in more than {MAX_JPEG_SCANS} scans, which takes too long to decode"
+BIG_WHY = "it has 40008000 pixels (8000x5001), and an image opened here may have 40000000 at most"
+
+
+def _without(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
+    """Pillow as one built without the decoders *names* answers for itself."""
+    from PIL import features
+
+    real = features.check
+    monkeypatch.setattr(features, "check", lambda name: name not in names and real(name))
+
+
 class _OddImagesSandbox(_ImageSandbox):
-    """The same, with the files of ``UNSHOWABLE`` beside the image."""
+    """The same, with the files of ``UNSHOWABLE`` and ``TOO_MUCH`` beside the image."""
 
     def start(self) -> Any:
         environment = super().start()
-        for name, data in UNSHOWABLE.items():
+        for name, data in {**UNSHOWABLE, **TOO_MUCH}.items():
             with open(os.path.join(self.root, name), "wb") as handle:
                 handle.write(data)
         return environment
@@ -1157,9 +1212,8 @@ class TestWholeRollouts:
     def test_an_image_that_is_let_in_is_sized_once(
         self, monkeypatch: pytest.MonkeyPatch, pillows_limit: int | None
     ) -> None:
-        """And the server's limit on an image's pixels holds whatever
-        Pillow's own is set to in this process: its default, a lower one, or
-        none at all."""
+        """And the limits on an image's pixels hold whatever Pillow's own is
+        set to in this process: its default, a lower one, or none at all."""
         from PIL import Image as Pil
 
         monkeypatch.setattr(Pil, "MAX_IMAGE_PIXELS", pillows_limit)
@@ -1170,14 +1224,265 @@ class TestWholeRollouts:
         assert all(why.values()), why
         assert "250000000 pixels" in str(why["huge.png"])
         if pillows_limit is None:
-            assert "exceed the maximum of 178956970 pixels" in str(why["huge.png"])
+            # Pillow lets it through, and the limit for a model's image holds.
+            assert "may have 40000000 at most" in str(why["huge.png"])
         assert "aspect ratio" in str(why["line.png"])
         assert list(seeing._sizes) == [RED.sha256]
-        # Just under the server's limit by its header: not refused for its size.
-        under = _png_of(13377, 13377, bytes(4))
+        # The server's own limit stands in the sizing a run does for every
+        # image it sends, where Pillow's does not come first: over it by the
+        # header, and just under it (refused for its data, not its size).
         assert 13377 * 13377 <= 178_956_970 < 13378 * 13378
-        if pillows_limit != 40_000_000:
-            assert "pixels" not in str(seeing.unshowable(under))
+        if pillows_limit is None:
+            with pytest.raises(ValueError, match="exceed the maximum of 178956970 pixels"):
+                server_image_size(_png_of(13378, 13378, bytes(4)))
+            with pytest.raises(OSError):
+                server_image_size(_png_of(13377, 13377, bytes(4)))
+
+    def test_a_jpeg_of_too_many_scans_is_refused_before_anything_opens_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each scan costs a pass over the whole picture, here and on the
+        server with every request: the scans are counted in the bytes."""
+        from PIL import Image as Pil
+
+        import turnstone.rollout.vision as vision_module
+
+        opened: list[int] = []
+        real_open, real_size = Pil.open, vision_module.server_image_size
+
+        def opening(*args: Any, **options: Any) -> Any:
+            opened.append(1)
+            return real_open(*args, **options)
+
+        def sizing(data: bytes) -> tuple[int, int]:
+            opened.append(2)
+            return real_size(data)
+
+        monkeypatch.setattr(Pil, "open", opening)
+        monkeypatch.setattr(vision_module, "server_image_size", sizing)
+        seeing = Vision(SEEING)
+        own = jpeg_with_scans(0).count(bytes([0xFF, 0xDA]))
+        over = jpeg_with_scans(MAX_JPEG_SCANS - own + 1)
+        assert seeing.unshowable(over) == SLOW_WHY
+        assert seeing.unshowable(TOO_MUCH["slow.jpg"]) == SLOW_WHY
+        assert opened == [] and seeing._sizes == {}
+        # One with the scans an encoder writes is let in, and one at the limit.
+        for scans in (0, MAX_JPEG_SCANS - own):
+            usual = jpeg_with_scans(scans)
+            assert seeing.unshowable(usual) is None
+            assert seeing._sizes[hashlib.sha256(usual).hexdigest()]["width"] == 64
+        assert opened.count(2) == 2
+
+    def test_an_image_of_more_than_40_megapixels_is_refused_from_its_header(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """What a decode holds grows with the pixels, whatever the file's
+        size, in the process that runs the episode: the size is read off the
+        header, and nothing is decoded."""
+        import io
+
+        from PIL import Image as Pil
+
+        import turnstone.rollout.vision as vision_module
+
+        monkeypatch.setattr(Pil, "MAX_IMAGE_PIXELS", 89478485)
+
+        def saved(mode: str, size: tuple[int, int], fmt: str, **options: Any) -> bytes:
+            out = io.BytesIO()
+            Pil.new(mode, size).save(out, fmt, **options)
+            return out.getvalue()
+
+        # Whole images, a row over the limit, in the three formats a file
+        # read hands on, and one at the limit.
+        over = [
+            saved("L", (8000, 5001), "PNG", compress_level=1),
+            saved("L", (8000, 5001), "JPEG"),
+            saved("L", (8000, 5001), "WEBP", lossless=True, quality=0, method=0),
+        ]
+        at_the_limit = saved("1", (8000, 5000), "PNG", compress_level=1)
+        decoded: list[str] = []
+        real_size, real_load = vision_module.server_image_size, Pil.Image.load
+
+        def sizing(data: bytes) -> tuple[int, int]:
+            decoded.append("sized")
+            return real_size(data)
+
+        def loading(image: Any, *args: Any) -> Any:
+            decoded.append("loaded")
+            return real_load(image, *args)
+
+        seeing = Vision(SEEING)
+        assert vision_module.OPENED_MAX_IMAGE_PIXELS == 40_000_000 == 8000 * 5000
+        with monkeypatch.context() as watched:
+            watched.setattr(vision_module, "server_image_size", sizing)
+            watched.setattr(Pil.Image, "load", loading)
+            # One that holds no pixel data to speak of: by its header.
+            assert seeing.unshowable(TOO_MUCH["big.png"]) == BIG_WHY
+            for whole in over:
+                assert seeing.unshowable(whole) == BIG_WHY
+            assert decoded == [] and seeing._sizes == {}
+            # At the limit it is let in, and sized.
+            assert seeing.unshowable(at_the_limit) is None
+            assert decoded[0] == "sized" and "loaded" in decoded
+        (sized,) = seeing._sizes.values()
+        assert (sized["width"], sized["height"]) == (8000, 5000)
+
+    def test_one_image_is_decoded_at_a_time_in_a_process(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An episode runs several tool calls at once, and its sub-agents
+        theirs: the images they open wait their turn, the framework's own."""
+        import threading
+        import time
+
+        import turnstone.rollout.vision as vision_module
+        from turnstone.core import images as framework
+
+        at_once: list[int] = []
+        inside = 0
+        count = threading.Lock()
+
+        def sizing(_data: bytes) -> tuple[int, int]:
+            nonlocal inside
+            with count:
+                inside += 1
+                at_once.append(inside)
+            time.sleep(0.02)
+            with count:
+                inside -= 1
+            return 64, 64
+
+        def together(work: Any) -> None:
+            begin = threading.Barrier(6)
+
+            def one(number: int) -> None:
+                begin.wait(timeout=30)
+                work(number)
+
+            threads = [threading.Thread(target=one, args=(n,)) for n in range(6)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+            assert not any(thread.is_alive() for thread in threads)
+
+        # Without the turn they overlap: the test can tell.
+        together(lambda _number: sizing(b""))
+        assert max(at_once) > 1
+        at_once.clear()
+        monkeypatch.setattr(vision_module, "server_image_size", sizing)
+        # Two sessions' worth: the turn is the process's, not a run's.
+        seeing = [Vision(SEEING), Vision(SEEING)]
+        pictures = [png(16 + 2 * n, 16, (30, 60, 220)) for n in range(6)]
+        told: list[str | None] = []
+        together(lambda number: told.append(seeing[number % 2].unshowable(pictures[number])))
+        assert told == [None] * 6 and at_once == [1] * 6
+        # It is the framework's turn, so no other decode of the process overlaps either.
+        with framework._flatten_slot:
+            waiting = threading.Thread(target=seeing[0].unshowable, args=(png(64, 64, (0, 0, 0)),))
+            waiting.start()
+            waiting.join(timeout=0.2)
+            assert waiting.is_alive() and at_once == [1] * 6
+        waiting.join(timeout=30)
+        assert not waiting.is_alive() and at_once == [1] * 7
+
+    def test_what_is_too_much_to_decode_is_refused_where_it_enters_and_the_run_goes_on(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A JPEG of thousands of scans, an image of more pixels than the
+        harness decodes for a model: the model made the file, so the check
+        of it must not become the machinery's failure either."""
+        from PIL import Image as Pil
+
+        monkeypatch.setattr(Pil, "MAX_IMAGE_PIXELS", 89478485)
+        script = [
+            _reads("slow.jpg", "I look at it."),
+            _reads("big.png", "The next."),
+            _reads("shot.png", "And the one that can be shown."),
+            {"content": "Only shot.png could be shown."},
+        ]
+        with ScriptedChatServer(script, sampler_logprobs=True, **SERVED) as server:
+            record, _box = _run(
+                server,
+                task=LOOKS,
+                sandbox=_OddImagesSandbox(),
+                **{**SEES, "image_dir": str(tmp_path / "i")},
+            )
+            asked = json.dumps([server.tokenize_requests, server.generate_requests])
+        assert record["finish_state"] == "completed", record["error"]
+        assert record["trainable"] is True and record["one_sequence"] is True
+        assert cli._status(record) == 0 and record["turns"] == 4
+        told = [m["content"] for m in record["messages"] if m["role"] == "tool"]
+        assert told[0] == f"Error: slow.jpg cannot be shown as an image: {SLOW_WHY}"
+        assert told[1] == f"Error: big.png cannot be shown as an image: {BIG_WHY}"
+        assert [entry["ok"] for entry in record["tool_log"]] == [False, False, True]
+        assert [image["sha256"] for image in record["vision"]["images"]] == [RED.sha256]
+        assert Image.of(TOO_MUCH["slow.jpg"], "image/jpeg").url not in asked
+        assert Image.of(TOO_MUCH["big.png"], "image/png").url not in asked
+        assert RED.url in asked
+
+    def test_a_sub_agent_is_refused_what_is_too_much_the_same_way(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from PIL import Image as Pil
+
+        monkeypatch.setattr(Pil, "MAX_IMAGE_PIXELS", 89478485)
+        parent = [{"reasoning": "I delegate.", "tool_calls": [SPAWN]}, {"content": "done"}]
+        agent = [
+            _reads("slow.jpg", "I look at it."),
+            _reads("big.png", "The next."),
+            {"content": "Neither can be shown."},
+        ]
+        with ScriptedChatServer(
+            parent, agent_script=agent, sampler_logprobs=True, **SERVED
+        ) as server:
+            record, _box = _run(
+                server,
+                task=LOOKS,
+                sandbox=_OddImagesSandbox(),
+                **{**SEES, "image_dir": str(tmp_path / "i")},
+            )
+            asked = json.dumps([server.tokenize_requests, server.generate_requests])
+        assert record["finish_state"] == "completed", record["error"]
+        assert record["trainable"] is True and not record["subagents"]["failures"]
+        slow, big = record["subagents"]["tool_log"]
+        assert (slow["tool"], slow["ok"]) == ("read_file", False)
+        assert slow["result"] == f"Error: slow.jpg cannot be shown as an image: {SLOW_WHY}"
+        assert (big["tool"], big["ok"]) == ("read_file", False)
+        assert big["result"] == f"Error: big.png cannot be shown as an image: {BIG_WHY}"
+        assert Image.of(TOO_MUCH["slow.jpg"], "image/jpeg").url not in asked
+        assert Image.of(TOO_MUCH["big.png"], "image/png").url not in asked
+
+    def test_a_harness_whose_pillow_lacks_a_decoder_runs_nothing(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It would refuse the model every image of that format and go on,
+        trainable: refused instead, by the check of the server and by the
+        run's own look at the Pillow it sizes with."""
+        settings = {"image_dir": str(tmp_path / "i")}
+        with ScriptedChatServer(LOOK, sampler_logprobs=True, **SERVED) as server:
+            # A verdict made where Pillow is whole, handed to a harness where it is not.
+            whole, plain = self.given(server)
+            assert whole["vision"]["ok"] is True
+            handed = {"token_id_prompts": True, "plain_text_verdict": plain, **settings}
+            with monkeypatch.context() as patched:
+                _without(patched, "webp")
+                with pytest.raises(SetupError, match=r"built without what decodes WebP \(webp\)"):
+                    _run(server, task=LOOKS, sandbox=_ImageSandbox(), plain_text=True, vision=None, token_id_route=whole, **handed)  # fmt: skip
+                # A verdict made where it is not: the check did not pass.
+                lacking, _plain = self.given(server)
+                assert lacking["ok"] is True and lacking["vision"]["ok"] is False
+            # Handed to a harness where Pillow is whole, it is refused as any failed check is.
+            with pytest.raises(SetupError, match="the image check of the server did not pass"):
+                _run(server, task=LOOKS, sandbox=_ImageSandbox(), plain_text=True, vision=None, token_id_route=lacking, **handed)  # fmt: skip
+        # A run that makes its own checks is refused the same way, and said
+        # aloud it goes ahead without images.
+        _without(monkeypatch, "jpg")
+        for vision in (None, True):
+            with pytest.raises(SetupError, match=r"built without what decodes JPEG \(jpg\)"):
+                self.run(tmp_path, vision=vision, **settings)
+        record = self.run(tmp_path, vision=False, plain_text=False, **settings)
+        assert record["vision"] == {"applied": False, "reason": "switched off"}
 
     def test_sizing_that_is_not_the_servers_is_a_harness_fault(
         self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
@@ -1391,6 +1696,16 @@ class TestTheCommand:
             assert status == 2 and verdict["route"]["ok"] is True
             assert verdict["route"]["vision"]["ok"] is False
             assert "refused unless they say --no-vision" in capsys.readouterr().err
+
+    def test_a_harness_whose_pillow_lacks_a_decoder_fails_the_probe(
+        self, tmp_path: Any, capsys: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _without(monkeypatch, "jpg", "webp")
+        status, verdict, _asked = self.probe(tmp_path, "--tokenizer-info", "server")
+        assert status == 2 and verdict["route"]["ok"] is True
+        assert verdict["route"]["vision"]["ok"] is False
+        assert "JPEG (jpg), WebP (webp)" in verdict["route"]["vision"]["reason"]
+        assert "refused unless they say --no-vision" in capsys.readouterr().err
 
     def test_the_same_server_passes_for_runs_without_images(self, tmp_path: Any) -> None:
         status, verdict, asked = self.probe(
