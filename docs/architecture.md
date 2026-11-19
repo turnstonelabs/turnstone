@@ -1273,6 +1273,61 @@ OpenAI SDK, so no extra dependency is needed.
 singleton provider instance (thread-safe). `create_client(name, base_url,
 api_key)` creates the appropriate SDK client.
 
+### Control-token text on self-hosted lanes
+
+A self-hosted server renders a conversation by writing its chat template out as text and
+tokenizing all of it, and its tokenizer writes a control token wherever it meets the token's
+text. So a tool result, a file or a fetched page that holds the characters of the end-of-turn
+token ends the message there, and what follows reads as a new turn or a tool call. Nothing on
+such a server marks a part of the prompt as content. `turnstone/core/control_text.py` closes that
+on the lanes it applies to:
+
+- **The escape.** In the copy of a request that is sent, every control-token text gets a
+  backslash after its first character (a text that already stands escaped gets one more, so no
+  two texts are sent as the same one). It covers every text of the request: messages of every
+  role, tool definitions, reasoning, the names and arguments of calls, and the model's own
+  earlier turns, which a server renders again from their text. Arguments are escaped as the
+  values their JSON holds, literal by literal, and stay JSON. The stored conversation is not
+  changed.
+- **The inverse.** The model reads the escaped text and writes it back with the backslash (an
+  edit of the file it read, a quotation). One backslash is taken out of every escaped
+  control-token text in what the model wrote, before anything uses it: the reply's text, its
+  reasoning, the arguments of its calls, the provider's own blocks, and the stream a display
+  watches. A tool runs on the characters the file holds, and the stored turn holds them. The
+  turn is escaped again when it is next sent. The inverse is applied only to a reply whose
+  request held an escaped text.
+- **One place.** `model_turn` applies both, around the one `create_streaming` call. No provider
+  adapter escapes anything, and `ModelTurnResult.wire_msgs` is the lowered list from before the
+  escape.
+- **Which lanes.** `control_text.decide`: the model definition's own word where it has one
+  (`escape_control_tokens` in its capabilities, `true` or `false`); otherwise on only for a lane
+  declared self-hosted, which is an `openai-compatible` Chat Completions lane or an
+  `anthropic-compatible` lane whose model names a self-hosted server type
+  (`server_compat.server_type` of `vllm`, `sglang` or `llama.cpp`) or whose endpoint is a
+  loopback or private address. A hosted service configured as a compatible endpoint, the
+  Responses surface and the providers' own APIs are left alone. The log says once per lane
+  which way it went (`control_text.escape`).
+- **Which texts.** The served model's own tokens where they can be learned: the model
+  definition's `control_tokens` (a list of texts), else what the server says of its tokenizer
+  (`GET /tokenizer_info`, asked once per lane; vLLM offers it when started with
+  `--enable-tokenizer-info-endpoint`). Of a tokenizer's own tokens those that look like
+  markers are taken (no white space, not a plain word). Where neither names them, a pattern
+  over the common template families stands in (a name between bars, ASCII or fullwidth; the
+  tool-call, tool-response and reasoning tags; turn, image and sentence markers; capital-letter
+  names in square brackets), and the log warns once per lane that the coverage could not be
+  established (`control_text.coverage_not_established`): a template with other tokens is then
+  not protected, and a text that only looks like a token (`[INFO]` in a log) gets a backslash
+  it did not need.
+- **What it cannot do.** A model that writes a complete tool-call block while quoting one has
+  written a tool call: that is the server's reading of the model's own output. And a model
+  that, unprompted, writes a backslash after the first character of a control-token text in a
+  reply to a request that held escaped text gets that backslash taken out.
+
+The walk that finds every text (`turnstone/core/text_walk.py`) is shared with the rollout
+harness's plain-text reading: strings and keys however deep, with a stack of its own; the text
+parts of a message as the one text a template makes of them; and nothing skipped but the data of
+an image or a sound in a message's content.
+
 ### Multi-Model Registry
 
 `ModelRegistry` (`turnstone/core/model_registry.py`) manages named model

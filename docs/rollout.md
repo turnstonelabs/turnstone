@@ -244,16 +244,28 @@ probes which log-probabilities the server reports and prints the
 [verdict](#which-log-probabilities) as one JSON object, and
 `--sampler-logprobs '<that object>'` or `--sampler-logprobs @FILE` hands it to
 each rollout, which then does not probe. With `--token-id-prompts` it first
-makes the [check for prompts as token IDs](#the-check-before-the-run), probes
-on the completions route, the one those rollouts use, and prints the check's
-verdict in the same object (`token_id_route`); `--token-id-route @FILE` hands
-that to each rollout, which then does not check. The check says in the same
-verdict whether the server can be sent [images](#images) (`vision`, unless
-`--no-vision`), and how the text of the tokenizer's own tokens is
-[read as plain text](#the-text-of-the-tokenizers-own-tokens) is established
-and printed beside it (`plain_text`, unless `--no-plain-text`), which takes the
-tokenizer's tokens named (`--tokenizer-info`); a rollout handed the file takes
-both from it:
+makes the [check for prompts as token IDs](#the-check-before-the-run) and
+probes on the completions route, the one those rollouts use. What it prints
+then is one object with each verdict under a key of its own:
+
+| Key | Holds |
+|-----|-------|
+| `server_check` | The layout's number, `2` |
+| `probe` | The probe's verdict, as it is printed by itself without `--token-id-prompts` |
+| `route` | The check's verdict. It says in the same verdict whether the server can be sent [images](#images) (`vision`); the image check runs by default and is left out only with `--no-vision` |
+| `plain_text` | How the text of the tokenizer's own tokens is [read as plain text](#the-text-of-the-tokenizers-own-tokens), unless `--no-plain-text`; it takes the tokenizer's tokens named (`--tokenizer-info`) |
+
+`--sampler-logprobs @FILE` and `--token-id-route @FILE` hand the same file to
+each rollout, which takes the probe from the one and the two checks from the
+other and then neither probes nor checks. Nothing of a verdict stands at the
+top of the object. That is on purpose: a build from before plain text and
+images reads the probe's verdict from the top and the check under
+`token_id_route`, finds neither, and refuses the file whichever flag it is
+handed with (status 3), where it would otherwise run without plain text and
+images and write the verdicts into its record as if they had been applied. A
+file such a build wrote (the probe at the top, the check under
+`token_id_route`) is still read; it says nothing of plain text or images, so a
+run handed one names `--tokenizer-info` and `--no-vision`, or both opt-outs.
 
 ```
 turnstone-rollout --base-url ... --model NAME --top-k 20 --top-p 0.95 \
@@ -266,9 +278,11 @@ turnstone-rollout --base-url ... --model NAME --top-k 20 --top-p 0.95 \
 
 The exit status of `--probe-only` is 0 when the reported values are the
 sampling distribution's and, where it was made, the check passed, plain text
-was established unless `--no-plain-text`, and with `--vision` the server can
-be sent images; 2 otherwise. Without `--tokenizer-info` and without
-`--no-plain-text` the command is refused (3): the rollouts would be.
+was established unless `--no-plain-text`, and the image check passed unless
+`--no-vision`; 2 otherwise, with a line on standard error where it is the
+image check: a rollout handed that verdict would be refused. Without
+`--tokenizer-info` and without `--no-plain-text` the command is refused (3),
+and so is `--no-plain-text` without `--no-vision`: the rollouts would be.
 
 A verdict is good for what it was made for, and says what that is: the `model`
 that was asked, the `endpoint` (the API root) and the time (`checked_at`, ISO
@@ -629,7 +643,16 @@ a first token is
 allowed more: the time its prompt takes at the minimum prompt speed (1000
 tokens a second where none is configured), since the length of a prompt is the
 model's doing and a model could otherwise fill its context until the limit fell
-into that silence. With a token budget the time limit is a backstop and the
+into that silence. How long the prompt is taken to be depends on how it went
+out. Sent as token IDs, text only or with images, it is the exact number of
+tokens sent (`calls[].request.prompt_tokens_sent`): a prompt of 4,000 tokens
+at 1,000 a second is allowed 4 seconds and then the stall time, no more. Sent
+as messages its length is not known until the server has counted it, and it is
+taken at its size in bytes, which bounds its tokens from above. (Before images
+could go beside token IDs, a prompt of token IDs was taken at its size in
+bytes as well, which allowed a silent server several times longer; a run with
+prompts as token IDs can therefore end as `server_stalled` where the same
+silence used to pass as the model's `timeout`.) With a token budget the time limit is a backstop and the
 verdict is by the server's speed; see
 [budgets of the model's own](#budgets-of-the-models-own). Either way the record
 says what the run was waiting on (`timeout`) and where the time went (`time`),
@@ -1179,31 +1202,50 @@ of each such text; after the rendering every stand-in token is taken out. The
 model gets the text's own characters as ordinary tokens, what a person reading
 the file sees. Every text of a conversation is treated so: the system prompt,
 user messages, tool results, tool definitions, and the model's own turns
-where they are rendered again from their text (a tool call's arguments as the
-values they decode to). The model's turn in the rollout's sequence is the
-tokens it generated and is never touched.
+where they are rendered again from their text. The walk that finds them is
+the one the escape below uses (`turnstone/core/text_walk.py`): every string
+and every key however deep, with a stack of its own, so that no depth of
+nesting in what a model wrote ends it; a tool call's arguments as the values
+their JSON holds, literal by literal, so that JSON stays JSON whatever it
+holds; the text parts of a message as the one text a template makes of them;
+and nothing skipped but the data of an image or a sound in a message's
+content. A schema or an argument that says `"type": "image"` is walked like
+any other. The model's turn in the rollout's sequence is the tokens it
+generated and is never touched.
 
 | | |
 |---|---|
-| What it takes | The verdict of `check_plain_text`: which texts the server writes a token for, a stand-in the template does not write, and that a cut keeps the texts apart (no text can come about across a cut; checked on the set of texts and, for each, on the server) |
+| What it takes | The verdict of `check_plain_text`: which texts the server writes a token for, a stand-in the template does not write (nor for an image, where the check for images was made), and that a cut keeps the texts apart (no text can come about across a cut; checked on the set of texts and, for each, on the server) |
 | Where the tokens are named | Explicitly: `--tokenizer-info FILE` (the model's `tokenizer_config.json` or `tokenizer.json`; `RolloutConfig.added_tokens`), or `--tokenizer-info server` to ask the server's `/tokenizer_info` (`tokenizer_info_from_server`). Never by what a server happens to answer |
-| For a batch | `--probe-only` prints the verdict beside the others (`plain_text`), and `--token-id-route @FILE` hands it on with the route's |
-| A run without it | Refused (status 3) unless it says `--no-plain-text`: it is neither switched on by discovery nor left off without a word |
-| In the record | `plain_text` in every record: `applied`, and with it the stand-in and what was seen; `prefix_events` gets `special_text_read_as_plain_text` where the environment wrote such text |
+| A file that is incomplete or not this tokenizer's | Fails the check. A named text that the server writes as another single token; a token the template is seen to write that the file does not name (the format's markers, the end-of-turn token, and any other whose text is a word in angle or square brackets); and, where the server offers `/tokenizer_info`, any difference between the file and what the server says (`tokenizer_info.compared_with_server` in the verdict says whether that comparison could be made). A named text the server writes as several tokens is no token of this server's: left out and listed (`left_out`) |
+| For a batch | `--probe-only` prints the verdict beside the others (`plain_text`), and `--token-id-route @FILE` hands it on with the route's. It names the model, the endpoint and the template arguments it was made with, and a run with others refuses it |
+| A run without it | Refused (status 3) unless it says `--no-plain-text`: it is neither switched on by discovery nor left off without a word. `--no-plain-text` needs `--no-vision` beside it |
+| In the record | `plain_text` in every record: `applied`, and with it the stand-in, what was left out and what was seen |
 | When no such text is there | The conversation goes to the tokenize route as the very objects it was: the same requests as without it |
 
 Sent as messages, a conversation cannot be treated this way: the prompt is
 text all the way. There the framework's own escape applies, as in any session
-on a self-hosted server (`turnstone/core/control_text.py`, the capability
-`escape_control_tokens`, on by default for local servers): a backslash after
-the first character of a control-token text, in every text of what is sent.
-A run with prompts as token IDs does not use it: there the prompt is built
-from the conversation as it is, read as plain text or, with `--no-plain-text`,
-rendered as it stands. The escape covers the model's own earlier turns too, which
-are text on that route like everything else, so a turn in which the model
-itself wrote such text goes back escaped and the next prompt does not extend
-what was generated (`one_sequence` is false for that run): one more reason
-why rollouts that are trained on send token IDs.
+on a self-hosted server (`turnstone/core/control_text.py`; see
+[the architecture notes](architecture.md#control-token-text-on-self-hosted-lanes)):
+a backslash after the first character of a control-token text, in every text
+of what is sent, and the exact inverse on what the model writes back, so that
+a tool gets the characters the file holds and the stored turn holds them too.
+
+| | |
+|---|---|
+| When | By the framework's rule for the lane: on for a server at a loopback or private address, which is what a rollout's `--base-url` usually names. `--control-text-escape` and `--no-control-text-escape` (`RolloutConfig.escape_control_text`) say so for the run, either way |
+| Which texts | The server's own tokens where it names them (`GET /tokenizer_info`, asked once); otherwise a pattern over the common template families, and a warning in the log that the coverage could not be established |
+| With prompts as token IDs | Not used, and the two flags are refused: the prompt is built from the conversation as it is, read as plain text or, with `--no-plain-text`, rendered as it stands |
+| In the record | `control_text_escape` in every record: `applied`, `reason`, `tokens_from` (`configured`, `server` or `pattern`) and `escaped` (the texts escaped in the latest request, each with how often) |
+
+A turn in which the model wrote the escaped text it had read is stored with
+the escape undone and sent again escaped, so the next prompt holds what the
+model wrote. A turn in which it wrote the bare text of a control token is
+sent again escaped as well, and then the next prompt does not extend what was
+generated (`one_sequence` is false for that run); and an argument whose
+recorded text no longer says what the stored value says is replayed from the
+value (`raw_arguments_unrecovered` among `prefix_events`). One more reason why
+rollouts that are trained on send token IDs.
 
 ### Images
 
@@ -1223,10 +1265,11 @@ images must be the runs in it.
 
 | | |
 |---|---|
-| When | By default, where the check of the server found the route working (`token_id_route.vision.ok`), the conversation's text is read as plain text, and a folder for the images is named (`--image-dir`, or `--out` with `.images` added). `--no-vision` switches it off and the check then asks nothing about images; `--vision` refuses a run that cannot. The record says which it was (`vision.applied`, `vision.reason`) |
-| What the check establishes | That the generate route answers a streamed request the way a run reads it (text, token IDs, one log-probability a token, named by ID, usage, the prompt reported); that an image is rendered as a run of one placeholder token between two tokens of the template's; that the route writes the runs out to the very rendering for one image, two images, an image after a tool result and one after a turn with reasoning; that the rendering up to a turn begins the rendering once an image follows; that two images under the same token IDs get two replies; that the route reports log-probabilities of the sampling distribution ([the probe](#which-log-probabilities), asked on that route) and lists the same distribution as the completions route under the run's settings |
-| The images | Written to the folder under the hash of their bytes (`<sha256>.png`), before the record. `vision.images[]`: `sha256`, `file`, `media_type`, `bytes`, `width`, `height`, `start`, `end` and `tokens` (the image's placeholder tokens are `start` to `end` of the final sequence), `processed` (the size and grid the server's resizing gives, where the check found its rule), `first_call` (the first call whose prompt holds it) and `source` (the tool call whose result held it) |
+| When | Two states. On by default, and a run that cannot have it is refused before anything runs (status 3), whatever is missing: the check of the server asked nothing about images (a verdict made with `--no-vision`, or by an earlier build) or its image check did not pass or could not be finished (`token_id_route.vision.ok`), the conversation's text is not read as plain text, no folder for the images is named (`--image-dir`, or `--out` with `.images` added), the run carries a request parameter the generate route has no place for, or the stand-in for plain text is a token the template writes for an image. Or off, with `--no-vision`, and the check then asks nothing about images. It is never switched off by what a server turns out to be able to do. `--vision` says the default aloud. The record says which it was (`vision.applied`, `vision.reason`) |
+| What the check establishes | That the generate route answers a streamed request the way a run reads it (text, token IDs, one log-probability a token, named by ID, usage, the prompt reported); that an image is rendered as a run of one placeholder token between two tokens of the template's; that the route writes the runs out to the very rendering for one image, two images, an image after a tool result and one after a turn with reasoning; that the rendering up to a turn begins the rendering once an image follows; that two images under the same token IDs get two replies; that the route reports log-probabilities of the sampling distribution ([the probe](#which-log-probabilities), asked on that route) and lists the same distribution as the completions route under the run's settings, at eight positions, at one of which at least a route lists more than one possible token (unless the run's own settings leave only one: temperature 0 or `top_k` 1); and that the server sizes images by the rule the record is written with (each side rounded to a multiple of 32 pixels, the whole scaled to hold 65,536 to 16,777,216 pixels, one token for every 32 by 32 pixels). A comparison that covered fewer positions, and a server that sizes images another way, fail the check. A check that broke off says so as the image check's own word (`vision.reason`), and the route for text is not failed by it |
+| The images | Written to the folder under the hash of their bytes (`<sha256>.png`), before the record. `vision.images[]`: `sha256`, `file`, `media_type`, `bytes`, `width`, `height`, `start`, `end` and `tokens` (the image's placeholder tokens are `start` to `end` of the final sequence), `processed` (the size and grid the server's resizing gives; an image whose size cannot be read here, or whose placeholder tokens are not the number the rule gives, is a line in `problems` and the record is not trainable), `first_call` (the first call whose prompt holds it) and `source` (the tool call whose result held it) |
 | The prompt's length | Exact, images included: the context window is kept as for text, and the server's speed is held against the tokens sent, never against the size of an image's data |
+| Renderings | One for a request with images wherever that is enough: the whole rendering begins with what was sent and generated, or, where the model's own split of a text is not the tokenizer's (`prompt_differs_from_rendering`), with the rendering of the request before, in which the end of the turn is then found. Only where neither holds is the conversation up to the turn rendered by itself as well, as for text |
 | A sub-agent | Sees images the same way; nothing of it is in the token record or among `vision.images` |
 | The model generates the placeholder token itself | It stays in the sequence (`vision.stray_placeholders`). A later image cannot then be sent where it belongs, and the run ends as `image_token_generated`, the model's own outcome |
 
@@ -1235,7 +1278,8 @@ images must be the runs in it.
 With the conversation's text read as plain text, nothing the model or the
 environment writes can move an image or change what the server makes of a
 prompt. So a reply for another prompt or other places of the images than were
-sent, an image without a place in a prompt the harness built, and a rendering
+sent, a whole reply that never says which prompt it answered, an image
+without a place in a prompt the harness built, and a rendering
 with more stand-in tokens than texts were cut in what the environment wrote
 can only be a fault of the harness or of a server that changed under it. The
 run ends as `harness_fault`, whoever asked (the session or a sub-agent);
@@ -2409,8 +2453,8 @@ whose value does not apply is `null`.
 | `usage` | The session's own token counts as the server reported them: `prompt`, `completion`; both 0 in a run that did not start |
 | `tokens` | The token record, below |
 | `prefix_ok`, `prefix_breaks` | The token-level prefix check: whether it held, and one readable line per break |
-| `prefix_events` | What the stable-prefix run noted, one entry per `event`; with prompts as token IDs also what the prompt assembly noted, about the session's own calls only: `turn_ended_on_other_token` (`turn`, `token_id`, `end_of_turn_token_id`), `prompt_differs_from_rendering` (`call`, `prompt_tokens`, `rendered_tokens`, `same_tokens`) and `marker_place_uncertain` (`call`, `tokens`), with `turn` and `call` counted as `tokens.calls[].call`; and `special_text_read_as_plain_text` (`texts`: the texts of tokenizer tokens the environment wrote, each with how often), in a record whose conversation held such text |
-| `calls` | One summary per model call of the session that ended normally, in order: `index`, `scope`, `route` (`chat`, or `completions` with prompts as token IDs), `window_left` (with prompts as token IDs, the tokens the context window had left for the reply; otherwise `null`), `streamed`, `request` (`model`, the count of `messages`, their `roles`, the names of the `tools`, the `sampling` keywords, the `extra_body`; with prompts as token IDs the `extra_body` is the completions request's, and `template_arguments` and `prompt_tokens_sent` are there too), `finish_reason`, `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`), `complete`, `error`, `aligned`, `misaligned_chunks`, `ids_checked`, `chunks`, `seconds`, `longest_silence`, `problems`. `index` numbers every request the run made, from 0, a sub-agent's and a discarded one included, so the session's calls need not be 0, 1, 2; the token record numbers the calls listed here from 0 (`tokens.calls[].call`), and entry *n* of the one list is entry *n* of the other |
+| `prefix_events` | What the stable-prefix run noted, one entry per `event`; with prompts as token IDs also what the prompt assembly noted, about the session's own calls only: `turn_ended_on_other_token` (`turn`, `token_id`, `end_of_turn_token_id`), `prompt_differs_from_rendering` (`call`, `prompt_tokens`, `rendered_tokens`, `same_tokens`) and `marker_place_uncertain` (`call`, `tokens`), with `turn` and `call` counted as `tokens.calls[].call`. (The texts of tokenizer tokens that were read as plain text are under `plain_text.seen`, not here) |
+| `calls` | One summary per model call of the session that ended normally, in order: `index`, `scope`, `route` (`chat`; with prompts as token IDs `completions`, or `generate` for a request that carried images), `window_left` (with prompts as token IDs, the tokens the context window had left for the reply; otherwise `null`), `streamed`, `request` (`model`, the count of `messages`, their `roles`, the names of the `tools`, the `sampling` keywords, the `extra_body`; with prompts as token IDs the `extra_body` is the completions request's, and `template_arguments` and `prompt_tokens_sent`, the exact length of the prompt, are there too, and on the generate route `images`, how many the request carried), `finish_reason`, `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`), `complete`, `error`, `aligned`, `misaligned_chunks`, `ids_checked`, `chunks`, `seconds`, `longest_silence`, `problems`. `index` numbers every request the run made, from 0, a sub-agent's and a discarded one included, so the session's calls need not be 0, 1, 2; the token record numbers the calls listed here from 0 (`tokens.calls[].call`), and entry *n* of the one list is entry *n* of the other |
 | `discarded_calls` | The session's calls that did not end normally (cut by the time limit, failed, or broken off and issued again), the same keys with `prompt_token_ids`, `token_ids` and `logprobs`; `index` as in `calls` |
 | `text` | With `keep_text`, each call's generated text; otherwise `null`. With prompts as token IDs it is the completions route's text, which leaves out the end-of-turn token and other special tokens |
 | `limits` | `max_tokens`, `context_window`, `tool_timeout`, `subagent_max_turns`, `max_output_chars`, `max_tool_result_chars`, each `{"value": ..., "source": "..."}` |
@@ -2419,8 +2463,9 @@ whose value does not apply is `null`.
 | `token_id_check` | `"required"` or `"not required"` |
 | `prompt_mode` | `"messages"`, or `"token_ids"` for a run with [prompts as token IDs](#prompts-as-token-ids) |
 | `token_id_route` | `null` for a run that sends messages; otherwise what the check before the run found, below |
-| `plain_text` | In every record: whether the text of the tokenizer's own tokens in the conversation was [read as plain text](#the-text-of-the-tokenizers-own-tokens). `applied` (`true` or `false`); with it `stand_in_id` (the stand-in token), `texts` (how many texts the tokenizer has tokens for) and `seen` (the texts the environment wrote that were read so, each with how often; empty when there were none); without it `reason` |
-| `vision` | In every record: whether the model saw [images](#images). `applied`; without it `reason`; with it `check` (what the check of the server found about images), `image_dir`, `placeholder`, `images` (one entry an image, below), `stray_placeholders` and `subagent_images` |
+| `plain_text` | In every record: whether the text of the tokenizer's own tokens in the conversation was [read as plain text](#the-text-of-the-tokenizers-own-tokens). `applied` (`true` only once a model call was made: a run that was set up for it and never built a prompt says `false`); with it `stand_in_id` (the stand-in token), `texts` (how many texts the tokenizer has tokens for), `left_out` (the named texts the server has no token for) and `seen` (the texts the environment wrote that were read so, each with how often; empty when there were none); without it `reason` |
+| `control_text_escape` | In every record: whether control-token text was [escaped in what was sent](#the-text-of-the-tokenizers-own-tokens) as messages. `applied`, `reason`, `tokens_from` (where the texts are known from: `configured`, `server` or `pattern`; `null` where it was not applied) and `escaped` (the texts escaped in the latest request, each with how often). With prompts as token IDs `applied` is `false` |
+| `vision` | In every record: whether the model saw [images](#images). `applied` (`true` only once a model call was made); without it `reason`; with it `check` (what the check of the server found about images), `image_dir`, `placeholder`, `images` (one entry an image, below), `stray_placeholders` and `subagent_images` |
 | `server_version` | `null` for a run given no address to ask; otherwise the [server's version](#one-version-of-the-server) at both ends, below |
 | `timeout` | `null` unless the time limit was reached; then what the run was waiting on, below |
 | `seconds`, `startup_seconds`, `teardown_seconds` | The time from the start of the sandbox to the end of the run; of that, the time bringing the sandbox up took, the task's before-run commands included; and the time removing it took, which comes on top |
@@ -2505,6 +2550,7 @@ Where the run did not start, only the first three keys are there.
 | `marker_ids`, `text_markers` | The token of each marker that is one token on this server, and the markers that are not; every marker of the format is in one of the two. A marker goes by its name here and wherever something is said per marker (`checks.markers_kept_in_text`, `checks.produced_by`, `checks.not_observed`): `reasoning_open`, `reasoning_close`, `call_open`, `call_close` |
 | `closing`, `generation_prompt` | The tokens the template writes at the end of an assistant turn and at the start of a reply |
 | `in_reasoning` | Whether a reply begins inside reasoning |
+| `vision` | What the same check found about [images](#images), unless the run wanted none: `ok`, `reason`, `checks` (`generate_route`, `image_is_a_run_of_one_token`, `generate_expands_like_tokenize` per layout, `turn_is_a_prefix_of_the_rendering_with_an_image`, `replies_to_two_images`, `images_reach_the_model`, `routes_agree` with `positions`, `unsure_positions`, `differing_positions`, `widest_difference` and `stopped`), `placeholder` (the token an image is rendered as), `frame` (the two tokens the template writes around an image), `sizes` (the placeholder tokens of a few image sizes), `resize_rule` (`multiple`, `min_pixels`, `max_pixels`, `patch`) and `sampler_logprobs` (the probe of the generate route). The same object is the record's `vision.check` |
 
 A verdict that was passed in is stored as it was given.
 
@@ -2675,8 +2721,9 @@ What a user of the harness has to know, in one place:
   the server as it is under the load of a batch: a minimum above what the
   server keeps marks long runs as `backstop` and loses them to training, one
   far below it scores a slow server's time as the model's `timeout`. The
-  record's `time` holds the measured speeds. A prompt the server has not
-  counted yet is taken at its size in bytes, which is more tokens than it has.
+  record's `time` holds the measured speeds. A prompt sent as messages that the
+  server has not counted yet is taken at its size in bytes, which is more
+  tokens than it has; one sent as token IDs is taken at its exact length.
   And the backstop worked out from the budgets assumes one long prompt per turn
   and per sub-agent; a model that sends more reaches it as its own `timeout`.
 - **The command budget counts what the session waits for.**

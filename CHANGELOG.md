@@ -325,6 +325,42 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   do the same from Python. See
   [the rollout guide](docs/rollout.md#started-by-another-program).
 
+### Changed
+
+- **Control-token text is escaped in what self-hosted servers are sent.** A
+  self-hosted server renders a conversation as text and tokenizes all of it,
+  so the text of a chat-template control token in a tool result, a file or a
+  fetched page became that token and could forge a turn or a tool call. On a
+  model declared self-hosted (`server_compat.server_type` of `vllm`, `sglang`
+  or `llama.cpp`, or a loopback or private base URL, on the
+  `openai-compatible` Chat Completions and `anthropic-compatible` providers)
+  every such text in a request now gets a backslash after its first
+  character, and the escape is undone exactly in what the model writes back,
+  so tools and stored turns hold the original characters. This is a change of
+  default for those models: their prompts differ wherever a conversation holds
+  such text, and the model sees a backslash there. Hosted services, the
+  Responses surface and the providers' own APIs are unchanged. The texts are
+  the model's own tokens where the model definition names them
+  (`control_tokens`) or the server does (`/tokenizer_info`); otherwise a
+  pattern over the common template families is used, which also marks
+  look-alikes such as `[INFO]`, and a warning says once per model that the
+  coverage could not be established. `escape_control_tokens` in a model's
+  capabilities switches it either way. See
+  [the architecture notes](docs/architecture.md#control-token-text-on-self-hosted-lanes)
+  and [the settings guide](docs/settings.md#control-token-escape-per-model).
+- **Rollouts: images and plain text are on by default with prompts as token
+  IDs, and a run that cannot have them is refused.** The text of the
+  tokenizer's own tokens in a conversation reaches the model as characters,
+  and the model sees images on a server that takes them beside token IDs;
+  `--no-plain-text` and `--no-vision` are the opt-outs, and nothing is
+  switched off by what a server turns out to be able to do.
+  `--probe-only --token-id-prompts` writes its verdicts under keys of their
+  own (`probe`, `route`, `plain_text`), which a build from before this change
+  refuses. The time a silent server is allowed for a prompt of token IDs is
+  now the prompt's exact length at the minimum speed, where it was bounded by
+  the request's size in bytes. A harness fault ends a run with exit status 4.
+  See [the rollout guide](docs/rollout.md#the-text-of-the-tokenizers-own-tokens).
+
 ### Fixed
 
 - **Assistant replies are styled the same in the console as on a node's own
