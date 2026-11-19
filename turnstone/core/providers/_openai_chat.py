@@ -13,7 +13,6 @@ if TYPE_CHECKING:
 
 import structlog
 
-from turnstone.core.control_text import escape_conversation
 from turnstone.core.providers._openai_common import (
     OPENAI_COMPAT_DEFAULT,
     RETRYABLE_ERROR_NAMES,
@@ -354,11 +353,6 @@ class OpenAIChatCompletionsProvider:
         messages = materialize_attachments(messages, resolve_attachments)
         caps = capabilities or self.get_capabilities(model)
         messages = self._prepare_messages(messages)
-        if caps.escape_control_tokens:
-            # No text of the conversation may become the template's own tokens
-            # on a server that tokenizes the whole prompt.
-            messages = escape_conversation(messages)
-            tools = escape_conversation(tools)
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,

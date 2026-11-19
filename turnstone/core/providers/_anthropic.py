@@ -14,7 +14,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.attachments import safe_attachment_label
-from turnstone.core.control_text import escape_conversation
 from turnstone.core.providers._protocol import (
     EFFORT_TEMPLATE_FALLBACK_PARAM,
     ContextWindowExceededError,
@@ -547,9 +546,6 @@ _ANTHROPIC_COMPAT_DEFAULT = ModelCapabilities(
     supports_tool_search=False,
     supports_vision=False,
     supports_reasoning_replay=True,
-    # The server tokenizes the rendered prompt as one text (see
-    # :mod:`turnstone.core.control_text`).
-    escape_control_tokens=True,
 )
 
 _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
@@ -1510,9 +1506,6 @@ class AnthropicProvider:
     ) -> Iterator[StreamChunk]:
         messages = materialize_attachments(messages, resolve_attachments)
         caps = capabilities or self.get_capabilities(model)
-        if caps.escape_control_tokens:
-            messages = escape_conversation(messages)
-            tools = escape_conversation(tools)
         system_prompt, converted_msgs = self._convert_messages(
             messages,
             replay_reasoning_to_model=replay_reasoning_to_model,

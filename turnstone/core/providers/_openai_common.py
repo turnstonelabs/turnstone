@@ -507,10 +507,7 @@ OPENAI_DEFAULT = ModelCapabilities(server_parses_reasoning=True)
 # the model definition (capabilities JSON + server_compat), mirroring
 # ``_ANTHROPIC_COMPAT_DEFAULT`` and ``lookup_model_capabilities``'s
 # "no static table for local models" contract.
-# ``escape_control_tokens``: these servers tokenize the rendered prompt as one
-# text, so the text of a control token in a tool result is that token; an
-# operator can switch the escape off in the model definition's capabilities.
-OPENAI_COMPAT_DEFAULT = ModelCapabilities(effort_passthrough=True, escape_control_tokens=True)
+OPENAI_COMPAT_DEFAULT = ModelCapabilities(effort_passthrough=True)
 
 
 def lookup_openai_capabilities(model: str) -> ModelCapabilities:

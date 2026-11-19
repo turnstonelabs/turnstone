@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
+from turnstone.core import control_text
 from turnstone.core.admission import ModelAdmission
 from turnstone.core.completion_recovery import (
     MAX_COMPLETION_REISSUES,
@@ -56,6 +57,7 @@ from turnstone.core.completion_recovery import (
     is_context_overflow,
     local_model_call,
 )
+from turnstone.core.control_text import ControlTokens, EscapeLog
 from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
 from turnstone.core.log import get_logger
@@ -241,6 +243,10 @@ _CAPABILITY_BOOL_STRINGS = {
 }
 
 
+# Capability switches whose default is "unset" rather than a yes or a no.
+_OPTIONAL_SWITCHES = frozenset({"escape_control_tokens"})
+
+
 def apply_capability_overrides(caps: ModelCapabilities, overrides_raw: Any) -> ModelCapabilities:
     """Field-filtered merge of an operator ``capabilities`` dict onto *caps*.
 
@@ -266,9 +272,20 @@ def apply_capability_overrides(caps: ModelCapabilities, overrides_raw: Any) -> M
             fld = by_name.get(key)
             if fld is None:
                 continue
+            if key == "control_tokens":
+                # A list of texts in hand-edited JSON; anything else drops
+                # the key, and the server is asked for its tokens instead.
+                if not isinstance(value, (list, tuple)) or not all(
+                    isinstance(text, str) for text in value
+                ):
+                    continue
+                value = tuple(value)
             # bool check FIRST — bool is an int subclass, so the int arm
-            # below would otherwise claim real booleans.
-            if isinstance(fld.default, bool) and not isinstance(value, bool):
+            # below would otherwise claim real booleans.  A switch that is
+            # unset by default (``bool | None``) takes the same spellings.
+            if (isinstance(fld.default, bool) or key in _OPTIONAL_SWITCHES) and not isinstance(
+                value, bool
+            ):
                 if isinstance(value, int):
                     value = bool(value)
                 elif isinstance(value, str) and value.strip().lower() in _CAPABILITY_BOOL_STRINGS:
@@ -547,6 +564,10 @@ class ModelLane:
     # Stable per-alias registry gate.  The gate object survives hot-resizes,
     # so old and newly resolved lanes coordinate through one FIFO.
     admission: ModelAdmission | None = None
+    # Told by every call on the lane what became of the escape of
+    # control-token text in the request (:class:`~turnstone.core.control_text.EscapeLog`),
+    # for an owner that records it.  ``None``: nobody asks.
+    control_text_log: EscapeLog | None = None
 
 
 @dataclass(frozen=True)
@@ -663,6 +684,46 @@ def lane_diagnostics(lane: ModelLane) -> ModelLaneDiagnostics:
         alias=lane.alias,
         base_url=raw_url,
     )
+
+
+def lane_control_tokens(
+    lane: ModelLane, cfg: Any | None, client: Any = None
+) -> ControlTokens | None:
+    """The control tokens whose text is escaped in what *lane* is sent, or
+    ``None`` where the lane's requests go out as they are.  *client* is the
+    client the call goes out on (the lane's own where none is given): the
+    server is asked for its tokens with the credentials of the call.
+
+    The one place the rule is applied (:func:`turnstone.core.control_text.decide`):
+    the model definition's own word where it has one, else on for a lane
+    declared self-hosted and off for every other.  The log is told once per
+    lane which way it went, and the lane's own log, where it has one, every
+    time.
+    """
+    caps = lane.capabilities
+    override = getattr(caps, "escape_control_tokens", None)
+    diagnostics = lane_diagnostics(lane)
+    applied, reason = control_text.decide(
+        override=override if isinstance(override, bool) else None,
+        provider_name=diagnostics.provider_name,
+        server_type=_server_type_of(cfg) if cfg is not None else "",
+        base_url=diagnostics.base_url,
+    )
+    control_text.note_decision(
+        diagnostics.base_url, str(lane.model), str(lane.alias), applied, reason
+    )
+    tokens: ControlTokens | None = None
+    if applied:
+        tokens = control_text.tokens_for(
+            client if client is not None else lane.client,
+            diagnostics.base_url,
+            str(lane.model),
+            getattr(caps, "control_tokens", None),
+            str(lane.alias),
+        )
+    if isinstance(lane.control_text_log, EscapeLog):
+        lane.control_text_log.note(applied, reason, tokens)
+    return tokens
 
 
 def lane_error_is_retryable(lane: ModelLane, exc: BaseException) -> bool:
@@ -1071,11 +1132,12 @@ class ModelTurnResult:
     *finish_reason* / *usage* are transport facts, not trajectory content
     — which is why they ride the result, not the Turn.
 
-    *wire_msgs* is the exact lowered list handed to ``create_streaming``,
-    after every pass including the caller's ``prepare_wire`` — the main
-    loop's token-table calibration reads it so chars-per-token is
-    computed against what the provider actually counted, lowerings the
-    caller cannot see included.
+    *wire_msgs* is the lowered list the request was made from, after every
+    pass including the caller's ``prepare_wire`` — the main loop's
+    token-table calibration reads it so chars-per-token is computed against
+    what the provider actually counted, lowerings the caller cannot see
+    included.  On a lane whose control-token text is escaped the copy that
+    went out differs from it by those backslashes and by nothing else.
 
     *provenance* is the immutable serving alias / backend model id / registry
     generation / acting-principal tuple. The same JSON-safe value is stamped
@@ -1730,6 +1792,36 @@ def model_turn(
             if callable(mark_dispatch):
                 with contextlib.suppress(Exception):
                     mark_dispatch()
+            # THE one place a request's text is escaped: the copy handed to the
+            # provider.  ``dispatched_wire`` stays as it was lowered, for the
+            # result and whoever compares requests.
+            control_tokens = lane_control_tokens(lane, cfg, call_client)
+            sent_wire, sent_tools = dispatched_wire, tools
+            escaped: dict[str, int] = {}
+            if control_tokens is not None:
+                sent_wire, sent_tools, escaped = control_text.escape_request(
+                    control_tokens, dispatched_wire, tools
+                )
+                if isinstance(lane.control_text_log, EscapeLog):
+                    lane.control_text_log.sent(escaped)
+                if escaped:
+                    log.info(
+                        "model_turn.control_text_escaped",
+                        model=lane.model,
+                        alias=lane.alias,
+                        tokens_from=control_tokens.source,
+                        texts=len(escaped),
+                        occurrences=sum(escaped.values()),
+                    )
+            # The model writes back what it read: the escape is undone in a
+            # reply whose request held an escaped text, for whoever watches the
+            # stream and, below, in the result.
+            undo = control_tokens if escaped else None
+            shown = (
+                control_text.unescaped_stream(undo, on_chunk)
+                if undo is not None and on_chunk is not None
+                else on_chunk
+            )
             # SDK creation errors retain the SDK's retry policy. An adapter can
             # also reject a response before returning an iterator (an HTTP-200
             # JSON error body): nothing ran, so it is a rejected request.
@@ -1739,8 +1831,8 @@ def model_turn(
                 chunks = lane.provider.create_streaming(
                     client=call_client,
                     model=lane.model,
-                    messages=dispatched_wire,
-                    tools=tools,
+                    messages=sent_wire,
+                    tools=sent_tools,
                     max_tokens=max_tokens,
                     temperature=temperature if temperature is not None else lane.temperature,
                     reasoning_effort=effective_effort,
@@ -1771,12 +1863,17 @@ def model_turn(
             else:
                 try:
                     result = drain_stream(
-                        _tee_chunks(chunks, on_chunk, protect_local_errors=product_recovery)
-                        if on_chunk
+                        _tee_chunks(chunks, shown, protect_local_errors=product_recovery)
+                        if shown
                         else chunks,
                         scan_inline_reasoning=lane_scans_inline_reasoning(lane),
                         clean_trailing_info=clean_trailing_info,
                     )
+                    if undo is not None:
+                        # Before anything uses the reply: a tool runs on the
+                        # characters the model meant, and the stored turn
+                        # holds them.
+                        result = control_text.unescape_result(undo, result)
                 except Exception as exc:
                     response_error = exc
                 finally:
