@@ -130,10 +130,42 @@ class TestWhatAVerdictNames:
             here = server.base_url
         written = json.loads(out.read_text(encoding="ascii"))
         assert written == json.loads(capsys.readouterr().out)
-        for verdict in (written, written["token_id_route"]):
+        # With prompts as token IDs: each verdict under a key of its own.
+        assert sorted(written) == ["probe", "route", "server_check"]
+        for verdict in (written["probe"], written["route"]):
             assert verdict["model"] == "scripted" and verdict["endpoint"] == here
             assert datetime.fromisoformat(verdict["checked_at"]).tzinfo is not None
-        assert written["route"] == "completions"
+        assert written["probe"]["route"] == "completions"
+
+    def test_an_earlier_build_finds_no_verdict_in_what_the_command_writes(self, tmp_path, capsys):
+        """A build that knows nothing of plain text or images takes the probe's
+        verdict from the top of the object and the check of the routes from
+        its ``token_id_route`` key, or else the whole object for the check.
+        It must find neither, whichever flag it is handed the file with: it
+        would run without plain text and images and write the verdicts into
+        its record as if they had been applied."""
+        out = tmp_path / "server.json"
+        with ScriptedChatServer(SCRIPT, sampler_logprobs=True) as server:
+            flags = ["--base-url", server.base_url, "--model", "scripted", "--probe-only"]
+            cli.main([*flags, "--token-id-prompts", "--no-plain-text", "--no-vision", "--out", str(out)])  # fmt: skip
+        capsys.readouterr()
+        written = json.loads(out.read_text(encoding="ascii"))
+        # What the earlier probe_verdict requires of the object it is given.
+        assert "reflects" not in written
+        # What the earlier reading of --token-id-route looks for, and what
+        # check_verdict requires of the object it then holds.
+        assert "token_id_route" not in written and "ok" not in written
+        with pytest.raises(SetupError, match="is not what a probe returns"):
+            probe_verdict(written, model="scripted", endpoint="x", route="completions")
+        with pytest.raises(SetupError, match="is not what a check returns"):
+            check_verdict(written, model="scripted", endpoint="x", fmt="parameter_blocks", arguments={})  # fmt: skip
+
+    def test_without_token_id_prompts_the_probes_verdict_is_printed_as_before(self, capsys):
+        with ScriptedChatServer(SCRIPT, sampler_logprobs=True) as server:
+            flags = ["--base-url", server.base_url, "--model", "scripted", "--probe-only"]
+            assert cli.main(flags) == 0
+        written = json.loads(capsys.readouterr().out)
+        assert written["route"] == "chat" and "reflects" in written and "probe" not in written
 
 
 class TestAVerdictOfTheProbe:
@@ -530,8 +562,8 @@ class TestTheCommand:
             assert len(server.requests) == asked + 3
         record = json.loads(out.read_text(encoding="ascii"))
         assert status == 0, record["problems"]
-        assert record["token_id_route"] == given["token_id_route"]
-        assert record["logprobs"] == _without(given, "token_id_route")
+        assert record["token_id_route"] == given["route"]
+        assert record["logprobs"] == given["probe"]
         assert record["logprobs"]["model"] == record["model"] == "scripted"
         assert record["logprobs"]["endpoint"] == record["endpoint"]
         capsys.readouterr()
@@ -541,38 +573,55 @@ class TestTheCommand:
         [
             (
                 "--sampler-logprobs",
-                lambda v: {**v, "model": "another"},
+                lambda v: {**v["probe"], "model": "another"},
                 "--sampler-logprobs: the given verdict of the probe was made for the model",
             ),
             (
                 "--sampler-logprobs",
-                lambda v: {**v, "endpoint": "http://127.0.0.1:9/v1"},
+                lambda v: {**v, "probe": {**v["probe"], "endpoint": "http://127.0.0.1:9/v1"}},
                 "--sampler-logprobs: the given verdict of the probe was made at",
             ),
             (
                 "--sampler-logprobs",
-                lambda v: _without(v, "model", "endpoint", "checked_at"),
+                lambda v: _without(v["probe"], "model", "endpoint", "checked_at"),
                 "(model, endpoint, checked_at missing), so nothing shows that it is this run's: "
                 "probe again",
             ),
             (
                 "--sampler-logprobs",
-                lambda v: v["reflects"],
+                lambda v: v["probe"]["reflects"],
                 "--sampler-logprobs: the given verdict of the probe is not what a probe returns",
             ),
             (
                 "--sampler-logprobs",
-                lambda v: {**v, "route": "chat"},
+                lambda v: {**v["probe"], "route": "chat"},
                 "was probed on the chat route",
             ),
             (
+                # The whole object, with no probe in it.
+                "--sampler-logprobs",
+                lambda v: _without(v, "probe"),
+                "--sampler-logprobs takes probe, yes, no, or what --probe-only printed",
+            ),
+            (
                 "--token-id-route",
-                lambda v: {**v["token_id_route"], "model": "another"},
+                lambda v: _without(v, "route"),
+                "--token-id-route takes what --probe-only printed",
+            ),
+            (
+                # What an earlier build printed is read where it holds its check.
+                "--token-id-route",
+                lambda v: {**v["probe"], "token_id_route": {**v["route"], "model": "another"}},
                 "--token-id-route: the given check of the server was made for the model",
             ),
             (
                 "--token-id-route",
-                lambda v: _without(v["token_id_route"], "template_arguments"),
+                lambda v: {**v, "route": {**v["route"], "model": "another"}},
+                "--token-id-route: the given check of the server was made for the model",
+            ),
+            (
+                "--token-id-route",
+                lambda v: _without(v["route"], "template_arguments"),
                 "(template_arguments missing)",
             ),
             (
@@ -583,13 +632,13 @@ class TestTheCommand:
             ),
             (
                 "--token-id-route",
-                lambda v: _without(v["token_id_route"], "marker_ids"),
+                lambda v: _without(v["route"], "marker_ids"),
                 "--token-id-route: the given check of the server does not hold what a passed "
                 "check found (marker_ids must give a token ID",
             ),
             (
                 "--token-id-route",
-                lambda v: {**v["token_id_route"], "closing": "2"},
+                lambda v: {**v["route"], "closing": "2"},
                 "(closing must be the token IDs the template writes, at least one)",
             ),
         ],

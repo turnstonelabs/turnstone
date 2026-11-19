@@ -1,12 +1,13 @@
 """Images in a rollout whose prompts go out as token IDs.
 
-Off unless a run asks for it (``RolloutConfig.vision``).  With it on, the
-session's model is given vision, so the framework's own paths bring an image
-into the conversation: ``read_file`` on an image file and an image a tool of
-the task's servers returns both arrive as ``image_url`` parts of the request's
-messages, the way they do for any model with vision.  Nothing of that is built
-here.  What this module adds is the part a prompt of token IDs lacks: the
-pixels.
+On by default with prompts as token IDs, and a run that cannot have it is
+refused unless it says it wants none (``RolloutConfig.vision``).  With it on,
+the session's model is given vision, so the framework's own paths bring an
+image into the conversation: ``read_file`` on an image file and an image a
+tool of the task's servers returns both arrive as ``image_url`` parts of the
+request's messages, the way they do for any model with vision.  Nothing of
+that is built here.  What this module adds is the part a prompt of token IDs
+lacks: the pixels.
 
 The server's tokenize route renders an image as a run of one placeholder
 token, as many as the image has patches after the server's own resizing.  The
@@ -23,9 +24,10 @@ prompt the tokenize route rendered:
 - the prompt it reports must be that rendering, token by token;
 - the places it reports for the images must be the runs found in it.
 
-A reply that fails either is not trainable, and no prompt is built on it: the
-run ends as a failure of the machinery.  Everything else is as on the
-completions route.  The prompt is still the previous prompt, the tokens
+A reply that fails either, or that never says which prompt it answered, is
+the harness's alarm: nothing a conversation holds brings it about, so the run
+ends as ``harness_fault`` and nothing more is sent.  Everything else is as on
+the completions route.  The prompt is still the previous prompt, the tokens
 generated after it and the template's tail; the reply is read on this side;
 token IDs and log-probabilities are kept one to one and compared by ID; the
 context window is kept exactly, images counted at their real length.  A
@@ -59,17 +61,14 @@ from turnstone.rollout.idprompt import (
     PromptAssemblyError,
     _root,
     completion_request,
+    note_reported_prompt,
+    pair_tokens,
     render,
     template_arguments,
+    unreadable,
 )
 from turnstone.rollout.plaintext import HarnessFaultError
-from turnstone.rollout.recording import (
-    _ID_PREFIX,
-    PARENT,
-    CallRecord,
-    _misaligned,
-    _usage_dict,
-)
+from turnstone.rollout.recording import _ID_PREFIX, PARENT, CallRecord, _usage_dict
 from turnstone.rollout.settings import SetupError
 from turnstone.rollout.tokens import common_prefix_len
 
@@ -320,37 +319,25 @@ def take_generate(record: CallRecord, part: Any) -> tuple[str, list[int]] | None
         if not isinstance(part, dict):
             raise TypeError("a part of the reply is no object")
         taken: tuple[str, list[int]] | None = None
-        reported = part.get("prompt_token_ids")
-        if reported is not None and record.prompt_token_ids is None:
-            prompt = [int(i) for i in reported]
-            if record.prompt_sent is not None and prompt == record.prompt_sent:
-                # One list for both: a long run holds every prompt.
-                prompt = record.prompt_sent
-            elif record.prompt_sent is not None:
-                record.prompt_differs = True
-            record.prompt_token_ids = prompt
-            record.prompt_sent = None
-            if record.placeholders_sent is not None:
-                places = _image_places(part.get("mm_placeholders"))
-                record.placeholders_differ = places != record.placeholders_sent
+        if (
+            note_reported_prompt(record, part.get("prompt_token_ids"))
+            and record.placeholders_sent is not None
+        ):
+            places = _image_places(part.get("mm_placeholders"))
+            record.placeholders_differ = places != record.placeholders_sent
         for choice in part.get("choices") or []:
             if choice.get("index", 0) != 0:
                 continue
             ids = [int(i) for i in (choice.get("token_ids") or [])]
             text = choice.get("text") or ""
-            record.token_ids.extend(ids)
             record.raw.extend(text.encode("utf-8", errors="replace"))
             entries = list((choice.get("logprobs") or {}).get("content") or [])
-            if len(ids) != len(entries):
-                _misaligned(record)
-            elif record.aligned:
-                named = [str(entry.get("token")) for entry in entries]
-                if named and all(n.startswith(_ID_PREFIX) for n in named):
-                    record.ids_checked = True
-                    if named != [f"{_ID_PREFIX}{i}" for i in ids]:
-                        _misaligned(record)
-                if record.aligned:
-                    record.logprobs.extend(float(entry["logprob"]) for entry in entries)
+            pair_tokens(
+                record,
+                ids,
+                [entry.get("logprob") for entry in entries],
+                [str(entry.get("token")) for entry in entries],
+            )
             reason = choice.get("finish_reason")
             if reason:
                 record.finish_reason = reason
@@ -360,10 +347,7 @@ def take_generate(record: CallRecord, part: Any) -> tuple[str, list[int]] | None
             record.usage = usage
         return taken
     except Exception as error:
-        record.unreadable = f"{type(error).__name__}: {str(error)[:200]}"
-        if record.aligned:
-            _misaligned(record)
-        log.warning("rollout.recording_unreadable", call=record.index, error=record.unreadable)
+        unreadable(record, error)
         return None
 
 
@@ -468,8 +452,9 @@ class VisionRoute:
     placeholder: int
     # The two tokens the template writes around an image's placeholders.
     frame: tuple[int, int]
-    # The rule the server's counts follow, where the check found one.
-    resize: ResizeRule | None = None
+    # The rule the server's image sizes follow: a check passes only on a
+    # server that follows it.
+    resize: ResizeRule = field(default_factory=ResizeRule)
 
     @classmethod
     def from_verdict(cls, verdict: Mapping[str, Any]) -> VisionRoute:
@@ -496,16 +481,15 @@ class VisionRoute:
                 "found (placeholder must be the token an image is rendered as): check again"
             )
         rule = verdict.get("resize_rule")
-        resize: ResizeRule | None = None
-        if rule is not None:
-            try:
-                resize = ResizeRule(**{name: int(rule[name]) for name in ResizeRule().describe()})
-            except (KeyError, TypeError, ValueError):
-                raise SetupError(
-                    "the given check of the server for images does not hold what a passed "
-                    "check found (resize_rule must name multiple, min_pixels, max_pixels and "
-                    "patch, or be null): check again"
-                ) from None
+        try:
+            sized = rule if isinstance(rule, dict) else {}
+            resize = ResizeRule(**{name: int(sized[name]) for name in ResizeRule().describe()})
+        except (KeyError, TypeError, ValueError):
+            raise SetupError(
+                "the given check of the server for images does not hold what a passed check "
+                "found (resize_rule must name multiple, min_pixels, max_pixels and patch: the "
+                "rule the server sizes an image by): check again"
+            ) from None
         around = verdict.get("frame")
         if (
             not isinstance(around, (list, tuple))
@@ -685,12 +669,17 @@ class Vision:
             width, height = image_size(image.data)
             processed: dict[str, Any] | None = None
             rule = self.route.resize
-            if (
-                rule is not None
-                and width
-                and height
-                and rule.tokens(width, height) == (placed.length)
-            ):
+            if not width or not height:
+                problems.append(
+                    f"image {index}: its size could not be read here, so the record cannot "
+                    "say what the server made of it"
+                )
+            elif rule.tokens(width, height) != placed.length:
+                problems.append(
+                    f"image {index}: {width}x{height} stands as {placed.length} placeholder "
+                    f"tokens, and the server's resize rule gives {rule.tokens(width, height)}"
+                )
+            else:
                 wide, high = rule.size(width, height)
                 processed = {
                     "width": wide,
@@ -895,7 +884,8 @@ def check_vision_route(
     Asks for exactly what the mode uses.  ``ok`` is true when every check
     passed; ``reason`` names the first that did not.  The verdict is JSON-safe
     and can be passed to further runs with the same model and template
-    arguments (:func:`vision_verdict`).  A server passes when
+    arguments, inside the verdict of
+    :func:`~turnstone.rollout.idprompt.check_token_id_route`.  A server passes when
 
     - its generate route answers a prompt of token IDs with text, token IDs
       and log-probabilities named by token ID, one to one;
@@ -911,8 +901,9 @@ def check_vision_route(
       distribution as the completions route at the same place.
 
     ``sizes`` lists how many placeholder tokens the server gives images of a
-    few sizes, and ``resize_rule`` the rule those counts follow, where they
-    follow the one known here.
+    few sizes, and ``resize_rule`` the rule those counts follow.  A server
+    whose counts do not follow the rule known here fails the check: the
+    record could not say what such a server makes of an image.
     """
     from turnstone.rollout.probe import sampler_logprobs_reported
 
@@ -1021,8 +1012,16 @@ def check_vision_route(
         )
     verdict["sizes"] = sizes
     rule = ResizeRule()
-    follows = all(rule.tokens(s["width"], s["height"]) == s["tokens"] for s in sizes)
-    verdict["resize_rule"] = rule.describe() if follows else None
+    for size in sizes:
+        by_rule = rule.tokens(size["width"], size["height"])
+        if by_rule != size["tokens"]:
+            return failed(
+                "the server does not size images by the rule known here (sides rounded to "
+                f"multiples of {rule.multiple}, the area kept within {rule.min_pixels} to "
+                f"{rule.max_pixels} pixels): {size['width']}x{size['height']} takes "
+                f"{size['tokens']} placeholder tokens, the rule gives {by_rule}"
+            )
+    verdict["resize_rule"] = rule.describe()
 
     # 4. The generate route expands the placeholders to the very rendering.
     red = Image.of(png(96, 96, _RED), "image/png")
@@ -1157,6 +1156,17 @@ def check_vision_route(
     except Exception as error:
         return failed(f"the two routes could not be compared at one place ({_status_words(error)})")
     checks["routes_agree"] = agree
+    if agree["positions"] < _COMPARED:
+        return failed(
+            f"the two routes were compared at {agree['positions']} positions and the check "
+            f"takes {_COMPARED}: {agree['stopped']}"
+        )
+    one_way = settings.get("temperature") == 0 or settings.get("top_k") == 1
+    if not agree["unsure_positions"] and not one_way:
+        return failed(
+            "at none of the positions compared did either route list more than one possible "
+            "token, so the comparison shows nothing about the run's sampler settings"
+        )
     if agree["differing_positions"]:
         return failed(
             "the generate route and the completions route list different distributions at the "
@@ -1176,6 +1186,7 @@ def _routes_agree(
     alternatives = 20
     positions = differing = unsure = 0
     widest = 0.0
+    stopped: str | None = None
     sent = list(prompt)
     keywords = {k: settings[k] for k in ("temperature", "top_p") if k in settings}
     body = {k: v for k, v in settings.items() if k not in keywords}
@@ -1199,22 +1210,29 @@ def _routes_agree(
             if float(one["logprob"]) > _IMPOSSIBLE_BELOW
         }
         if not there or not here:
+            stopped = (
+                f"the {'completions' if not there else 'generate'} route listed no possible "
+                f"token at position {positions}"
+            )
+            break
+        likeliest = max(there, key=there.__getitem__)
+        if not likeliest.startswith(_ID_PREFIX):
+            stopped = "the completions route does not name the tokens it lists by ID"
             break
         positions += 1
-        unsure += len(there) > 1
+        unsure += len(there) > 1 or len(here) > 1
         apart = max((abs(there[name] - here[name]) for name in there if name in here), default=0.0)
         widest = max(widest, apart)
         if set(there) != set(here) or apart > _AGREE_WITHIN:
             differing += 1
-        likeliest = max(there, key=there.__getitem__)
-        if not likeliest.startswith(_ID_PREFIX):
-            break
         sent = [*sent, int(likeliest[len(_ID_PREFIX) :])]
     return {
         "positions": positions,
-        # Positions with more than one possible token: the ones that show a
-        # cut-off or a temperature one route leaves out.
+        # Positions at which a route listed more than one possible token: the
+        # ones that show a cut-off or a temperature one route leaves out.
         "unsure_positions": unsure,
         "differing_positions": differing,
         "widest_difference": round(widest, 6),
+        # Why fewer positions were compared than the check takes.
+        "stopped": stopped,
     }

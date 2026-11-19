@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from openai import APIStatusError, DefaultHttpxClient, OpenAI
 
 from turnstone.core.completion_recovery import EmptyCompletionError, is_context_overflow
+from turnstone.core.control_text import EscapeLog
 from turnstone.core.log import get_logger
 from turnstone.core.memory import get_attachments, save_attachment
 from turnstone.core.model_turn import ModelContextLimitError, require_lane_capabilities
@@ -75,7 +76,7 @@ from turnstone.rollout.idprompt import (
     check_token_id_route,
     template_arguments,
 )
-from turnstone.rollout.plaintext import HarnessFaultError, PlainText
+from turnstone.rollout.plaintext import PlainText
 from turnstone.rollout.preparation import BeforeRunCommand, before_run_failure, run_before
 from turnstone.rollout.probe import SETTINGS as PROBED_SETTINGS
 from turnstone.rollout.probe import all_settings, sampler_logprobs_reported
@@ -295,15 +296,25 @@ class RolloutConfig:
     # model is given vision, so an image file it reads and an image a tool of
     # the task's servers returns reach it as images, and a request that holds
     # one goes to the server's generate route with the images beside the token
-    # IDs.  ``None``: on where the check of the server found that route
-    # working, the conversation's text is read as plain text and a folder for
-    # the images is named; the record says which of these was missing.
-    # ``True`` refuses a run that cannot; ``False`` is off, and the check then
-    # asks nothing about images.
+    # IDs.  Two states, with prompts as token IDs: on (``None``, the default,
+    # and ``True``), and a run that cannot have it is refused before anything
+    # runs, whatever the reason (the check of the server asked nothing about
+    # images or did not pass, plain text is off, no folder is named for the
+    # images, the run carries a request parameter the generate route has no
+    # place for); or off (``False``), and the check then asks nothing about
+    # images.  It is never switched off by what a server turns out to be able
+    # to do.  ``True`` says the default aloud and is refused where prompts
+    # are sent as messages.
     vision: bool | None = None
     # The folder the images of a run with vision are written to, each under
     # the hash of its bytes.
     image_dir: str | None = None
+    # With prompts sent as messages: whether control-token text is escaped in
+    # what is sent (:mod:`turnstone.core.control_text`).  ``None`` leaves it
+    # to the framework's rule for the lane (on for a server at a loopback or
+    # private address); ``True`` and ``False`` say so for this run.  With
+    # prompts as token IDs nothing is escaped, and the record says so.
+    escape_control_text: bool | None = None
 
     # Seconds one tool call may run when the model names no limit of its own;
     # ``None``: the framework's ``tools.timeout``.
@@ -681,6 +692,7 @@ class RolloutSession(HeadlessSession):
         before_acting: Callable[[], None] | None = None,
         vision: bool = False,
         token_ids: bool = False,
+        escape_control_text: bool | None = None,
         **kwargs: Any,
     ) -> None:
         if kwargs.get("judge_config") is not None:
@@ -701,26 +713,29 @@ class RolloutSession(HeadlessSession):
         self._subagent_sidecar_tools = subagent_sidecar_tools
         super().__init__(**kwargs)
         self._vision = vision
+        lane = self._model_binding.lane
+        capabilities = require_lane_capabilities(lane)
         if token_ids:
             # The prompts are built here, token by token, from the conversation as
             # it is: read as plain text (plaintext.py) or, where that is switched
             # off, rendered as it stands.  The framework's escape of control-token
             # text in what is sent is for the routes that take text, and would
             # put a character into the prompt that no file holds.
-            lane = self._model_binding.lane
-            exact = replace(require_lane_capabilities(lane), escape_control_tokens=False)
-            self._model_binding = replace(
-                self._model_binding, lane=replace(lane, capabilities=exact)
-            )
+            capabilities = replace(capabilities, escape_control_tokens=False)
+        elif escape_control_text is not None:
+            # The run's own word, where the lane's rule is not to decide.
+            capabilities = replace(capabilities, escape_control_tokens=escape_control_text)
         if vision:
             # The model sees images.  The framework's own paths then bring one
             # into the conversation as an image: a file the model reads, what
             # a tool of the task's servers returns.
-            lane = self._model_binding.lane
-            seeing = replace(require_lane_capabilities(lane), supports_vision=True)
-            self._model_binding = replace(
-                self._model_binding, lane=replace(lane, capabilities=seeing)
-            )
+            capabilities = replace(capabilities, supports_vision=True)
+        # What became of the escape in the session's requests, for the record.
+        self.control_text_log = EscapeLog()
+        self._model_binding = replace(
+            self._model_binding,
+            lane=replace(lane, capabilities=capabilities, control_text_log=self.control_text_log),
+        )
         # Called once, before the first of the model's tool calls runs.
         self._before_acting = before_acting
         # Counts the run's tokens and time (:mod:`turnstone.rollout.budget`).
@@ -1863,10 +1878,16 @@ def _build_record(
     # sequence and where it came from.  The bytes are written now, before the
     # record.
     plain_text = dict(state.get("plain_text") or {"applied": False, "reason": "not set up"})
+    seen = dict(state.get("vision") or {"applied": False, "reason": "not set up"})
+    if assembly is not None and not assembly.started:
+        # Set up, and applied to nothing: no prompt was built.
+        for said in (plain_text, seen):
+            if said["applied"]:
+                said.clear()
+                said.update({"applied": False, "reason": "the run made no model call"})
     if plain_text["applied"]:
         plain_text["seen"] = dict(assembly.plain_seen) if assembly is not None else {}
-    seen = dict(state.get("vision") or {"applied": False, "reason": "not set up"})
-    seeing = assembly.vision if assembly is not None else None
+    seeing = assembly.vision if assembly is not None and seen["applied"] else None
     if seeing is not None:
         seen["check"] = (state.get("token_id_route") or {}).get("vision")
         seen["image_dir"] = config.image_dir
@@ -1974,14 +1995,7 @@ def _build_record(
         "prefix_ok": prefix["ok"],
         "prefix_breaks": [describe_break(b) for b in prefix["breaks"]],
         "prefix_events": snapshot["prefix_events"]
-        + (_plain(assembly.events) if assembly is not None else [])
-        # The texts of the tokenizer's own tokens that the conversation held
-        # and the model was given as plain text.
-        + (
-            [{"event": "special_text_read_as_plain_text", "texts": dict(assembly.plain_seen)}]
-            if assembly is not None and assembly.plain_seen
-            else []
-        ),
+        + (_plain(assembly.events) if assembly is not None else []),
         # Every model turn's tokens and log-probabilities are sound and were
         # sampled the way the record says: each call can be trained on.
         "trainable": trainable,
@@ -2043,6 +2057,20 @@ def _build_record(
         record["subagents"]["text"] = [c.raw_text for c in side]
     record["plain_text"] = plain_text
     record["vision"] = seen
+    # Whether control-token text was escaped in what was sent as messages
+    # (:mod:`turnstone.core.control_text`), and which texts in the latest
+    # request.
+    session = state.get("session")
+    escape = getattr(session, "control_text_log", None)
+    record["control_text_escape"] = (
+        escape.describe() if isinstance(escape, EscapeLog) else EscapeLog().describe()
+    )
+    if config.token_id_prompts:
+        record["control_text_escape"]["reason"] = (
+            "prompts are sent as token IDs: nothing is escaped"
+            if escape is not None and escape.applied is not None
+            else "no model call was made"
+        )
     return record
 
 
@@ -2535,7 +2563,24 @@ def _token_id_route(config: RolloutConfig) -> dict[str, Any]:
     return dict(verdict)
 
 
-def plain_text_check(config: RolloutConfig, written: Sequence[int] = ()) -> dict[str, Any]:
+def template_writes(route: Mapping[str, Any]) -> tuple[list[int], list[int]]:
+    """The tokens a passed check of the routes saw the template write or a
+    reply's reading relies on, those it writes for an image included; and
+    those among them that are control tokens for certain (the format's
+    markers that are one token, the end-of-turn token)."""
+    markers = [*route["marker_ids"].values()]
+    written = [*markers, *route["closing"], *route["generation_prompt"]]
+    seeing = route.get("vision")
+    if isinstance(seeing, dict) and seeing.get("ok") is True:
+        for token in (seeing.get("placeholder"), *(seeing.get("frame") or [])):
+            if isinstance(token, int) and not isinstance(token, bool):
+                written.append(token)
+    return written, [*markers, route["closing"][0]]
+
+
+def plain_text_check(
+    config: RolloutConfig, written: Sequence[int] = (), required: Sequence[int] = ()
+) -> dict[str, Any]:
     """How the text of the tokenizer's own tokens is read as plain text on
     *config*'s server: the verdict of a check made now
     (:func:`~turnstone.rollout.idprompt.check_plain_text`), from the tokens
@@ -2552,78 +2597,88 @@ def plain_text_check(config: RolloutConfig, written: Sequence[int] = ()) -> dict
                 reasoning_effort=config.reasoning_effort,
                 added_tokens=config.added_tokens,
                 written=written,
+                required=required,
             )
     except Exception as check_error:
         return {
             "ok": False,
             "reason": f"the check failed ({type(check_error).__name__}: {str(check_error)[:300]})",
+            "template_arguments": _template_arguments(config),
             **made_at(config.base_url, config.model),
         }
 
 
-def _plain_text(config: RolloutConfig, route: TokenIdRoute) -> PlainText | None:
-    """What reads the conversation's text as plain text in a run with *config*;
-    ``None`` where the run switched it off.  Raises :class:`SetupError` for a
-    verdict that is not this run's and for a server on which it could not be
-    established: the run does not start."""
+def _plain_text(
+    config: RolloutConfig, route: Mapping[str, Any]
+) -> tuple[PlainText | None, dict[str, Any] | None]:
+    """What reads the conversation's text as plain text in a run with *config*
+    and the verdict it rests on; ``None`` twice where the run switched it
+    off.  *route* is the verdict of the check of the routes.  Raises
+    :class:`SetupError` for a verdict that is not this run's (another model,
+    endpoint or set of template arguments) and for a server on which it
+    could not be established: the run does not start."""
     if not config.plain_text:
-        return None
+        return None, None
     verdict = config.plain_text_verdict
+    what, again = "check of the server for plain text", "check the server again"
     if verdict is None:
-        written = [*route.marker_ids.values(), *route.closing, *route.generation_prompt]
-        verdict = plain_text_check(config, written)
+        verdict = plain_text_check(config, *template_writes(route))
     else:
         _says_what_for(
-            verdict,
-            ("model", "endpoint", "checked_at"),
-            "check of the server for plain text",
-            "check the server again",
+            verdict, ("model", "endpoint", "checked_at", "template_arguments"), what, again
         )
-        _made_here(
-            verdict,
-            "check of the server for plain text",
-            "check the server again",
-            config.model,
-            config.base_url,
-        )
-    return PlainText.from_verdict(verdict)
+        _made_here(verdict, what, again, config.model, config.base_url)
+        if verdict["template_arguments"] != _template_arguments(config):
+            # Which tokens a template writes can depend on its arguments, and
+            # the stand-in is chosen among the ones it does not write.
+            raise SetupError(
+                f"the given {what} was made with other template arguments "
+                f"({json.dumps(verdict['template_arguments'], sort_keys=True)[:300]}) than the "
+                f"run's: {again}"
+            )
+    return PlainText.from_verdict(verdict), verdict
 
 
 def _seeing(
     config: RolloutConfig, route: Mapping[str, Any], plain: PlainText | None
-) -> tuple[VisionRoute | None, str | None]:
-    """What a run with *config* sends its images with, or why it sends none.
-    Raises :class:`SetupError` where the run asked for vision and cannot
-    have it."""
+) -> VisionRoute | None:
+    """What a run with *config* sends its images with; ``None`` where the
+    run says it wants none.  A run that is to see images and cannot is
+    refused with :class:`SetupError`, whatever the reason: it never goes on
+    without them."""
     if config.vision is False:
-        return None, "switched off"
+        return None
+
+    def refused(why: str) -> SetupError:
+        return SetupError(
+            f"the model is to see images and cannot: {why}. Make it possible (the check of "
+            "the server says what is missing), or run without images (vision=False, "
+            "--no-vision)"
+        )
+
     found = route.get("vision")
-    why: str | None = None
     if not isinstance(found, dict):
-        why = "the check of the server asked nothing about images"
-    elif found.get("ok") is not True:
-        why = f"the server cannot be sent images: {found.get('reason')}"
-    elif plain is None:
-        why = "the conversation's text is not read as plain text"
-    elif not config.image_dir:
-        why = "the run names no folder for its images (image_dir)"
-    if why is None:
-        assert isinstance(found, dict)
-        seeing = VisionRoute.from_verdict(found)
-        try:
-            carried = {k: v for k, v in config.extra_body.items() if k != "chat_template_kwargs"}
-            generate_body({"extra_body": carried}, [0], ())
-        except RuntimeError as no_place:
-            why = str(no_place)
-        else:
-            assert plain is not None
-            if plain.stand_in_id in (seeing.placeholder, *seeing.frame):
-                why = "the stand-in for plain text is a token the template writes for an image"
-            else:
-                return seeing, None
-    if config.vision:
-        raise SetupError(f"the run asks for vision and cannot have it: {why}")
-    return None, why
+        raise refused(
+            "the check of the server asked nothing about images (it was made for runs without)"
+        )
+    if found.get("ok") is not True:
+        raise refused(f"the image check of the server did not pass: {found.get('reason')}")
+    if plain is None:
+        raise refused("the conversation's text is not read as plain text")
+    if not config.image_dir:
+        raise refused("the run names no folder for its images (image_dir)")
+    seeing = VisionRoute.from_verdict(found)
+    try:
+        carried = {k: v for k, v in config.extra_body.items() if k != "chat_template_kwargs"}
+        generate_body({"extra_body": carried}, [0], ())
+    except RuntimeError as no_place:
+        raise refused(str(no_place)) from None
+    if plain.stand_in_id in (seeing.placeholder, *seeing.frame):
+        raise refused(
+            "the stand-in for plain text is a token the template writes for an image (the "
+            "check for plain text was made without the check for images)"
+        )
+    return seeing
 
 
 def run_episode(
@@ -2690,10 +2745,10 @@ def run_episode(
             "vision is for prompts as token IDs (token_id_prompts), which this run does not "
             "send: with messages the chat route takes the images itself"
         )
-    if config.vision and not config.image_dir:
+    if config.escape_control_text is not None and config.token_id_prompts:
         raise SetupError(
-            "a run with vision names the folder its images are written to (image_dir): the "
-            "record names each image by the hash of its bytes, and the bytes must be kept"
+            "escape_control_text is for prompts sent as messages: with prompts as token IDs "
+            "nothing is escaped"
         )
     if (
         config.token_id_prompts
@@ -2710,12 +2765,22 @@ def run_episode(
             "tokenizer's tokens (added_tokens, or tokenizer_info_from_server), or switch it "
             "off (plain_text=False)"
         )
-    if config.vision and not config.plain_text:
-        raise SetupError(
-            "vision needs the conversation's text read as plain text (plain_text), which is "
-            "switched off: a tool result that holds the text of the image placeholder would "
-            "take the next image"
-        )
+    if config.token_id_prompts and config.vision is not False:
+        # The model sees images unless the run says otherwise, and what that
+        # takes is asked for here, before anything runs.
+        if not config.plain_text:
+            raise SetupError(
+                "the model sees images unless the run says otherwise (vision=False, "
+                "--no-vision), and that needs the conversation's text read as plain text "
+                "(plain_text), which is switched off: a tool result that holds the text of "
+                "the image placeholder would take the next image"
+            )
+        if not config.image_dir:
+            raise SetupError(
+                "the model sees images unless the run says otherwise (vision=False, "
+                "--no-vision), and the run names no folder for them (image_dir): the record "
+                "names each image by the hash of its bytes, and the bytes must be kept"
+            )
 
     # Before the clock starts: what the run's limits are, and which
     # log-probabilities the server reports.  Neither is the task's time.
@@ -2734,6 +2799,8 @@ def run_episode(
     # answer the run does not start, and the server is asked nothing more.
     version = state["server_version"] = _server_version(config)
     answered = version is None or version.ask_first() is None
+    # What the run is set up to apply to the conversation.  The record says
+    # that it was applied only once a model call was made.
     state["plain_text"] = {"applied": False, "reason": "prompts are sent as messages"}
     state["vision"] = {"applied": False, "reason": "prompts are sent as messages"}
     if config.token_id_prompts:
@@ -2742,24 +2809,28 @@ def run_episode(
         if answered or config.token_id_route is not None:
             state["token_id_route"] = _token_id_route(config)
             route = TokenIdRoute.from_verdict(state["token_id_route"])
-            plain = _plain_text(config, route) if answered or config.plain_text_verdict else None
-            state["assembly"] = PromptAssembly(
-                route, context_window=config.context_window, plain=plain
-            )
-            if plain is not None:
-                state["plain_text"] = {
-                    "applied": True,
-                    "stand_in_id": plain.stand_in_id,
-                    "texts": len(plain.texts),
-                }
-            elif not config.plain_text:
-                state["plain_text"] = {"applied": False, "reason": "switched off"}
-            seeing, why_not = _seeing(config, state["token_id_route"], plain)
-            state["vision"] = {"applied": seeing is not None}
-            if seeing is None:
-                state["vision"]["reason"] = why_not
-            else:
-                state["assembly"].vision = Vision(seeing)
+            state["assembly"] = PromptAssembly(route, context_window=config.context_window)
+            # A verdict for plain text is made by asking the server, which a
+            # run that will not start does not do.
+            settled = answered or config.plain_text_verdict is not None or not config.plain_text
+            if settled:
+                plain, established = _plain_text(config, state["token_id_route"])
+                state["assembly"].plain = plain
+                if plain is not None and established is not None:
+                    state["plain_text"] = {
+                        "applied": True,
+                        "stand_in_id": plain.stand_in_id,
+                        "texts": len(plain.texts),
+                        "left_out": list(established.get("left_out") or []),
+                    }
+                else:
+                    state["plain_text"] = {"applied": False, "reason": "switched off"}
+                seeing = _seeing(config, state["token_id_route"], plain)
+                if seeing is None:
+                    state["vision"] = {"applied": False, "reason": "switched off"}
+                else:
+                    state["vision"] = {"applied": True}
+                    state["assembly"].vision = Vision(seeing)
         else:
             state["token_id_route"] = {
                 "ok": None,
@@ -2879,6 +2950,11 @@ def run_episode(
                     before_acting=before_acting,
                     **({"vision": True} if state["vision"]["applied"] else {}),
                     **({"token_ids": True} if config.token_id_prompts else {}),
+                    **(
+                        {"escape_control_text": config.escape_control_text}
+                        if config.escape_control_text is not None
+                        else {}
+                    ),
                 )
                 state["session"] = session
                 # A sandbox that is gone ends the run at the next turn: nothing
@@ -2982,9 +3058,9 @@ def run_episode(
                     error = _refused_text("the session's", refused)
                 elif any(isinstance(c, PlaceholderGeneratedError) for c in _causes(run_error)):
                     forced, error = "image_token_generated", str(run_error)[:500]
-                elif any(isinstance(c, HarnessFaultError) for c in _causes(run_error)):
-                    forced, error = "harness_fault", str(run_error)[:500]
                 else:
+                    # A fault of the harness's own is raised with the prompt
+                    # assembly told of it, and the record is built from that.
                     forced = "error"
                     error = f"{type(run_error).__name__}: {str(run_error)[:500]}"
             else:

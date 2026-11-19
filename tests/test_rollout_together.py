@@ -22,6 +22,7 @@ from tests.test_rollout_episode import (
     _DirSandbox,
     _no_configuration_file,  # noqa: F401
     _run,
+    both_ways,  # noqa: F401
 )
 from tests.test_rollout_preparation import _answer, _PreparedSandbox
 from tests.test_rollout_subagent_tools import (
@@ -76,8 +77,9 @@ class TestOneCheckForABatch:
             assert cli.main(base) == 0
             as_messages = json.loads(capsys.readouterr().out)
 
-        assert as_token_ids["sampler_logprobs"] is True and as_token_ids["route"] == "completions"
-        route = as_token_ids["token_id_route"]
+        probe = as_token_ids["probe"]
+        assert probe["sampler_logprobs"] is True and probe["route"] == "completions"
+        route = as_token_ids["route"]
         assert route["ok"] is True and route["format"] == "parameter_blocks"
         assert route["closing"] and route["generation_prompt"]
         # A batch that sends messages has no such check, and nothing is printed for it.
@@ -107,7 +109,8 @@ class TestOneCheckForABatch:
         assert status == 0, record["problems"]
         assert record["prompt_mode"] == "token_ids" and record["one_sequence"] is True
         given = json.loads(verdict.read_text(encoding="ascii"))
-        assert record["token_id_route"] == given["token_id_route"]
+        assert record["token_id_route"] == given["route"]
+        assert record["logprobs"] == given["probe"]
         # The verdict that was handed in is the one in force; no probe was made.
         assert record["logprobs"]["sampler_logprobs"] is True
         assert record["logprobs"]["reflects"] == {"temperature": True, "top_k": True, "top_p": True}
@@ -122,7 +125,7 @@ class TestOneCheckForABatch:
                 )
                 == 2
             )
-        route = json.loads(capsys.readouterr().out)["token_id_route"]
+        route = json.loads(capsys.readouterr().out)["route"]
         assert route["ok"] is False and "tokenize route" in route["reason"]
 
     @pytest.mark.parametrize(
@@ -349,6 +352,8 @@ class TestTheRecordIsWhole:
             assert records[name]["trainable"] is False
 
 
+# Twice: rendered as it is, and with plain text and vision on from given verdicts.
+@pytest.mark.usefixtures("both_ways")
 class TestASubAgentWithPromptsAsTokenIds:
     def test_the_bounds_on_its_results_and_its_tool_log_are_the_same_there(self):
         """A sub-agent goes the same route as the session; what bounds its results,

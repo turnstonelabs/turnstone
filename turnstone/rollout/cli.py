@@ -74,6 +74,7 @@ from turnstone.rollout.episode import (
     logprob_verdict,
     plain_text_check,
     run_episode,
+    template_writes,
     token_id_route_verdict,
 )
 from turnstone.rollout.idprompt import TokenIdRoute, template_arguments
@@ -98,6 +99,15 @@ REFUSED = 3
 # The exit status of a rollout in which the harness found itself at fault.  Its
 # own, so that no caller takes it for a refusal or for a failure to run again.
 FAULT = 4
+# The key that marks what ``--probe-only`` prints with ``--token-id-prompts``,
+# and the layout's number.  The object holds its verdicts under keys no
+# earlier build reads (``probe``, ``route``, ``plain_text``) and nothing of a
+# verdict at its top level, so that a build that knows nothing of plain text
+# or images refuses the file whichever flag it is handed with, where it would
+# otherwise run without either and write the verdicts into its record as if
+# they had been applied.
+SERVER_CHECK = "server_check"
+SERVER_CHECK_LAYOUT = 2
 
 # The flags that say what the task is.  A task file says all of it, so beside
 # ``--task`` each of them is refused: two sources for one value is how a stale
@@ -399,22 +409,36 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-plain-text",
         action="store_true",
-        help="with --token-id-prompts: render a conversation as it is. Without this flag the "
-        "text of the tokenizer's own tokens in a conversation (a tool result that holds the "
-        "characters of the end-of-turn token) reaches the model as characters, and a run that "
-        "was not given what that takes is refused",
+        help="with --token-id-prompts: render a conversation as it is; needs --no-vision "
+        "beside it. Without this flag the text of the tokenizer's own tokens in a "
+        "conversation (a tool result that holds the characters of the end-of-turn token) "
+        "reaches the model as characters, and a run that was not given what that takes is "
+        "refused",
     )
     parser.add_argument(
         "--vision",
         action="store_true",
-        help="with --token-id-prompts: the model must see images, and a server that cannot be "
-        "sent them is refused. Without this flag and without --no-vision the model sees "
-        "images where the check of the server found that it can",
+        help="with --token-id-prompts: the model sees images. This is the default and the "
+        "flag only says it aloud: a run that cannot have it (the check of the server did "
+        "not pass for images, no folder for them, plain text off) is refused unless it "
+        "says --no-vision",
     )
     parser.add_argument(
         "--no-vision",
         action="store_true",
-        help="the model sees no images, whatever the server can do",
+        help="the model sees no images, and the check of the server asks nothing about them",
+    )
+    parser.add_argument(
+        "--control-text-escape",
+        action="store_true",
+        help="with prompts sent as messages: escape control-token text in what is sent, "
+        "whatever the server's address (default: on for a server at a loopback or private "
+        "address)",
+    )
+    parser.add_argument(
+        "--no-control-text-escape",
+        action="store_true",
+        help="with prompts sent as messages: send the conversation's text as it is",
     )
     parser.add_argument(
         "--image-dir",
@@ -440,7 +464,10 @@ def _parser() -> argparse.ArgumentParser:
         "--probe-only",
         action="store_true",
         help="run no rollout: probe which log-probabilities the server reports, print the "
-        "verdict as one JSON object and exit (0 when they are the sampling distribution's)",
+        "verdict as one JSON object and exit (0 when they are the sampling distribution's). "
+        "With --token-id-prompts the object holds that verdict (probe), the check of the "
+        "routes with the image check in it (route) and the check for plain text "
+        "(plain_text), and the status is 0 only when all that the rollouts will use passed",
     )
     parser.add_argument(
         "--server-version-url",
@@ -709,6 +736,10 @@ def _verdict_given(
     if said in ("probe", "yes", "no"):
         return {"probe": None, "yes": True, "no": False}[said]
     verdict = _json_given("--sampler-logprobs", said)
+    if isinstance(verdict, dict) and SERVER_CHECK in verdict and "reflects" not in verdict:
+        # What --probe-only printed with --token-id-prompts: the probe is one
+        # of the verdicts in it.
+        verdict = verdict.get("probe")
     if not isinstance(verdict, dict):
         raise SetupError(
             "--sampler-logprobs takes probe, yes, no, or what --probe-only printed: a JSON "
@@ -735,9 +766,14 @@ def _route_given(
     """
     verdict = _json_given("--token-id-route", said)
     plain: dict[str, Any] | None = None
-    if isinstance(verdict, dict) and "token_id_route" in verdict:
+    if isinstance(verdict, dict) and SERVER_CHECK in verdict and "ok" not in verdict:
+        # What --probe-only prints with --token-id-prompts.
         found = verdict.get("plain_text")
         plain = found if isinstance(found, dict) else None
+        verdict = verdict.get("route")
+    elif isinstance(verdict, dict) and "token_id_route" in verdict:
+        # What an earlier build printed: the check of the routes inside the
+        # probe's verdict, and nothing about plain text or images.
         verdict = verdict["token_id_route"]
     if not isinstance(verdict, dict):
         raise SetupError(
@@ -779,6 +815,8 @@ def _wants(args: argparse.Namespace) -> dict[str, Any]:
     takes it.  Refuses flags that do not go together."""
     if args.vision and args.no_vision:
         raise SetupError("--vision and --no-vision cannot both be given")
+    if args.control_text_escape and args.no_control_text_escape:
+        raise SetupError("--control-text-escape and --no-control-text-escape cannot both be given")
     if not args.token_id_prompts:
         for flag, given in (
             ("--vision", args.vision),
@@ -788,11 +826,20 @@ def _wants(args: argparse.Namespace) -> dict[str, Any]:
             if given:
                 raise SetupError(f"{flag} is for --token-id-prompts, which is not given")
         return {}
-    if args.vision and args.no_plain_text:
+    for flag, given in (
+        ("--control-text-escape", args.control_text_escape),
+        ("--no-control-text-escape", args.no_control_text_escape),
+    ):
+        if given:
+            raise SetupError(
+                f"{flag} is for prompts sent as messages: with --token-id-prompts nothing is "
+                "escaped"
+            )
+    if args.no_plain_text and not args.no_vision:
         raise SetupError(
-            "--vision needs the conversation's text read as plain text, and --no-plain-text "
-            "switches that off: a tool result that holds the text of the image placeholder "
-            "would take the next image"
+            "--no-plain-text renders a conversation as it is, and the model sees images unless "
+            "--no-vision is given: a tool result that holds the text of the image placeholder "
+            "would take the next image. Give --no-vision with --no-plain-text"
         )
     if args.no_plain_text and args.tokenizer_info is not None:
         raise SetupError("--tokenizer-info is for plain text, which --no-plain-text switches off")
@@ -801,6 +848,16 @@ def _wants(args: argparse.Namespace) -> dict[str, Any]:
         "vision": False if args.no_vision else (True if args.vision else None),
         **_tokenizer_source(args),
     }
+
+
+def _escape_wanted(args: argparse.Namespace) -> dict[str, Any]:
+    """What the flags say about the escape of control-token text in a run
+    that sends messages, as the configuration takes it."""
+    if args.control_text_escape:
+        return {"escape_control_text": True}
+    if args.no_control_text_escape:
+        return {"escape_control_text": False}
+    return {}
 
 
 def _template_arguments(args: argparse.Namespace, extra_body: dict[str, Any]) -> dict[str, Any]:
@@ -917,12 +974,14 @@ def _probe_only(args: argparse.Namespace, api_key: str, extra_body: dict[str, An
 
     With ``--token-id-prompts`` the server is first checked for what prompts as
     token IDs need, images beside them included, and how the text of the
-    tokenizer's own tokens is read as plain text is established; both verdicts
-    are printed with the probe's (``token_id_route``, with ``vision`` in it,
-    and ``plain_text``), to be handed on the same way.  The status is 0 when
-    everything the rollouts will need is there: the probe, the route, plain
-    text unless ``--no-plain-text``, and images where ``--vision`` asks for
-    them.
+    tokenizer's own tokens is read as plain text is established.  What is
+    printed then holds three verdicts under keys of their own (``probe``,
+    ``route`` with ``vision`` in it, ``plain_text``) and the layout's number
+    (:data:`SERVER_CHECK`), to be handed on with ``--sampler-logprobs`` and
+    ``--token-id-route`` alike.  The status is 0 when everything the rollouts
+    will use is there: the probe, the route, plain text unless
+    ``--no-plain-text``, and images unless ``--no-vision``.  Anything else is
+    2: a rollout handed such a verdict would be refused.
     """
     wants = _wants(args)
     if wants.get("plain_text") and args.tokenizer_info is None:
@@ -956,31 +1015,30 @@ def _probe_only(args: argparse.Namespace, api_key: str, extra_body: dict[str, An
         config = replace(config, temperature=sampling["temperature"].value)
     route = token_id_route_verdict(config) if args.token_id_prompts else None
     verdict = logprob_verdict(config)
+    usable = verdict.get("sampler_logprobs") is True
     if route is not None:
-        verdict = {**verdict, "token_id_route": route}
-    usable = verdict.get("sampler_logprobs") is True and (route is None or route.get("ok") is True)
-    if route is not None and wants.get("plain_text"):
-        written: list[int] = []
-        if route.get("ok"):
-            written = [
-                *route["marker_ids"].values(),
-                *route["closing"],
-                *route["generation_prompt"],
-            ]
-        plain = plain_text_check(config, written)
-        # Beside the route, not in it: a build that does not know the key
-        # must not pass it on as something it did.
-        verdict = {**verdict, "plain_text": plain}
-        usable = usable and plain.get("ok") is True
-    seeing = (route or {}).get("vision")
-    if args.vision:
-        usable = usable and isinstance(seeing, dict) and seeing.get("ok") is True
-    elif isinstance(seeing, dict) and not seeing.get("ok"):
-        # Said, not decided: the rollouts run without images.
-        _put(
-            sys.stderr,
-            f"turnstone-rollout: note: the model will see no images ({seeing.get('reason')}){_NL}",
-        )
+        verdict = {SERVER_CHECK: SERVER_CHECK_LAYOUT, "probe": verdict, "route": route}
+        usable = usable and route.get("ok") is True
+        if wants["vision"] is not False:
+            seeing = route.get("vision")
+            sees = isinstance(seeing, dict) and seeing.get("ok") is True
+            usable = usable and sees
+            if not sees:
+                why = seeing.get("reason") if isinstance(seeing, dict) else None
+                _put(
+                    sys.stderr,
+                    "turnstone-rollout: the model cannot be shown images "
+                    f"({why or 'the routes for token IDs did not pass, so images were not asked'}): "
+                    f"rollouts handed this verdict are refused unless they say --no-vision{_NL}",
+                )
+        if wants.get("plain_text"):
+            written: tuple[list[int], list[int]] = ([], [])
+            if route.get("ok"):
+                written = template_writes(route)
+            plain = plain_text_check(config, *written)
+            # Beside the route, not in it.
+            verdict["plain_text"] = plain
+            usable = usable and plain.get("ok") is True
     # The status is the verdict's, whatever becomes of printing it.
     status = 0 if usable else 2
     line = _json_text(verdict)
@@ -1070,6 +1128,8 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
         wants["image_dir"] = args.image_dir or (f"{args.out}.images" if args.out else None)
     elif args.image_dir is not None:
         raise SetupError("--image-dir is for --token-id-prompts, which is not given")
+    else:
+        wants = _escape_wanted(args)
 
     config = RolloutConfig(
         base_url=args.base_url,

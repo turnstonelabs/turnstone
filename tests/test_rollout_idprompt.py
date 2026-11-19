@@ -29,7 +29,13 @@ from tests._scripted_chat_server import (
     no_user_query,
     render_prompt,
 )
-from tests.test_rollout_episode import SCRIPT, SPAWN, _no_configuration_file, _run  # noqa: F401
+from tests.test_rollout_episode import (  # noqa: F401
+    SCRIPT,
+    SPAWN,
+    _no_configuration_file,
+    _run,
+    both_ways,
+)
 from turnstone.core import session as session_module
 from turnstone.core.model_turn import ModelContextLimitError
 from turnstone.rollout import cli
@@ -868,14 +874,19 @@ class TestTheProbe:
             assert cli.main([*base, "--token-id-prompts", "--no-plain-text", "--no-vision"]) == 0
             asked = list(server.requests)
         verdict = json.loads(capsys.readouterr().out)
-        assert verdict["route"] == "completions" and verdict["sampler_logprobs"] is True
+        probe = verdict["probe"]
+        assert probe["route"] == "completions" and probe["sampler_logprobs"] is True
         # The one request with messages is the check's, which compares the chat
         # route's rendering with the tokenize route's; the probe asked with IDs.
         (compared,) = [r for r in asked if "messages" in r]
-        assert compared["max_tokens"] == 1 and verdict["token_id_route"]["ok"] is True
+        assert compared["max_tokens"] == 1 and verdict["route"]["ok"] is True
         assert sum(isinstance(r.get("prompt"), list) for r in asked) == len(asked) - 1
 
 
+# Each of these runs twice: rendered as it is, and with plain text and vision
+# on from given verdicts.  Their conversations hold no text of a token and no
+# image, so what they look at must not differ.
+@pytest.mark.usefixtures("both_ways")
 class TestWholeRollouts:
     def test_a_rollout_with_prompts_as_token_ids(self) -> None:
         with ScriptedChatServer(SCRIPT, sampler_logprobs=True) as server:
@@ -1035,6 +1046,10 @@ def _limits(server: ScriptedChatServer) -> list[int]:
     return [r["max_tokens"] for r in server.requests if r.get("max_tokens") != 1]
 
 
+# Each of these runs twice: rendered as it is, and with plain text and vision
+# on from given verdicts.  Their conversations hold no text of a token and no
+# image, so what they look at must not differ.
+@pytest.mark.usefixtures("both_ways")
 class TestTheWindow:
     """With prompts as token IDs the context window is kept exactly."""
 
@@ -1185,6 +1200,10 @@ def checked(server: ScriptedChatServer, **slow: Any) -> dict[str, Any]:
     return verdict
 
 
+# Each of these runs twice: rendered as it is, and with plain text and vision
+# on from given verdicts.  Their conversations hold no text of a token and no
+# image, so what they look at must not differ.
+@pytest.mark.usefixtures("both_ways")
 class TestTimeAndBudgets:
     """The time limit, the stall rule and the server's minimum speed read the
     same call records, whichever route the calls went out on."""

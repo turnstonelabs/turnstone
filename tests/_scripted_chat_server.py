@@ -173,11 +173,32 @@ def image_bytes(part: dict[str, Any]) -> bytes:
     return base64.b64decode(str(url).partition(";base64,")[2])
 
 
+# Whether the toy server sizes an image its own way (one token for every
+# square of eight pixels) where a server sizes it by the rule of the image
+# processors.  Set by a server started with ``own_image_sizes`` while it runs.
+_OWN_IMAGE_SIZES = False
+
+
 def image_patches(data: bytes) -> int:
-    """How many placeholder tokens the toy server gives a PNG: one for every
-    square of eight pixels, at least one."""
+    """How many placeholder tokens the toy server gives a PNG.  By the rule
+    the image processors of the served models follow: each side rounded to a
+    multiple of 32 pixels, the whole scaled to hold 65,536 to 16,777,216
+    pixels, one token for every square of 32 pixels."""
     width, height = struct.unpack(">II", data[16:24])
-    return max(1, ((width + 7) // 8) * ((height + 7) // 8))
+    if _OWN_IMAGE_SIZES:
+        return max(1, ((width + 7) // 8) * ((height + 7) // 8))
+    side, least, most = 32, 65536, 16777216
+    high = max(side, round(height / side) * side)
+    wide = max(side, round(width / side) * side)
+    if high * wide > most:
+        scale = math.sqrt(height * width / most)
+        high = max(side, math.floor(height / scale / side) * side)
+        wide = max(side, math.floor(width / scale / side) * side)
+    elif high * wide < least:
+        scale = math.sqrt(least / (height * width))
+        high = math.ceil(height * scale / side) * side
+        wide = math.ceil(width * scale / side) * side
+    return (wide // side) * (high // side)
 
 
 def content_tokens(
@@ -405,8 +426,15 @@ class ScriptedChatServer:
         generate_fault: str | None = None,
         own_tokens: bool = False,
         tokenizer_info: bool = False,
+        tokenizer_info_names: dict[str, int] | None = None,
+        own_image_sizes: bool = False,
     ) -> None:
         self.script = script
+        # A server that sizes images its own way, not by the rule a check
+        # knows; and what ``GET /tokenizer_info`` names where that is to be
+        # something else than the tokenizer's tokens (``ADDED_TOKENS``).
+        self.own_image_sizes = own_image_sizes
+        self.tokenizer_info_names = tokenizer_info_names
         # The generate route (``/inference/v1/generate``): token IDs with one
         # placeholder token per image, and the images beside them.  It answers
         # with this status (403: a server started without the route).  What
@@ -414,7 +442,8 @@ class ScriptedChatServer:
         # their text), ``other_prompt`` (it writes one placeholder token too
         # many), ``other_places`` (it says the images are one token further
         # on), ``blind`` (its replies do not depend on the images),
-        # ``no_usage`` (a streamed reply ends without its token counts).  A reply
+        # ``no_usage`` (a streamed reply ends without its token counts),
+        # ``no_prompt`` (it never says which prompt it answered).  A reply
         # to a request with images ends its text with ``saw:`` and the first
         # characters of each image's hash, as a model that sees them would
         # say something of them.
@@ -532,6 +561,8 @@ class ScriptedChatServer:
     # -- lifecycle ---------------------------------------------------------------
 
     def start(self) -> ScriptedChatServer:
+        global _OWN_IMAGE_SIZES  # noqa: PLW0603
+        _OWN_IMAGE_SIZES = self.own_image_sizes
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -548,7 +579,8 @@ class ScriptedChatServer:
                     if not owner.tokenizer_info:
                         owner._refuse(self, 404, "Not Found")
                         return
-                    decoder = {str(i): {"content": t} for t, i in ADDED_TOKENS.items()}
+                    names = owner.tokenizer_info_names or ADDED_TOKENS
+                    decoder = {str(i): {"content": t} for t, i in names.items()}
                     owner._send_json(self, {"added_tokens_decoder": decoder})
                     return
                 owner._send_json(
@@ -593,6 +625,8 @@ class ScriptedChatServer:
         return self
 
     def stop(self) -> None:
+        global _OWN_IMAGE_SIZES  # noqa: PLW0603
+        _OWN_IMAGE_SIZES = False
         if self._httpd is not None:
             self._httpd.shutdown()
             # Wake any handler still blocked on its client, then join them all.
@@ -844,7 +878,7 @@ class ScriptedChatServer:
                     "logprobs": None if content is None else {"content": content},
                 }
             )
-            if "prompt_token_ids" in choice:
+            if "prompt_token_ids" in choice and self.generate_fault != "no_prompt":
                 places = body["_generate"]["places"]
                 out["prompt_token_ids"] = choice["prompt_token_ids"]
                 out["mm_placeholders"] = (

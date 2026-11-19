@@ -59,8 +59,12 @@ from turnstone.rollout.vision import (
 )
 
 NL = chr(10)
-RED = Image.of(png(24, 16, (220, 30, 30)), "image/png")  # six placeholder tokens
-BLUE = Image.of(png(16, 16, (30, 60, 220)), "image/png")  # four
+RED = Image.of(png(24, 16, (220, 30, 30)), "image/png")
+BLUE = Image.of(png(16, 16, (30, 60, 220)), "image/png")
+# The placeholder tokens the toy server gives each, by the rule it sizes images by.
+RED_TOKENS = image_patches(RED.data)
+BLUE_TOKENS = image_patches(BLUE.data)
+assert (RED_TOKENS, BLUE_TOKENS) == (70, 64)
 FRAME = (IMAGE, IMAGE_END)
 SEEING = VisionRoute(placeholder=PAD, frame=FRAME)
 PLAIN = PlainText(stand_in="<spare>", stand_in_id=SPARE, texts=tuple(ADDED_TOKENS))
@@ -254,8 +258,12 @@ class TestTheCheck:
         assert checks["routes_agree"]["positions"] > 0
         # Asked the way a run asks: every request streamed.
         assert self.streamed and all(self.streamed)
-        # The toy server counts patches its own way: no rule is claimed for it.
-        assert verdict["resize_rule"] is None
+        # The toy server sizes images by the rule the check knows.
+        assert verdict["resize_rule"] == ResizeRule().describe()
+        assert (
+            checks["routes_agree"]["positions"] == 8 and checks["routes_agree"]["stopped"] is None
+        )
+        assert checks["routes_agree"]["unsure_positions"] > 0
         assert [s["tokens"] for s in verdict["sizes"]] == [
             image_patches(png(s["width"], s["height"], (0, 0, 0))) for s in verdict["sizes"]
         ]
@@ -272,6 +280,9 @@ class TestTheCheck:
             ({"generate_fault": "blind"}, "the images do not reach the model"),
             ({"generate_fault": "no_usage"}, "reported no usage"),
             ({"tokenize_status": 404}, "the tokenize route does not render messages"),
+            # A server that sizes images another way: the record could not say
+            # what it makes of one.
+            ({"own_image_sizes": True}, "does not size images by the rule known here"),
         ],
     )
     def test_a_server_that_cannot_is_told_why(self, fault: dict[str, Any], reason: str) -> None:
@@ -309,10 +320,44 @@ class TestTheCheck:
             with_it = check_token_id_route(make_client(server), "m", vision=True)
         assert without["ok"] is True and "vision" not in without and asked == 0
         assert with_it["ok"] is True and with_it["vision"]["ok"] is True
-        # A server that cannot be sent images still passes the check itself.
+        # A server that cannot be sent images still passes the check for text,
+        # and the verdict says of images that it cannot.
         with ScriptedChatServer([step], sampler_logprobs=True, generate_status=403) as server:
             verdict = check_token_id_route(make_client(server), "m", vision=True)
         assert verdict["ok"] is True and verdict["vision"]["ok"] is False
+
+    def test_an_image_check_that_breaks_off_says_so_in_its_own_words(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not "the check of the server failed": the route for text passed, and
+        what could not be finished is named."""
+        import turnstone.rollout.vision as vision_module
+
+        def breaks(*_args: Any, **_settings: Any) -> dict[str, Any]:
+            raise ConnectionError("the server went away")
+
+        monkeypatch.setattr(vision_module, "check_vision_route", breaks)
+        step = {**STEP, "reasoning": "I think first."}
+        with ScriptedChatServer([step], sampler_logprobs=True) as server:
+            verdict = check_token_id_route(make_client(server), "m", vision=True)
+        assert verdict["ok"] is True and verdict["vision"]["ok"] is False
+        assert "the image check could not be finished" in verdict["vision"]["reason"]
+        assert "the server went away" in verdict["vision"]["reason"]
+
+    def test_routes_that_were_compared_at_too_few_places_fail_the_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import turnstone.rollout.vision as vision_module
+
+        agreed = {"differing_positions": 0, "widest_difference": 0.0}
+        for found, why in (
+            ({"positions": 0, "unsure_positions": 0, "stopped": "nothing was listed"}, "compared at 0 positions"),
+            ({"positions": 3, "unsure_positions": 2, "stopped": "nothing was listed"}, "compared at 3 positions"),
+            ({"positions": 8, "unsure_positions": 0, "stopped": None}, "more than one possible token"),
+        ):  # fmt: skip
+            monkeypatch.setattr(vision_module, "_routes_agree", lambda *_a, found=found: {**agreed, **found})  # fmt: skip
+            verdict = self.check()
+            assert verdict["ok"] is False and why in verdict["reason"]
 
     def test_a_verdict_must_hold_what_a_passed_check_found(self) -> None:
         verdict = self.check()
@@ -320,6 +365,7 @@ class TestTheCheck:
             ("placeholder", "placeholder must be the token"),
             ("frame", "frame must be the two tokens"),
             ("sampler_logprobs", "sampler_logprobs must be the probe"),
+            ("resize_rule", "resize_rule must name"),
         ):
             with pytest.raises(SetupError, match=why):
                 VisionRoute.from_verdict({**verdict, key: None})
@@ -350,12 +396,12 @@ class TestPromptsWithImages:
         # One placeholder went out for the image; its run came back.
         assert sent["token_ids"].count(PAD) == 1
         assert sent["content_parts"] == [{"type": "image_url", "url": RED.url}]
-        assert call.prompt_token_ids is not None and call.prompt_token_ids.count(PAD) == 6
+        assert call.prompt_token_ids is not None and call.prompt_token_ids.count(PAD) == RED_TOKENS
         assert sent["sampling_params"]["logprobs"] == 0
         assert sent["sampling_params"]["temperature"] == 1.0
         assert sent["sampling_params"]["max_tokens"] == 500
         (placed,) = vision.images
-        assert placed.image.sha256 == RED.sha256 and placed.length == 6
+        assert placed.image.sha256 == RED.sha256 and placed.length == RED_TOKENS
         assert call.prompt_token_ids[placed.start - 1] == IMAGE
         assert call.prompt_token_ids[placed.start + placed.length] == IMAGE_END
         assert call.request["images"] == 1
@@ -406,18 +452,20 @@ class TestPromptsWithImages:
         assert len(renderings) == 3
         final = rebuild_final(record)
         assert [(p.image.sha256, p.length) for p in vision.images] == [
-            (RED.sha256, 6),
-            (BLUE.sha256, 4),
+            (RED.sha256, RED_TOKENS),
+            (BLUE.sha256, BLUE_TOKENS),
         ]
         for placed in vision.images:
             assert set(final[placed.start : placed.start + placed.length]) == {PAD}
-        assert final.count(PAD) == 10
+        assert final.count(PAD) == RED_TOKENS + BLUE_TOKENS
 
     @pytest.mark.parametrize(
         ("fault", "problem"),
         [
             ("other_prompt", "another prompt than the token IDs it was sent"),
             ("other_places", "did not place the images where the prompt holds them"),
+            # A reply that came whole and never said which prompt it answered.
+            ("no_prompt", "no prompt token IDs returned"),
         ],
     )
     def test_a_server_that_expands_another_way_is_the_alarm(self, fault: str, problem: str) -> None:
@@ -433,6 +481,43 @@ class TestPromptsWithImages:
                 ask(recorder, messages)
             assert len(server.generate_requests) == asked
         assert recorder.id_prompts is not None and recorder.id_prompts.fault
+
+    def test_a_sub_agents_reply_that_names_no_prompt_is_the_alarm_too(self) -> None:
+        """Nothing of a sub-agent is in the token record, so nothing else
+        would hold such a reply against the prompt that was sent."""
+        from turnstone.core import session as session_module
+
+        messages = [MESSAGES[0], shows(RED)]
+        with ScriptedChatServer([STEP, STEP], generate_fault="no_prompt") as server:
+            recorder, _vision = seeing_recorder(server)
+            inside = session_module._active_task_agent_cancel_scope.set(object())  # type: ignore[arg-type]
+            try:
+                with pytest.raises(HarnessFaultError, match="without saying which prompt"):
+                    ask(recorder, messages)
+            finally:
+                session_module._active_task_agent_cancel_scope.reset(inside)
+        assert recorder.calls[0].scope == "sub_agent"
+        assert recorder.id_prompts is not None and "sub_agent" in str(recorder.id_prompts.fault)
+
+    def test_one_rendering_a_request_also_after_a_prompt_that_is_not_the_rendering(self) -> None:
+        """A model's own split of a text is not the tokenizer's: from then on
+        the whole rendering no longer begins with what was sent and generated.
+        The end of the turn is found in the one rendering all the same."""
+        merged = {**STEP, "content": "a cab drives", "merge": True}
+        with ScriptedChatServer([merged, STEP, {"content": "done"}], own_tokens=True) as server:
+            recorder, vision = seeing_recorder(server, PLAIN)
+            sent = self.conversation(server, recorder)
+            renderings = [r for r in server.tokenize_requests if "messages" in r]
+        assembly = recorder.id_prompts
+        assert assembly is not None and assembly.fault is None
+        assert [e["event"] for e in assembly.events] == ["prompt_differs_from_rendering"] * 2
+        assert all(c.problems() == [] for c in recorder.calls)
+        record = build_token_record([c.to_dict() for c in recorder.calls])
+        assert record["one_sequence"] is True
+        assert [len(r["content_parts"]) for r in sent] == [1, 2]
+        # One rendering a request: three requests, three renderings.
+        assert len(renderings) == 3
+        assert [p.length for p in vision.images] == [RED_TOKENS, BLUE_TOKENS]
 
     STRAY = {
         "role": "user",
@@ -450,8 +535,8 @@ class TestPromptsWithImages:
         assert call.problems() == [] and call.prompt_token_ids is not None
         (placed,) = vision.images
         prompt = call.prompt_token_ids
-        assert prompt.count(PAD) == 6 and sent["token_ids"].count(PAD) == 1
-        assert (prompt[placed.start - 1], prompt[placed.start + 6]) == (IMAGE, IMAGE_END)
+        assert prompt.count(PAD) == RED_TOKENS and sent["token_ids"].count(PAD) == 1
+        assert (prompt[placed.start - 1], prompt[placed.start + RED_TOKENS]) == (IMAGE, IMAGE_END)
         # The text itself, spelled out, before the image.
         spelled = encode("it says " + PAD_TEXT)
         assert prompt[placed.start - 1 - len(spelled) : placed.start - 1] == spelled
@@ -482,6 +567,32 @@ class TestThePromptsLength:
         assert meter._prompt_tokens(call) == 128000
         call.prompt_tokens_sent = 4115
         assert meter._prompt_tokens(call) == 4115
+
+    def test_when_a_silent_server_counts_as_stalled_is_set_by_the_tokens_sent(self) -> None:
+        """With a prompt sent as token IDs, text only or with images, the time
+        a server may take for it is the prompt's exact length at the minimum
+        speed.  A prompt sent as messages is still bounded by its size in
+        bytes, which nothing else is known of."""
+        from types import SimpleNamespace
+
+        from turnstone.rollout.episode import _classify_timeout
+
+        budgets = Budgets(
+            wall_seconds=100, context_window=128000, min_prompt_tokens_per_second=1000.0
+        )
+
+        def waiting(silence: float, **said: Any) -> str:
+            call = CallRecord(index=0, streamed=True, request={}, prompt_bytes=50_000, **said)
+            call.started_at = call.last_heard_at = 1000.0
+            recorder: Any = SimpleNamespace(calls=[call])
+            return _classify_timeout(recorder, 0.0, 1000.0 + silence, 30.0, budgets)[0]
+
+        # 4,000 tokens at 1,000 a second: 4 s for the prompt, then 30 s of silence.
+        assert waiting(33.99, prompt_tokens_sent=4000) == "timeout"
+        assert waiting(34.0, prompt_tokens_sent=4000) == "server_stalled"
+        # Sent as messages, the same request is allowed its 50,000 bytes: 50 s, then 30.
+        assert waiting(34.0) == "timeout" and waiting(79.99) == "timeout"
+        assert waiting(80.0) == "server_stalled"
 
 
 class TestKeepingTheImages:
@@ -603,14 +714,19 @@ class TestWholeRollouts:
         for number, image in enumerate((first, second)):
             assert image["index"] == number and image["sha256"] == RED.sha256
             assert image["file"] == RED.sha256 + ".png" and image["media_type"] == "image/png"
-            assert (image["width"], image["height"], image["tokens"]) == (24, 16, 6)
-            assert image["end"] - image["start"] == 6 and image["processed"] is None
+            assert (image["width"], image["height"], image["tokens"]) == (24, 16, RED_TOKENS)
+            assert image["end"] - image["start"] == RED_TOKENS
+            # What the server made of it: the size it was scaled to, and the
+            # patches of 16 pixels before they are merged two by two.
+            assert image["processed"] == {"width": 320, "height": 224, "grid": [1, 14, 20]}
+            rows, columns = image["processed"]["grid"][1:]
+            assert rows * columns // 4 == image["tokens"]
             assert set(final[image["start"] : image["end"]]) == {PAD}
             assert final[image["start"] - 1] == IMAGE and final[image["end"]] == IMAGE_END
             assert image["first_call"] == number + 1
             assert image["source"]["tool"] == "read_file" and image["source"]["turn"] == number
             assert json.loads(image["source"]["arguments"]) == {"path": "shot.png"}
-        assert final.count(PAD) == 12
+        assert final.count(PAD) == 2 * RED_TOKENS
         # The bytes are kept once, under their hash.
         assert os.listdir(folder) == [RED.sha256 + ".png"]
         with open(os.path.join(folder, first["file"]), "rb") as handle:
@@ -622,31 +738,105 @@ class TestWholeRollouts:
     @pytest.mark.parametrize(
         ("config", "server", "why"),
         [
-            ({}, {"generate_status": 403}, "the server cannot be sent images"),
-            ({"plain_text": False}, {}, "not read as plain text"),
-            ({"image_dir": None}, {}, "names no folder for its images"),
+            # The image check of the server did not pass.
+            ({}, {"generate_status": 403}, "--enable-scale-out"),
+            ({}, {"own_image_sizes": True}, "does not size images by the rule"),
+            # Plain text is off.
+            ({"plain_text": False}, {}, "needs the conversation's text read as plain text"),
+            # No folder for the images.
+            ({"image_dir": None}, {}, "names no folder for them"),
+            # A request parameter the generate route has no place for.
+            ({"extra_body": {"top_k": 20, "priority": 3}}, {}, "'priority' has no place"),
         ],
     )
-    def test_by_default_a_run_that_cannot_goes_without_and_says_why(
+    def test_a_run_that_cannot_have_vision_is_refused_whatever_the_reason(
         self, tmp_path: Any, config: dict[str, Any], server: dict[str, Any], why: str
     ) -> None:
+        """Vision is on unless the run says otherwise, and never switched off
+        by what turns out to be missing: nothing is run."""
         settings = {"image_dir": str(tmp_path / "i"), **config}
-        record = self.run(tmp_path, vision=None, server=server, **settings)
-        assert record["trainable"] is True
-        assert record["vision"]["applied"] is False and why in record["vision"]["reason"]
+        for vision in (None, True):
+            with pytest.raises(SetupError, match=why):
+                self.run(tmp_path, vision=vision, server=server, **settings)
+        # Said aloud, the same run goes ahead without images.
+        settings["plain_text"] = False
+        record = self.run(tmp_path, vision=False, server=server, **settings)
+        assert record["vision"] == {"applied": False, "reason": "switched off"}
         assert "does not support vision" in record["tool_log"][0]["result"]
 
-    def test_a_run_that_asks_for_vision_and_cannot_have_it_is_refused(self, tmp_path: Any) -> None:
-        with pytest.raises(SetupError, match="--enable-scale-out"):
-            self.run(
-                tmp_path, vision=True, image_dir=str(tmp_path), server={"generate_status": 403}
+    def given(
+        self, server: ScriptedChatServer, **config: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The verdicts of the checks of *server*, as a batch is handed them."""
+        from turnstone.rollout.episode import RolloutConfig, plain_text_check, template_writes
+
+        made_for = RolloutConfig(
+            base_url=server.base_url,
+            model="scripted",
+            extra_body={"top_k": 20, "top_p": 0.95},
+            token_id_prompts=True,
+            added_tokens=ADDED_TOKENS,
+            **config,
+        )
+        route = token_id_route_verdict(made_for)
+        plain = plain_text_check(made_for, *template_writes(route))
+        assert route["ok"] is True and plain["ok"] is True
+        return route, plain
+
+    def test_a_verdict_made_without_images_cannot_drive_a_run_with_them(
+        self, tmp_path: Any
+    ) -> None:
+        with ScriptedChatServer(LOOK, sampler_logprobs=True, **SERVED) as server:
+            route, plain = self.given(server, vision=False, plain_text=True)
+            assert "vision" not in route
+            handed = {
+                "token_id_prompts": True,
+                "token_id_route": route,
+                "plain_text_verdict": plain,
+                "image_dir": str(tmp_path / "i"),
+            }
+            with pytest.raises(SetupError, match="asked nothing about images"):
+                _run(server, task=LOOKS, sandbox=_ImageSandbox(), plain_text=True, vision=None, **handed)  # fmt: skip
+            # The stand-in of a check that knew nothing of images may be a
+            # token the template writes for one.
+            seeing, _plain = self.given(server)
+            collides = {**plain, "stand_in": PAD_TEXT, "stand_in_id": PAD}
+            handed.update(token_id_route=seeing, plain_text_verdict=collides)
+            with pytest.raises(SetupError, match="stand-in for plain text is a token"):
+                _run(server, task=LOOKS, sandbox=_ImageSandbox(), plain_text=True, vision=None, **handed)  # fmt: skip
+
+    def test_the_stand_in_is_chosen_clear_of_the_tokens_of_an_image(self) -> None:
+        with ScriptedChatServer(LOOK, sampler_logprobs=True, **SERVED) as server:
+            route, plain = self.given(server)
+        seeing = route["vision"]
+        assert plain["stand_in_id"] not in (seeing["placeholder"], *seeing["frame"])
+
+    def test_what_was_set_up_is_said_to_be_applied_only_once_a_model_call_was_made(
+        self, tmp_path: Any
+    ) -> None:
+        """A run that never built a prompt applied nothing to a conversation."""
+        with ScriptedChatServer(LOOK, sampler_logprobs=True, **SERVED) as server:
+            route, plain = self.given(server)
+            server.forget()
+            record, _box = _run(
+                server,
+                task=LOOKS,
+                sandbox=_DirSandbox(fail_start=True),
+                token_id_prompts=True,
+                token_id_route=route,
+                plain_text=True,
+                plain_text_verdict=plain,
+                vision=None,
+                image_dir=str(tmp_path / "i"),
             )
-        with pytest.raises(SetupError, match="names the folder its images are written to"):
-            self.run(tmp_path, vision=True)
-        with pytest.raises(
-            SetupError, match="vision needs the conversation's text read as plain text"
-        ):
-            self.run(tmp_path, vision=True, image_dir=str(tmp_path), plain_text=False)
+            assert server.requests == []
+        assert record["finish_state"] == "sandbox_failed"
+        said = {"applied": False, "reason": "the run made no model call"}
+        assert record["plain_text"] == said and record["vision"] == said
+        assert record["control_text_escape"]["applied"] is False
+        assert record["control_text_escape"]["reason"] == "no model call was made"
+
+    def test_a_run_refused_for_vision_in_the_wrong_mode(self, tmp_path: Any) -> None:
         with (
             ScriptedChatServer(LOOK, sampler_logprobs=True) as server,
             pytest.raises(SetupError, match="vision is for prompts as token IDs"),
@@ -655,18 +845,8 @@ class TestWholeRollouts:
 
     def test_a_given_verdict_spares_the_checks(self, tmp_path: Any) -> None:
         with ScriptedChatServer(LOOK, sampler_logprobs=True, **SERVED) as server:
-            from turnstone.rollout.episode import RolloutConfig, plain_text_check
-
-            config = RolloutConfig(
-                base_url=server.base_url,
-                model="scripted",
-                extra_body={"top_k": 20, "top_p": 0.95},
-                token_id_prompts=True,
-                added_tokens=ADDED_TOKENS,
-            )
-            route = token_id_route_verdict(config)
-            plain = plain_text_check(config)
-            assert route["ok"] is True and route["vision"]["ok"] is True and plain["ok"] is True
+            route, plain = self.given(server)
+            assert route["vision"]["ok"] is True
             server.forget()
             server.generate_requests.clear()
             record, _box = _run(
@@ -684,6 +864,41 @@ class TestWholeRollouts:
         assert record["trainable"] is True and record["vision"]["check"] == route["vision"]
         # Only the run's own two requests with images went to the generate route.
         assert asked == 2
+
+    def test_a_verdict_for_plain_text_made_with_other_template_arguments_is_refused(
+        self, tmp_path: Any
+    ) -> None:
+        with ScriptedChatServer(LOOK, sampler_logprobs=True, **SERVED) as server:
+            route, plain = self.given(server)
+            assert plain["template_arguments"] == route["template_arguments"] == {}
+            handed = {
+                "task": LOOKS,
+                "sandbox": _ImageSandbox(),
+                "token_id_prompts": True,
+                "token_id_route": route,
+                "plain_text": True,
+                "image_dir": str(tmp_path / "i"),
+            }
+            other = {**plain, "template_arguments": {"enable_thinking": False}}
+            with pytest.raises(SetupError, match="other template arguments"):
+                _run(server, plain_text_verdict=other, **handed)
+            unsaid = {k: v for k, v in plain.items() if k != "template_arguments"}
+            with pytest.raises(SetupError, match="template_arguments missing"):
+                _run(server, plain_text_verdict=unsaid, **handed)
+
+    def test_an_image_whose_size_is_not_the_rules_makes_the_record_untrainable(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Never a record that is trainable and does not say what the server
+        made of an image."""
+        import turnstone.rollout.vision as vision_module
+
+        for size, why in (((None, None), "its size could not be read"), ((640, 480), "resize rule gives")):  # fmt: skip
+            monkeypatch.setattr(vision_module, "image_size", lambda _data, size=size: size)
+            record = self.run(tmp_path, image_dir=str(tmp_path / "i"))
+            assert record["trainable"] is False and record["finish_state"] == "completed"
+            assert any(why in said for said in record["problems"])
+            assert all(image["processed"] is None for image in record["vision"]["images"])
 
     def test_a_sub_agent_sees_the_image_too_and_none_of_it_is_the_rollouts(
         self, tmp_path: Any
@@ -742,7 +957,8 @@ class TestWholeRollouts:
         (image,) = record["vision"]["images"]
         final = rebuild_final(record["tokens"])
         assert (final[image["start"] - 1], final[image["end"]]) == (IMAGE, IMAGE_END)
-        assert record["vision"]["stray_placeholders"]["count"] == 0 and final.count(PAD) == 6
+        assert record["vision"]["stray_placeholders"]["count"] == 0
+        assert final.count(PAD) == RED_TOKENS
         assert image["source"]["arguments"] == json.dumps({"path": "shot.png"})
         assert record["plain_text"]["seen"] == {PAD_TEXT: 1}
 
@@ -754,16 +970,7 @@ class TestWholeRollouts:
         with ScriptedChatServer(
             script, sampler_logprobs=True, **{**SERVED, **server_options}
         ) as server:
-            from turnstone.rollout.episode import RolloutConfig, plain_text_check
-
-            config = RolloutConfig(
-                base_url=server.base_url,
-                model="scripted",
-                extra_body={"top_k": 20, "top_p": 0.95},
-                token_id_prompts=True,
-                added_tokens=ADDED_TOKENS,
-            )
-            route, plain = token_id_route_verdict(config), plain_text_check(config)
+            route, plain = self.given(server)
             assert route["vision"]["ok"] is True
             server.generate_fault = "other_prompt"
             server.generate_requests.clear()
@@ -846,38 +1053,46 @@ class TestTheCommand:
     def test_the_probe_checks_for_images_by_default(self, tmp_path: Any, capsys: Any) -> None:
         status, verdict, _asked = self.probe(tmp_path, "--tokenizer-info", "server")
         assert status == 0
-        assert verdict["sampler_logprobs"] is True and verdict["route"] == "completions"
-        assert verdict["token_id_route"]["ok"] is True
-        assert verdict["token_id_route"]["vision"]["ok"] is True
+        # Three verdicts under keys of their own, and nothing of one at the top.
+        assert sorted(verdict) == ["plain_text", "probe", "route", "server_check"]
+        assert verdict["server_check"] == cli.SERVER_CHECK_LAYOUT == 2
+        probe = verdict["probe"]
+        assert probe["sampler_logprobs"] is True and probe["route"] == "completions"
+        assert verdict["route"]["ok"] is True
+        assert verdict["route"]["vision"]["ok"] is True
         assert verdict["plain_text"]["ok"] is True
         assert json.loads(capsys.readouterr().out) == verdict
 
-    def test_without_images_it_passes_and_says_so(self, tmp_path: Any, capsys: Any) -> None:
-        status, verdict, _asked = self.probe(
-            tmp_path, "--tokenizer-info", "server", generate_status=403
-        )
-        assert status == 0 and verdict["token_id_route"]["vision"]["ok"] is False
-        assert "the model will see no images" in capsys.readouterr().err
-
-    def test_asked_for_images_it_fails_where_the_server_cannot(self, tmp_path: Any) -> None:
-        status, _verdict, _asked = self.probe(
-            tmp_path, "--tokenizer-info", "server", "--vision", generate_status=403
-        )
-        assert status == 2
-
-    def test_asked_for_images_it_fails_where_plain_text_is_not_established(
-        self, tmp_path: Any
+    def test_a_server_that_cannot_be_sent_images_fails_the_probe(
+        self, tmp_path: Any, capsys: Any
     ) -> None:
+        """The rollouts handed this verdict would be refused: the probe says so
+        with its status, with or without --vision."""
+        for flags in ((), ("--vision",)):
+            status, verdict, _asked = self.probe(
+                tmp_path, "--tokenizer-info", "server", *flags, generate_status=403
+            )
+            assert status == 2 and verdict["route"]["ok"] is True
+            assert verdict["route"]["vision"]["ok"] is False
+            assert "refused unless they say --no-vision" in capsys.readouterr().err
+
+    def test_the_same_server_passes_for_runs_without_images(self, tmp_path: Any) -> None:
+        status, verdict, asked = self.probe(
+            tmp_path, "--tokenizer-info", "server", "--no-vision", generate_status=403
+        )
+        assert status == 0 and asked == 0 and "vision" not in verdict["route"]
+
+    def test_it_fails_where_plain_text_is_not_established(self, tmp_path: Any) -> None:
         """Every rollout with images would be refused at its start."""
         status, verdict, _asked = self.probe(
-            tmp_path, "--tokenizer-info", "server", "--vision", tokenizer_info=False
+            tmp_path, "--tokenizer-info", "server", tokenizer_info=False
         )
         assert status == 2 and verdict["plain_text"]["ok"] is False
 
     def test_told_not_to_it_asks_nothing_about_images(self, tmp_path: Any) -> None:
         status, verdict, asked = self.probe(tmp_path, "--no-vision", "--no-plain-text")
         assert status == 0 and asked == 0
-        assert "vision" not in verdict["token_id_route"] and "plain_text" not in verdict
+        assert "vision" not in verdict["route"] and "plain_text" not in verdict
 
     @pytest.mark.parametrize(
         ("flags", "why"),
@@ -886,10 +1101,11 @@ class TestTheCommand:
             (["--no-plain-text"], "--no-plain-text is for --token-id-prompts"),
             (["--image-dir", "x"], "--image-dir is for --token-id-prompts"),
             (["--token-id-prompts", "--vision", "--no-vision"], "cannot both be given"),
-            (
-                ["--token-id-prompts", "--vision", "--no-plain-text"],
-                "--vision needs the conversation's text",
-            ),
+            (["--token-id-prompts", "--vision", "--no-plain-text"], "Give --no-vision with"),
+            # Without --no-vision the model sees images, so plain text cannot go.
+            (["--token-id-prompts", "--no-plain-text"], "Give --no-vision with --no-plain-text"),
+            (["--token-id-prompts", "--no-control-text-escape"], "nothing is escaped"),
+            (["--control-text-escape", "--no-control-text-escape"], "cannot both be given"),
         ],
     )
     def test_flags_that_do_not_go_together_are_refused(

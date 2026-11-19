@@ -209,45 +209,65 @@ def completion_request(request: Mapping[str, Any], prompt: list[int]) -> dict[st
     return out
 
 
+def note_reported_prompt(record: CallRecord, reported: Any) -> bool:
+    """Note the prompt a server reports for *record*'s call, the first time
+    it does, and hold it against the one that was sent; ``True`` where this
+    was that first time."""
+    if reported is None or record.prompt_token_ids is not None:
+        return False
+    prompt = [int(i) for i in reported]
+    if record.prompt_sent is not None and prompt == record.prompt_sent:
+        # One list for both: a long run holds every prompt.
+        prompt = record.prompt_sent
+    elif record.prompt_sent is not None:
+        record.prompt_differs = True
+    record.prompt_token_ids = prompt
+    record.prompt_sent = None
+    return True
+
+
+def pair_tokens(
+    record: CallRecord, ids: list[int], values: Sequence[Any], named: Sequence[str]
+) -> None:
+    """Add one part's generated tokens to *record*: *ids*, their
+    log-probabilities *values* and the names the server gave the values'
+    tokens.  IDs and values are kept only one to one, and where the server
+    names each value's token by ID the two channels are compared token by
+    token."""
+    record.token_ids.extend(ids)
+    if len(ids) != len(values):
+        _misaligned(record)
+    elif record.aligned:
+        if named and all(n.startswith(_ID_PREFIX) for n in named):
+            record.ids_checked = True
+            if list(named) != [f"{_ID_PREFIX}{i}" for i in ids]:
+                _misaligned(record)
+        if record.aligned:
+            record.logprobs.extend(float(v) for v in values)
+
+
 def take_completion(record: CallRecord, part: Any) -> tuple[str, list[int]] | None:
     """Copy token data out of one part of a completions reply into *record*;
     return the part's text and token IDs.  Never raises.
 
-    The same pairing rules as for a chat reply: token IDs and log-probabilities
-    are kept only one to one, and where the server names each value's token by
-    ID the two channels are compared token by token.
+    The same pairing rules as for a chat reply (:func:`pair_tokens`).
     """
     try:
         taken: tuple[str, list[int]] | None = None
         for choice in getattr(part, "choices", None) or []:
             if getattr(choice, "index", 0) != 0:
                 continue
-            reported = extra_field(choice, "prompt_token_ids")
-            if reported is not None and record.prompt_token_ids is None:
-                prompt = [int(i) for i in reported]
-                if record.prompt_sent is not None and prompt == record.prompt_sent:
-                    # One list for both: a long run holds every prompt.
-                    prompt = record.prompt_sent
-                elif record.prompt_sent is not None:
-                    record.prompt_differs = True
-                record.prompt_token_ids = prompt
-                record.prompt_sent = None
+            note_reported_prompt(record, extra_field(choice, "prompt_token_ids"))
             ids = [int(i) for i in (extra_field(choice, "token_ids") or [])]
             text = getattr(choice, "text", None) or ""
-            record.token_ids.extend(ids)
             record.raw.extend(text.encode("utf-8", errors="replace"))
             given = getattr(choice, "logprobs", None)
-            values = list(getattr(given, "token_logprobs", None) or [])
-            named = [str(n) for n in (getattr(given, "tokens", None) or [])]
-            if len(ids) != len(values):
-                _misaligned(record)
-            elif record.aligned:
-                if named and all(n.startswith(_ID_PREFIX) for n in named):
-                    record.ids_checked = True
-                    if named != [f"{_ID_PREFIX}{i}" for i in ids]:
-                        _misaligned(record)
-                if record.aligned:
-                    record.logprobs.extend(float(v) for v in values)
+            pair_tokens(
+                record,
+                ids,
+                list(getattr(given, "token_logprobs", None) or []),
+                [str(n) for n in (getattr(given, "tokens", None) or [])],
+            )
             reason = getattr(choice, "finish_reason", None)
             if reason:
                 record.finish_reason = reason
@@ -257,11 +277,16 @@ def take_completion(record: CallRecord, part: Any) -> tuple[str, list[int]] | No
             record.usage = usage
         return taken
     except Exception as error:
-        record.unreadable = f"{type(error).__name__}: {str(error)[:200]}"
-        if record.aligned:
-            _misaligned(record)
-        log.warning("rollout.recording_unreadable", call=record.index, error=record.unreadable)
+        unreadable(record, error)
         return None
+
+
+def unreadable(record: CallRecord, error: Exception) -> None:
+    """Mark *record* for a part of its reply that could not be read."""
+    record.unreadable = f"{type(error).__name__}: {str(error)[:200]}"
+    if record.aligned:
+        _misaligned(record)
+    log.warning("rollout.recording_unreadable", call=record.index, error=record.unreadable)
 
 
 @dataclass(frozen=True)
@@ -416,6 +441,9 @@ class _Link:
     # What is to be noted of this prompt once a call has returned a whole
     # reply to it: that it is not the chat route's rendering.
     differs: dict[str, Any] | None = None
+    # The server's rendering of ``messages`` with a generation prompt, where
+    # one was made: the next request's rendering begins with it.
+    rendered: list[int] | None = None
 
 
 def _common_suffix(a: Sequence[int], b: Sequence[int]) -> list[int]:
@@ -468,6 +496,12 @@ class PromptAssembly:
     def format(self) -> ReplyFormat:
         return reply_format(self.route.format)
 
+    @property
+    def started(self) -> bool:
+        """Whether a prompt of the session's own was built: what the run was
+        set up to apply to a conversation was then applied to one."""
+        return self._last is not None
+
     # -- the prompt --------------------------------------------------------------
 
     def prompt(self, client: Any, call: CallRecord, request: Mapping[str, Any]) -> list[int]:
@@ -517,13 +551,14 @@ class PromptAssembly:
             # The first prompt holds what the environment wrote and nothing else.
             self._no_surplus(whole, 0, sum(whole.cuts) + whole.tool_cuts)
             prompt = self.route.first_prompt(whole.ids)
+            made: list[int] | None = whole.ids
         elif messages == last.messages and not last.call.complete:
             # The same request again, after an attempt that did not end.
-            prompt, differs = last.prompt, last.differs
+            prompt, differs, made = last.prompt, last.differs, last.rendered
         else:
-            prompt, differs = self._extended(last, messages, rendered)
+            prompt, differs, made = self._extended(last, messages, rendered)
             self._turn += 1
-        self._last = _Link(copy.deepcopy(messages), prompt, call, differs)
+        self._last = _Link(copy.deepcopy(messages), prompt, call, differs, made)
         return prompt
 
     def _no_surplus(self, made: _Rendering, kept_before: int, cuts: int) -> None:
@@ -548,10 +583,11 @@ class PromptAssembly:
         last: _Link,
         messages: list[dict[str, Any]],
         rendered: Callable[[list[dict[str, Any]], bool], _Rendering],
-    ) -> tuple[list[int], dict[str, Any] | None]:
-        """The previous prompt, what was generated after it, and the tail; and
+    ) -> tuple[list[int], dict[str, Any] | None, list[int]]:
+        """The previous prompt, what was generated after it, and the tail;
         where that is not what the chat route renders for the same
-        conversation, the event that says so.  The event is noted by
+        conversation, the event that says so; and that rendering.  The event
+        is noted by
         :meth:`read`, once a call has returned a whole reply to the prompt: a
         prompt can be built and never sent (the context window is full), and
         a request can go out and never be answered."""
@@ -584,17 +620,26 @@ class PromptAssembly:
         new_cuts = 0
         if self.vision is not None and _holds_images(messages):
             # A request with images: every rendering carries them, so the
-            # one of the conversation up to the turn is asked for only where
-            # the whole one does not already begin with what was sent and
-            # generated.  It usually does, and is then the prompt.
+            # conversation is rendered once wherever that is enough.  It is
+            # where the whole rendering begins with what was sent and
+            # generated, and is then the prompt.  Where it does not (the
+            # model's own split of a text is not the tokenizer's, in this
+            # turn or an earlier one), the end of the turn is found in the
+            # one rendering, which begins with the rendering of the request
+            # before.  Only where neither holds is the conversation up to
+            # the turn rendered by itself, as for text.
             made = rendered(messages, True)
             head = call.prompt_token_ids + generated + (closing[1:] if ended else closing)
             if made.ids[: len(head)] == head and made.ids[-len(opening) :] == opening:
                 self._no_surplus(made, len(head), sum(made.cuts[earlier + 1 :]))
                 if not ended:
                     self.events.append(self._other_token(generated, closing[0]))
-                return made.ids, None
-            through = rendered(messages[: earlier + 1], False).ids
+                return made.ids, None, made.ids
+            turn_end = self._turn_end(last, made.ids)
+            if turn_end is not None:
+                through = made.ids[:turn_end]
+            else:
+                through = rendered(messages[: earlier + 1], False).ids
         else:
             through = rendered(messages[: earlier + 1], False).ids
             made = rendered(messages, True)
@@ -629,19 +674,49 @@ class PromptAssembly:
             )
         prompt = call.prompt_token_ids + generated + tail
         if prompt == whole:
-            return prompt, None
+            return prompt, None, whole
         # What the model saw and wrote, and still not what the chat route
         # renders for the same conversation: the reader of the record is
         # told, because a model served through that route never sees it.
-        return prompt, {
-            "event": "prompt_differs_from_rendering",
-            # The call whose prompt it is, counted as the token record
-            # counts the session's own calls.
-            "call": self._turn + 1,
-            "prompt_tokens": len(prompt),
-            "rendered_tokens": len(whole),
-            "same_tokens": common_prefix_len(prompt, whole),
-        }
+        return (
+            prompt,
+            {
+                "event": "prompt_differs_from_rendering",
+                # The call whose prompt it is, counted as the token record
+                # counts the session's own calls.
+                "call": self._turn + 1,
+                "prompt_tokens": len(prompt),
+                "rendered_tokens": len(whole),
+                "same_tokens": common_prefix_len(prompt, whole),
+            },
+            whole,
+        )
+
+    def _turn_end(self, last: _Link, whole: list[int]) -> int | None:
+        """Where the assistant turn that answered *last* ends in *whole*,
+        the rendering of the conversation that now follows it; ``None``
+        where the one rendering does not show it.
+
+        The rendering of the request before, without its generation prompt,
+        is the conversation up to the turn; where *whole* begins with it,
+        the turn begins there, and it ends with the first closing the
+        template writes after that.  With the conversation's text read as
+        plain text nothing inside a turn is the closing's token but the
+        template's own.
+        """
+        before = last.rendered
+        closing = list(self.route.closing)
+        opening = list(self.route.generation_prompt)
+        if self.plain is None or before is None or len(before) < len(opening):
+            return None
+        start = len(before) - len(opening)
+        if before[start:] != opening or whole[:start] != before[:start]:
+            return None
+        size = len(closing)
+        for at in range(start, len(whole) - size + 1):
+            if whole[at] == closing[0] and whole[at : at + size] == closing:
+                return at + size
+        return None
 
     def _other_token(self, generated: list[int], end_of_turn: int) -> dict[str, Any]:
         return {
@@ -837,17 +912,26 @@ class IdStream:
                     parts.append(taken)
                 if call.first_token_at is None and call.token_ids:
                     call.first_token_at = now
-            if call.route == "generate" and (call.prompt_differs or call.placeholders_differ):
+            reason = call.finish_reason
+            unsaid = reason is not None and call.prompt_token_ids is None
+            if call.route == "generate" and (
+                call.prompt_differs or call.placeholders_differ or unsaid
+            ):
                 # The prompt of a request with images is held to the rendering
                 # before it goes out, so no conversation brings this about,
-                # the session's or a sub-agent's.
+                # the session's or a sub-agent's.  A reply that came whole
+                # and never said which prompt it answered shows as little
+                # that the images stood where they belong.
                 self._assembly.fault = (
                     f"the server answered a request with images (call {call.index}, "
-                    f"{call.scope}) for another prompt, or other places of the images, than it "
-                    "was sent"
+                    f"{call.scope}) "
+                    + (
+                        "without saying which prompt it answered"
+                        if unsaid
+                        else "for another prompt, or other places of the images, than it was sent"
+                    )
                 )
                 raise HarnessFaultError(self._assembly.fault)
-            reason = call.finish_reason
             if reason is None:
                 return None
             call.ended_by_itself = reason == "stop"
@@ -1298,16 +1382,27 @@ def check_token_id_route(
     )
     if vision:
         # Whether images can go beside the token IDs: part of the same
-        # verdict, and no failure of the route where they cannot.
+        # verdict, with a word of its own.  A run that is to see images is
+        # refused on it; the route for text is not failed by it.
         from turnstone.rollout.vision import check_vision_route
 
-        verdict["vision"] = check_vision_route(
-            client,
-            model,
-            extra_body=extra_body,
-            reasoning_effort=reasoning_effort,
-            temperature=temperature,
-        )
+        try:
+            verdict["vision"] = check_vision_route(
+                client,
+                model,
+                extra_body=extra_body,
+                reasoning_effort=reasoning_effort,
+                temperature=temperature,
+            )
+        except Exception as error:
+            verdict["vision"] = {
+                "ok": False,
+                "reason": (
+                    "the image check could not be finished "
+                    f"({type(error).__name__}: {str(error)[:300]})"
+                ),
+                "checks": {},
+            }
     return verdict
 
 
@@ -1319,6 +1414,7 @@ def check_plain_text(
     reasoning_effort: str | None = None,
     added_tokens: Mapping[str, int] | None = None,
     written: Sequence[int] = (),
+    required: Sequence[int] = (),
 ) -> dict[str, Any]:
     """How the text of the tokenizer's own tokens is read as plain text on
     the server behind *client* (:func:`~turnstone.rollout.plaintext.plain_text_verdict`).
@@ -1326,29 +1422,63 @@ def check_plain_text(
     *added_tokens* are those tokens, text to ID, from a description of the
     tokenizer; ``None`` asks the server for them (``/tokenizer_info``, which a
     server offers when it is started for it).  *written* are tokens a reply's
-    reading relies on.  Never raises: what could not be established is a
-    verdict that says so.  The verdict names what it was made for."""
+    reading relies on or the template writes for an image, and *required*
+    those of them the description must name.
+
+    A description from a file is held against the server's own wherever the
+    server offers it: one that names other tokens than the server's
+    tokenizer has fails the check, and the verdict says whether the
+    comparison could be made (``tokenizer_info``).
+
+    Never raises: what could not be established is a verdict that says so.
+    The verdict names what it was made for, the template arguments
+    included."""
     request: dict[str, Any] = {"extra_body": dict(extra_body or {})}
     if reasoning_effort is not None:
         request["reasoning_effort"] = reasoning_effort
     arguments = template_arguments(request)
-    for_what = made_for(client, model)
+    for_what = {"template_arguments": arguments, **made_for(client, model)}
 
-    def failed(reason: str) -> dict[str, Any]:
-        return {"ok": False, "reason": reason, **for_what}
+    def failed(reason: str, **more: Any) -> dict[str, Any]:
+        return {"ok": False, "reason": reason, **more, **for_what}
 
+    served: dict[str, int] | None = None
+    not_offered: str | None = None
+    try:
+        served = added_tokens_of(client.get(_root(client) + "/tokenizer_info", cast_to=object))
+    except Exception as error:
+        not_offered = f"{type(error).__name__}: {str(error)[:120]}"
     added = added_tokens
+    compared: dict[str, Any]
     if added is None:
-        try:
-            added = added_tokens_of(client.get(_root(client) + "/tokenizer_info", cast_to=object))
-        except Exception as error:
+        if served is None:
             return failed(
                 "the server does not say which tokens its tokenizer has of its own "
-                f"(/tokenizer_info: {type(error).__name__}: {str(error)[:120]}): start it with "
+                f"(/tokenizer_info: {not_offered}): start it with "
                 "--enable-tokenizer-info-endpoint, or name them from the tokenizer's files"
             )
+        added = served
+        compared = {"source": "server"}
+    elif not served:
+        compared = {
+            "source": "named",
+            "compared_with_server": False,
+            "why_not": not_offered or "the server's answer names no tokens",
+        }
+    else:
+        compared = {"source": "named", "compared_with_server": True}
+        apart = sorted(set(added.items()) ^ set(served.items()))
+        if apart:
+            return failed(
+                "the named description of the tokenizer is not the server's own "
+                f"(/tokenizer_info): they differ in {len(apart)} tokens, first "
+                + ", ".join(f"{text!r} ({token})" for text, token in apart[:5]),
+                tokenizer_info=compared,
+            )
     if not added:
-        return failed("the description of the tokenizer names no tokens of its own")
+        return failed(
+            "the description of the tokenizer names no tokens of its own", tokenizer_info=compared
+        )
 
     def text_of(ids: list[int]) -> str:
         reply = client.post(
@@ -1363,7 +1493,11 @@ def check_plain_text(
             text_of,
             added,
             written,
+            required,
         )
     except Exception as error:
-        return failed(f"it could not be established ({type(error).__name__}: {str(error)[:200]})")
-    return {**found, **for_what}
+        return failed(
+            f"it could not be established ({type(error).__name__}: {str(error)[:200]})",
+            tokenizer_info=compared,
+        )
+    return {**found, "tokenizer_info": compared, **for_what}
