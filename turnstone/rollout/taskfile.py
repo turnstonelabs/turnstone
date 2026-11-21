@@ -254,6 +254,21 @@ def check_task(task: Task, refuse: Callable[[str, str], SetupError] = _refuse) -
         for path in task.sidecar.files:
             if not path.startswith("/"):
                 raise refuse(f"sidecar.files[{path!r}]", "a sidecar's paths are absolute")
+        for tool, names in task.sidecar.base64_file_arguments.items():
+            where = f"sidecar.base64_file_arguments[{tool!r}]"
+            parts = tool.split("__", 2)
+            if (
+                len(parts) != 3
+                or parts[0] != "mcp"
+                or parts[1] not in task.sidecar.mcp_servers
+                or not parts[2]
+            ):
+                raise refuse(where, "is not a tool of the sidecar's servers (mcp__SERVER__TOOL)")
+            if not names:
+                raise refuse(where, "names no argument")
+            for number, name in enumerate(names):
+                if not name:
+                    raise refuse(f"{where}[{number}]", "is empty")
     for where, spec in specs:
         try:
             spec.validate()

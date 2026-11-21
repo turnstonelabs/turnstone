@@ -88,6 +88,7 @@ FULL = Task(
         wait_ports=[39101, 39102],
         wait_timeout=44,
         mcp_servers={"ledger": "http://127.0.0.1:39101/mcp"},
+        base64_file_arguments={"mcp__ledger__post_entry": ["memo"]},
     ),
 )
 
@@ -328,6 +329,84 @@ class TestWhatAFileMustNotHold:
             (
                 {"prompt": "p", "sidecar": {"container": {}, "wait_ports": [39101, 0]}},
                 "sidecar.wait_ports[1]: must be a port, 1 to 65535",
+            ),
+            (
+                {
+                    "prompt": "p",
+                    "sidecar": {
+                        "container": {},
+                        "base64_file_arguments": {"mcp__grader__submit": ["poc_b64"]},
+                    },
+                },
+                "sidecar.base64_file_arguments['mcp__grader__submit']: is not a tool of the "
+                "sidecar's servers (mcp__SERVER__TOOL)",
+            ),
+            (
+                {
+                    "prompt": "p",
+                    "sidecar": {
+                        "container": {},
+                        "mcp_servers": {"grader": "http://127.0.0.1:39101/mcp"},
+                        "base64_file_arguments": {"mcp__other__submit": ["poc_b64"]},
+                    },
+                },
+                "sidecar.base64_file_arguments['mcp__other__submit']: is not a tool of the "
+                "sidecar's servers (mcp__SERVER__TOOL)",
+            ),
+            (
+                {
+                    "prompt": "p",
+                    "sidecar": {
+                        "container": {},
+                        "mcp_servers": {"grader": "http://127.0.0.1:39101/mcp"},
+                        "base64_file_arguments": {"submit": ["poc_b64"]},
+                    },
+                },
+                "sidecar.base64_file_arguments['submit']: is not a tool of the sidecar's servers",
+            ),
+            (
+                {
+                    "prompt": "p",
+                    "sidecar": {
+                        "container": {},
+                        "mcp_servers": {"grader": "http://127.0.0.1:39101/mcp"},
+                        "base64_file_arguments": {"mcp__grader__": ["poc_b64"]},
+                    },
+                },
+                "sidecar.base64_file_arguments['mcp__grader__']: is not a tool of the sidecar's",
+            ),
+            (
+                {
+                    "prompt": "p",
+                    "sidecar": {
+                        "container": {},
+                        "mcp_servers": {"grader": "http://127.0.0.1:39101/mcp"},
+                        "base64_file_arguments": {"mcp__grader__submit": []},
+                    },
+                },
+                "sidecar.base64_file_arguments['mcp__grader__submit']: names no argument",
+            ),
+            (
+                {
+                    "prompt": "p",
+                    "sidecar": {
+                        "container": {},
+                        "mcp_servers": {"grader": "http://127.0.0.1:39101/mcp"},
+                        "base64_file_arguments": {"mcp__grader__submit": ["poc_b64", ""]},
+                    },
+                },
+                "sidecar.base64_file_arguments['mcp__grader__submit'][1]: is empty",
+            ),
+            (
+                {
+                    "prompt": "p",
+                    "sidecar": {
+                        "container": {},
+                        "mcp_servers": {"grader": "http://127.0.0.1:39101/mcp"},
+                        "base64_file_arguments": {"mcp__grader__submit": "poc_b64"},
+                    },
+                },
+                "sidecar.base64_file_arguments['mcp__grader__submit']: must be a list",
             ),
         ],
     )

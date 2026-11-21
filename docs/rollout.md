@@ -2196,6 +2196,40 @@ A task's files can be bytes as well as text (`Task.files`). Either kind is put
 where its path says: a relative path in the working directory, an absolute one
 as it is, owned by the user the model's commands run as.
 
+### An argument given as a file in the sandbox
+
+A tool of a task's server can take the bytes of a file as base64 text, such as
+an input the model made to make a program crash. Writing out a long base64 text
+one token at a time is a skill of its own, which such a task does not mean to
+measure: a model that has the file can still fail to hand it over. So the
+sidecar can name those arguments, by the tool's name as the model calls it:
+
+```python
+Sidecar(
+    ...,
+    mcp_servers={"grader": "http://127.0.0.1:39101/mcp"},
+    base64_file_arguments={"mcp__grader__submit": ["poc_b64"]},
+)
+```
+
+The model may then give such an argument as `file:///ABSOLUTE/PATH`, a file in
+its own sandbox. Before the call goes to the server, the harness reads that
+file from the model's container (it has no way into the sidecar's) and sends
+its bytes as base64 in a copy of the arguments, so the conversation, the next
+prompt and the record keep what the model wrote. Inline base64 still works, as
+does any value that does not begin with `file://`; no other argument and no
+other tool is looked at. The task's own prompt says that the argument may be
+given so.
+
+| The reference | What happens |
+|---------------|--------------|
+| A regular file the model may read, of at most 16 MiB | the server gets its bytes as base64 |
+| A path that is not absolute, no file there, a directory or anything else that is not a regular file, a file the model may not read, a larger file | the call answers `{"error": ..., "argument": ..., "path": ...}` with `path_not_absolute`, `file_not_found`, `is_a_directory`, `not_a_regular_file`, `not_readable` or `file_too_large` (with `max_bytes`), and the server is not called: an ordinary tool result, the model's to fix |
+| The machinery fails the read: a read that does not finish, the container gone | the server is not called, and the run is stopped at the next turn: the model is not asked to carry on from a result that is not its own. The run ends as the machinery's, `error` (`sandbox_lost` if the container is gone), not trainable |
+
+A task file that names a tool none of the sidecar's servers has, or a tool
+with no argument, is refused.
+
 ---
 
 ## Checking a rollout afterwards

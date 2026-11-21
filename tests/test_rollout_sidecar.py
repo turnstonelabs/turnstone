@@ -7,6 +7,9 @@ written with the standard library only, so the test image needs nothing added.
 
 from __future__ import annotations
 
+import base64
+import errno
+import hashlib
 import json
 import socket
 import stat
@@ -27,7 +30,7 @@ from tests.test_rollout_container import (
 )
 from turnstone.core import config as config_module
 from turnstone.core.tools import ENVIRONMENT_TOOL_NAMES
-from turnstone.rollout.container import Container, ContainerSpec
+from turnstone.rollout.container import Container, ContainerEnvironment, ContainerSpec
 from turnstone.rollout.episode import ContainerSandbox, RolloutConfig, Task, run_episode
 from turnstone.rollout.sidecar import (
     FORWARD_HEADER,
@@ -758,3 +761,132 @@ class TestTheForwardCarriesOnlyTheSessionsOwnClient:
             assert secret not in running.urls["ledger"]
         finally:
             running._disconnect()
+
+
+# The same ledger with a tool that is handed a file as the base64 of its bytes:
+# it notes how many bytes it got, and answers with that and their SHA-256.
+ATTACH_SERVER = SERVER.replace(
+    "TOOLS = [",
+    NL.join(
+        [
+            "import base64, hashlib",
+            "",
+            "TOOLS = [",
+            "    {",
+            '        "name": "attach",',
+            '        "description": "Attach a file, given as the base64 of its bytes.",',
+            '        "inputSchema": {',
+            '            "type": "object",',
+            '            "properties": {"data_b64": {"type": "string"}},',
+            '            "required": ["data_b64"],',
+            "        },",
+            "    },",
+        ]
+    ),
+    1,
+).replace(
+    "def call(name, arguments):",
+    NL.join(
+        [
+            "def call(name, arguments):",
+            '    if name == "attach":',
+            '        data = base64.b64decode(arguments["data_b64"], validate=True)',
+            '        with open("/state/attached.txt", "a") as f:',
+            "            f.write(str(len(data)) + chr(10))",
+            '        return str(len(data)) + " " + hashlib.sha256(data).hexdigest()',
+        ]
+    ),
+    1,
+)
+
+
+@needs_container
+class TestAnArgumentGivenAsAFileInTheSandbox:
+    """A sidecar that names an argument its tool takes as base64: the model gives
+    a file in its own sandbox, and the server gets the file's bytes."""
+
+    def test_the_server_gets_the_bytes_and_the_record_keeps_the_reference(
+        self, containers_made: list[str]
+    ) -> None:
+        data = bytes(range(256)) * 8 + b"A" * 1359
+        reference = "file:///workspace/poc.bin"
+        missing = {"name": "mcp__ledger__attach", "arguments": {"data_b64": "file:///nowhere"}}
+        script = [
+            {"tool_calls": [{"name": "mcp__ledger__attach", "arguments": {"data_b64": reference}}]},
+            {"tool_calls": [missing]},
+            {"content": "attached"},
+        ]
+
+        def read_what_was_attached(context: VerificationContext) -> dict[str, Any]:
+            got = export_paths(context.sidecar_name or "", ["/state/attached.txt"])
+            return {"verdict": "pass", "attached": got.files()["/state/attached.txt"].decode()}
+
+        task = _task(
+            files={"poc.bin": data},
+            sidecar=_sidecar(
+                files={"/srv/ledger.py": ATTACH_SERVER.encode()},
+                base64_file_arguments={"mcp__ledger__attach": ["data_b64"]},
+            ),
+        )
+        with ScriptedChatServer(script) as server:
+            record = run_episode(
+                task,
+                RolloutConfig(base_url=server.base_url, model="scripted", **SMALL),
+                verifier=read_what_was_attached,
+            )
+            requests = list(server.requests)
+
+        assert record["finish_state"] == "completed", record["error"]
+        log = record["tool_log"]
+        assert [(e["tool"], e["ok"]) for e in log] == [("mcp__ledger__attach", True)] * 2
+        # The server got the file's bytes; the record holds what the model wrote.
+        assert log[0]["args"] == {"data_b64": reference}
+        assert log[0]["result"] == f"{len(data)} {hashlib.sha256(data).hexdigest()}"
+        # A reference to no file is the model's to fix, and never reaches the server.
+        assert json.loads(log[1]["result"]) == {
+            "error": "file_not_found",
+            "argument": "data_b64",
+            "path": "/nowhere",
+        }
+        assert record["verification"]["result"] == {
+            "verdict": "pass",
+            "attached": f"{len(data)}{NL}",
+        }
+        # The next prompt has the reference as the model wrote it, not the bytes.
+        later = json.dumps(requests[1])
+        assert reference in later and base64.b64encode(data).decode() not in later
+        assert record["prefix_ok"] and record["trainable"]
+        _gone(record, containers_made)
+
+    def test_a_read_the_machinery_fails_ends_the_run_as_the_machinerys(
+        self, containers_made: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fails(self: ContainerEnvironment, path: str, limit: int) -> bytes:
+            raise OSError(errno.EIO, "Input/output error", path)
+
+        monkeypatch.setattr(ContainerEnvironment, "read_whole", fails)
+        reference = "file:///workspace/poc.bin"
+        script = [
+            {"tool_calls": [{"name": "mcp__ledger__attach", "arguments": {"data_b64": reference}}]},
+            {"content": "attached"},
+        ]
+        task = _task(
+            files={"poc.bin": b"A" * 1359},
+            sidecar=_sidecar(
+                files={"/srv/ledger.py": ATTACH_SERVER.encode()},
+                base64_file_arguments={"mcp__ledger__attach": ["data_b64"]},
+            ),
+        )
+        with ScriptedChatServer(script) as server:
+            record = run_episode(
+                task, RolloutConfig(base_url=server.base_url, model="scripted", **SMALL)
+            )
+            requests = list(server.requests)
+
+        assert record["finish_state"] == "error", record["error"]
+        assert record["finish_cause"] == "machinery" and record["trainable"] is False
+        assert "the machinery could not read /workspace/poc.bin" in record["error"]
+        assert "OSError" in record["error"]
+        # The model was not asked to carry on from a result that is not its own.
+        assert len(requests) == 1
+        _gone(record, containers_made)

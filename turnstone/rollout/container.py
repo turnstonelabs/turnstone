@@ -2311,8 +2311,9 @@ class ContainerEnvironment(ExecutionEnvironment):
 
     # -- content -------------------------------------------------------------
 
-    def _raise_for(self, done: Completed, path: str) -> None:
-        """Turn a failed helper into the exception the host call would raise."""
+    def _raise_for(self, done: Completed, path: str, limit: int | None = None) -> None:
+        """Turn a failed helper into the exception the host call would raise.
+        *limit* is the most bytes the read took, ``max_file_bytes`` unless given."""
         code = done.returncode
         if code == 0 and not done.timed_out:
             return
@@ -2323,10 +2324,10 @@ class ContainerEnvironment(ExecutionEnvironment):
         if code == _RC_UNREADABLE:
             raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
         if code == _RC_TOO_LARGE:
+            largest = self.max_file_bytes if limit is None else limit
             raise OSError(
                 errno.EFBIG,
-                f"file is larger than {self.max_file_bytes} bytes; read part of it with a "
-                "shell command",
+                f"file is larger than {largest} bytes; read part of it with a shell command",
                 path,
             )
         if code == _RC_NOT_REGULAR:
@@ -2349,7 +2350,7 @@ class ContainerEnvironment(ExecutionEnvironment):
             timeout=self.op_timeout + 15,
             limit=count + 1,
         )
-        self._raise_for(done, path)
+        self._raise_for(done, path, count)
         if mode == "whole" and done.stdout_total > count:
             # It grew between the size check and the read.
             raise OSError(errno.EFBIG, "file is growing while it is read", path)
@@ -2357,6 +2358,14 @@ class ContainerEnvironment(ExecutionEnvironment):
 
     def read_bytes(self, path: str, limit: int) -> bytes:
         return self._read(path, "head", limit)
+
+    def read_whole(self, path: str, limit: int) -> bytes:
+        """All of the regular file *path*, which may have at most *limit* bytes.
+
+        Any other file raises :class:`OSError`, a larger one ``EFBIG`` after a
+        look at its size alone: never a part of a file in place of all of it,
+        as :meth:`read_bytes` would give."""
+        return self._read(path, "whole", limit)
 
     def read_text(self, path: str) -> str:
         data = self._read(path, "whole", self.max_file_bytes)

@@ -85,6 +85,12 @@ class Sidecar:
     # MCP servers by name, each with its address as seen inside the sidecar
     # (``http://127.0.0.1:PORT/path``).
     mcp_servers: dict[str, str] = field(default_factory=dict)
+    # Arguments of the servers' tools that take the bytes of a file as base64,
+    # by the tool's name as the model calls it (``mcp__SERVER__TOOL``).  The
+    # model may give one as ``file:///ABSOLUTE/PATH`` of a file in its own
+    # sandbox, which is read there and sent as base64 in its place
+    # (:mod:`turnstone.rollout.file_arguments`).
+    base64_file_arguments: dict[str, list[str]] = field(default_factory=dict)
 
 
 class SidecarError(RuntimeError):

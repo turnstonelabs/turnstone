@@ -69,6 +69,7 @@ from turnstone.rollout.container import (
     ContainerLostError,
     ContainerSpec,
 )
+from turnstone.rollout.file_arguments import Base64FileArguments
 from turnstone.rollout.idprompt import (
     PromptAssembly,
     TokenIdRoute,
@@ -439,6 +440,11 @@ class ContainerSandbox:
         if task.sidecar is not None:
             self.sidecar = RunningSidecar(task.sidecar, max_lifetime=lifetime)
         self.environment: ContainerEnvironment | None = None
+        # What the machinery failed at while it read a file the model named for a
+        # tool of the sidecar (:mod:`turnstone.rollout.file_arguments`).  That ends
+        # the run as the machinery's, at the next turn, as a lost sandbox does.
+        self.file_argument_failure: str | None = None
+        self._stop_the_run: Callable[[], None] | None = None
 
     def keep_for(self, seconds: float) -> None:
         """Have the containers removed from outside *seconds* from now if the
@@ -457,6 +463,13 @@ class ContainerSandbox:
 
     def notify_lost(self, callback: Callable[[], None]) -> None:
         self.container.on_lost = callback
+        self._stop_the_run = callback
+
+    def _file_argument_failed(self, what: str) -> None:
+        if self.file_argument_failure is None:
+            self.file_argument_failure = what
+        if self._stop_the_run is not None:
+            self._stop_the_run()
 
     def start(self) -> ExecutionEnvironment:
         self.container.start()
@@ -471,8 +484,24 @@ class ContainerSandbox:
 
     @property
     def mcp_client(self) -> Any:
-        """The MCP client for this rollout's sidecar, ``None`` without one."""
-        return self.sidecar.mcp_client if self.sidecar is not None else None
+        """The MCP client for this rollout's sidecar, ``None`` without one.
+
+        Where the sidecar names arguments that take the bytes of a file as
+        base64, the client reads the model's ``file://`` references to them from
+        this rollout's container (:mod:`turnstone.rollout.file_arguments`)."""
+        if self.sidecar is None or self.sidecar.mcp_client is None:
+            return None
+        arguments = self.sidecar.spec.base64_file_arguments
+        if not arguments:
+            return self.sidecar.mcp_client
+        if self.environment is None:
+            raise RuntimeError("the sandbox has not started: no file of it can be read yet")
+        return Base64FileArguments(
+            self.sidecar.mcp_client,
+            arguments,
+            self.environment.read_whole,
+            self._file_argument_failed,
+        )
 
     def sidecar_lost(self) -> str | None:
         return self.sidecar.lost() if self.sidecar is not None else None
@@ -3186,6 +3215,11 @@ def run_episode(
             else:
                 # Stopped by a used-up budget, the session ended in an orderly way.
                 forced = meter.ended
+            failure: str | None = getattr(sandbox, "file_argument_failure", None)
+            if failure is not None and forced not in MACHINERY_FAILURES.keys() - {"error"}:
+                # The machinery could not read a file the model named for a tool of
+                # the sidecar, and the run was stopped there: not the model's outcome.
+                forced, error = "error", failure
             if forced in ("token_budget", "command_time") and error is None:
                 error = MODEL_OUTCOMES[forced]
             if version is not None:

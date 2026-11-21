@@ -142,7 +142,13 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   sidecar that does not come up or stops during the run makes the record not
   trainable; a call the model gets wrong is an ordinary result. Both containers
   are removed afterwards, and a verifier is given the stopped sidecar to read
-  its state from.
+  its state from. A sidecar can name the arguments of its tools that take the
+  bytes of a file as base64 (`base64_file_arguments`): the model may give one
+  as `file:///PATH` of a file in its own sandbox, and the server is sent that
+  file's bytes, read from the model's container, in a copy of the call; the
+  conversation and the record keep the reference as written. A read the
+  machinery fails stops the run and ends it as the machinery's. See
+  [the rollout guide](docs/rollout.md#an-argument-given-as-a-file-in-the-sandbox).
 - **Rollouts: pattern rules on tool calls.** A rollout enforces a rule set of
   its own on the model's tool calls, the session's and a sub-agent's alike: a
   rule that says deny refuses the call before anything runs, with a fixed text
