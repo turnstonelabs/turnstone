@@ -357,6 +357,26 @@ provider-side mechanics (Anthropic `thinking`, OpenAI Responses
 `reasoning` + `include=["reasoning.encrypted_content"]`, synthetic
 `reasoning_text` for Chat Completions / vLLM / llama.cpp / Gemini-compat).
 
+### Control-token escape (per-model)
+
+On a self-hosted server the text of a chat-template control token in a tool
+result, a file or a fetched page becomes that token, so content can forge a
+turn. Turnstone escapes such text in what it sends and undoes the escape in
+what the model writes back (see
+[the architecture notes](architecture.md#control-token-text-on-self-hosted-lanes)).
+Two keys of a model definition's `capabilities` JSON control it:
+
+| Capability | Default | Effect |
+|------------|---------|--------|
+| `escape_control_tokens` | unset | Unset: on for a model whose `server_compat.server_type` is `vllm`, `sglang` or `llama.cpp`, or whose base URL is a loopback or private address, on the `openai-compatible` (Chat Completions) and `anthropic-compatible` providers; off for everything else, hosted services configured as compatible endpoints included. `true` or `false` decides it for the model, whatever the lane. |
+| `control_tokens` | unset | The model's control tokens as a list of texts, for example `["<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>"]`. Unset: the server is asked once (`GET /tokenizer_info`), and where it does not say, a pattern over the common template families is used and a warning is logged once for the model (`control_text.coverage_not_established`). |
+
+The log says once per model whether the escape is applied and why
+(`control_text.escape`). A hosted endpoint that renders a template the same
+way (a rented vLLM behind a public name) needs `escape_control_tokens: true`
+or a `server_type`; a server at a private address whose prompts must go out
+as they are needs `escape_control_tokens: false`.
+
 ### Task agent overrides
 
 `task_agent` sub-sessions resolve independently from the conversation model

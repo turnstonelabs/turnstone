@@ -24,6 +24,7 @@
     "required": ["command"]
   },
   "task_agent": true,
+  "environment": true,
   "primary_key": "command",
   "cwd_note": "Commands run in {working_dir} — each call starts a fresh shell there; cd does not persist across calls.",
   "workspace_note": "The user's workspace directory is {workspace_dir}."

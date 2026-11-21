@@ -809,20 +809,26 @@ def test_every_image_decoder_checks_scans_and_reads_exif_itself() -> None:
     root = Path(__file__).resolve().parent.parent / "turnstone"
     checked: dict[str, bool] = {}
     pillow_exif: list[str] = []
+    pillow_exif_in: list[str] = []
+
+    def reads_exif(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("getexif", "exif_transpose")
+        )
+
     for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         where = path.relative_to(root.parent)
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr in ("getexif", "exif_transpose")
-            ):
+            if reads_exif(node):
                 pillow_exif.append(f"{where}:{node.lineno}")
         for fn in ast.walk(tree):
             if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
                 continue
             nodes = list(ast.walk(fn))
+            pillow_exif_in += [f"{where}:{fn.name}" for node in nodes if reads_exif(node)]
             opens = any(
                 isinstance(n, ast.Call)
                 and isinstance(n.func, ast.Attribute)
@@ -836,7 +842,17 @@ def test_every_image_decoder_checks_scans_and_reads_exif_itself() -> None:
                 checked[f"{where}:{fn.name}"] = "too_many_jpeg_scans" in names
     assert "turnstone/core/images.py:normalize_image_orientation" in checked, checked
     assert all(checked.values()), checked
-    assert pillow_exif == []
+    # One call, in one function, and it has to be Pillow's own.  A rollout
+    # records the size a server works from, and a server turns a picture with
+    # exactly this call, going on with the picture as it is where the call
+    # fails.  The reader above differs from it on purpose in just those
+    # cases (a tag in an odd type, an orientation outside the EXIF block),
+    # and the number of image tokens is the same either way round, so a
+    # record made with the reader above would name the grid on its side and
+    # nothing would show it.  That function turns nothing and shows nothing:
+    # it reads a size.
+    assert pillow_exif_in == ["turnstone/rollout/vision.py:server_image_size"]
+    assert len(pillow_exif) == 1
 
 
 def test_every_image_entry_path_flattens() -> None:

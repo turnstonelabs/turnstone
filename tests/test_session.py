@@ -13636,6 +13636,22 @@ class TestSearchBackendSelection:
         # And the malicious path is the last token, not interspersed with flags.
         assert args[-1] == "--pre=/tmp/evil.sh"
 
+    def test_grep_names_the_file_when_it_searches_a_single_file(self, tmp_path):
+        """Given one file, the fallback program prints ``line:content`` with no file
+        name unless told to, which the parser reads as malformed: a search of a single
+        file then failed wherever the preferred program is not installed."""
+        import subprocess
+
+        from turnstone.core.session import _build_search_args, _parse_search_records
+
+        target = tmp_path / "notes.txt"
+        target.write_text("alpha" + chr(10) + "needle here" + chr(10))
+        args = _build_search_args("needle", str(target), "grep")
+        assert "-H" in args
+
+        found = subprocess.run(args, capture_output=True, check=True).stdout
+        assert _parse_search_records(found) == [(str(target), "2", "needle here")]
+
     def test_grep_args_include_excludes_and_separator(self):
         from turnstone.core.session import _build_search_args
 

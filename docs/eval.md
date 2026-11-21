@@ -200,6 +200,83 @@ Runs a complete multi-turn conversation:
 
 Parallel tool calls are capped at 10 per turn to prevent degenerate repetition.
 
+### Stable prefix
+
+`HeadlessSession(stable_prefix=True)` makes every request of a run extend the
+previous one: the message list of a request begins with the previous request's
+message list, unchanged, followed by the assistant turn that request returned
+and whatever came after it. A caller that records each request's prompt tokens
+(a rollout for training) then holds one growing sequence per run. The option is
+off by default and changes nothing when off.
+
+| What could change earlier context | Default | With `stable_prefix` |
+|-----------------------------------|---------|----------------------|
+| Earlier reasoning | Sent back only for a model definition that enables reasoning replay | Sent back on every request |
+| More tool calls in one turn than run in one turn (10) | The stored turn keeps the first 10 and loses its reasoning | The stored turn keeps every call and its reasoning; each call over the limit gets a result saying it was not run |
+| System messages, offered tool list, reasoning effort | Read from the session for every request | Taken once at the first request and sent unchanged |
+| A tool that changes the system prompt or the tool list (`tool_search`, `skills` action `load`) | Runs | Refused with a tool result that says so |
+| Compaction | Not called by the headless loop | Does nothing |
+| Malformed tool-call arguments | Legalized on the wire at every request | The same; the legalized call is identical in every later request |
+| A reply cut at the token limit | Its tool calls run and the loop goes on | The run ends at that reply and its calls do not run: a cut turn cannot be sent back the way it was generated |
+| Typed tool-call arguments (a boolean, a null, a number, a nested value) | Sent back as parsed values | With `raw_arguments`, sent back as the text the model wrote; see below |
+
+Each request is compared with the previous one immediately before it is sent.
+One that would resend earlier context changed or shortened raises
+`StablePrefixError` and is not sent.
+
+The guarantee is about messages. Whether the prompt *tokens* also extend depends
+on the server rendering a replayed assistant turn exactly as it was generated.
+`session.prefix_events` lists what a recording caller should know about: a turn
+whose tool-call arguments were legalized (its tokens cannot match what was
+generated), a turn over the tool-call limit, a run ended at a cut reply, a call
+whose arguments could not be sent back as written, a skipped compaction.
+
+#### Arguments as the model wrote them
+
+A server that parses tool calls out of the generated text delivers typed
+arguments, and its template writes a typed value back in one fixed spelling. A
+model does not keep to that spelling: it writes `True` where the template writes
+`true`, or `None` for a null. Sent back from the parsed value, such a turn is one
+token off, and the prompt no longer extends.
+
+`HeadlessSession(stable_prefix=True, raw_arguments=fn)` sends each argument back
+as the exact text the model wrote. `fn` gets the tool calls of the turn just
+received and returns, per call, a mapping from each argument (in order) to that
+text. The stored turn then carries the arguments as a JSON object whose values
+are all strings, which a template that writes strings as they are reproduces
+exactly. The tool still runs on the parsed, typed values.
+
+The text has to account for the call: the same arguments in the same order, and
+every value that is not a string equal to what its text parses to (as JSON, or
+`True`, `False`, `None`; a whole number is the same value written `1` or `1.0`).
+A string argument goes back as the parsed string whatever its text says, since
+the template writes a string as it is. A call the text does not account for, or for
+which `fn` has no answer or fails, is sent back from the parsed values and noted
+in `prefix_events` as `raw_arguments_unrecovered`; it is never sent back in a
+guessed spelling. The caller supplies the text because only the caller knows the
+server's tool-call format; `turnstone.rollout` reads it from the token bytes it
+records.
+
+### Tool set and execution environment
+
+`HeadlessSession(tool_names=...)` limits a run to the named tools: only they
+are offered, and a call to any other tool gets a "not available in this
+session" result before its preparer runs. Without it a model can call a tool
+it was never offered, because dispatch is by name. The limit also holds for a
+task agent the run spawns (when `task_agent` is among the names): it is offered
+the named tools a task agent may have, and a call outside them is refused.
+
+`HeadlessSession(exec_env=...)` runs the shell and file tools in another
+[execution environment](tools.md#execution-environment). Such a session offers
+only the tools that act through the environment unless `tool_names` says
+otherwise, and their descriptions name the environment's working directory.
+
+Headless runs offer no MCP tool. `HeadlessSession(mcp_client=..., mcp_tools=True)`
+also offers the tools of the MCP client the session was given, as that client
+lists them when the session is built. It is for a run that brings its own
+servers: build the client from that run's servers only, and the session can
+reach no others. The list does not follow later changes of the catalog.
+
 ### Timeout and Cancellation
 
 Each test runs in a `ThreadPoolExecutor(max_workers=1)` with a per-test
@@ -219,6 +296,12 @@ follow-on work:
 `send_headless()` is called inside `_run_single_test()` with retry logic:
 3 attempts with exponential backoff (sleep `2^attempt` seconds) on any
 exception. `TimeoutError` is re-raised immediately (no retry).
+
+The attempt count is the `attempts` parameter of `run_with_lifecycle()`
+(default 3). A caller whose run must not be repeated passes `attempts=1`:
+every attempt samples the model again, repeats the run's side effects and
+gets its own `test_timeout`, so only a single attempt is bounded by one
+`test_timeout` overall.
 
 ---
 

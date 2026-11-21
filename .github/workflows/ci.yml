@@ -93,6 +93,25 @@ jobs:
         env:
           TURNSTONE_TEST_PG_URL: postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test
 
+  test-rollout-container:
+    # The rollout sandbox tests need a container runtime and an image, which the
+    # main test job does not provide, so they skip there.  This lane pulls the
+    # image by digest (the tests themselves never pull) and makes a missing
+    # runtime or image a failure instead of a skip.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TURNSTONE_ROLLOUT_TEST_IMAGE: python@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
+      TURNSTONE_ROLLOUT_REQUIRE_CONTAINER: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
+      - run: docker pull "$TURNSTONE_ROLLOUT_TEST_IMAGE"
+      - run: pip install -e ".[test]"
+      - run: pytest tests/test_rollout_container.py tests/test_rollout_verification.py tests/test_rollout_sidecar.py tests/test_rollout_rules.py tests/test_rollout_preparation.py tests/test_rollout_verifier_command.py tests/test_rollout_result_bound.py -v
+
   wheel-completeness:
     runs-on: ubuntu-latest
     steps:

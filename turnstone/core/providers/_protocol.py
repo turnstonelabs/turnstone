@@ -751,6 +751,21 @@ class ModelCapabilities:
     # cached prefix when effort changes. Standard single-agent requests only;
     # pro mode and requests with sampling parameters retain request-level reasoning.
     supports_reasoning_config_updates: bool = False
+    # A server that renders a chat template as text and tokenizes the whole
+    # writes a control token wherever it meets the token's text, so a tool
+    # result that holds such text forges a turn.  On a lane declared
+    # self-hosted the text is escaped in what is sent and the escape undone
+    # in what the model writes back (:mod:`turnstone.core.control_text`).
+    # ``None`` (the default) leaves it to that rule: on where the model names
+    # the type of a self-hosted server or its endpoint is a loopback or
+    # private address, off for a hosted service.  ``True`` and ``False`` are
+    # the operator's word for the model, either way.
+    escape_control_tokens: bool | None = None
+    # The model's control tokens, as texts, for that escape.  Empty: the
+    # server is asked for them (``/tokenizer_info``), and where it does not
+    # say, a pattern over the common template families stands in and the
+    # log says that the lane's coverage could not be established.
+    control_tokens: tuple[str, ...] = ()
 
 
 # The session effort knob is ORDINAL — snapping must respect this order.

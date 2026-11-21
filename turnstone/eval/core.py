@@ -16,6 +16,7 @@ module; this module never imports from the optimizer.
 
 import contextlib
 import copy
+import dataclasses
 import functools
 import hashlib
 import json
@@ -27,7 +28,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any
@@ -35,13 +36,32 @@ from typing import Any
 from openai import DefaultHttpxClient, OpenAI
 
 from turnstone.core.attachments import Attachment, classify_upload
+from turnstone.core.exec_env import HOST_ENVIRONMENT
+from turnstone.core.log import get_logger
+from turnstone.core.lowering import legalize_tool_call_entry
 from turnstone.core.model_turn import cap_tool_calls, model_turn, require_lane_capabilities
+from turnstone.core.output_guard import ControllerText
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.providers._http_client import shutdown_on_close
 from turnstone.core.session import _ADMISSION_REFITS, _TRUNCATION_FLOOR_CHARS, ChatSession
 from turnstone.core.storage import get_storage, init_storage, reset_storage
-from turnstone.core.tools import INTERACTIVE_TOOLS, PRIMARY_KEY_MAP
-from turnstone.core.trajectory import Turn, final_assistant_text, turn_from_dict, turns_from_dicts
+from turnstone.core.tools import (
+    ENVIRONMENT_TOOL_NAMES,
+    INTERACTIVE_TOOLS,
+    PRIMARY_KEY_MAP,
+    apply_cwd_context,
+    apply_null_spellings,
+    merge_mcp_tools,
+)
+from turnstone.core.trajectory import (
+    Turn,
+    dicts_from_turns,
+    final_assistant_text,
+    turn_from_dict,
+    turns_from_dicts,
+)
+
+log = get_logger(__name__)
 
 # Eval evaluates interactive-session agent behaviour — coordinator tools
 # require a console-hosted session and aren't exercised by the harness.
@@ -50,6 +70,15 @@ TOOLS = INTERACTIVE_TOOLS
 
 # Tools that require MCP servers — excluded from headless eval
 _MCP_ONLY_TOOLS = frozenset({"read_resource", "use_prompt"})
+
+# Tool calls one headless turn runs.  A reply with more is the degenerate
+# repetition the cap exists for.
+_MAX_TOOL_CALLS_PER_TURN = 10
+
+# Under ``stable_prefix``: tools whose purpose is to change the system prompt or
+# the offered tool list, and the ``skills`` action that does.
+_PREFIX_CHANGING_TOOLS = frozenset({"tool_search"})
+_PREFIX_CHANGING_SKILL_ACTIONS = frozenset({"load"})
 
 # Workstream row a case's attachments persist onto.  The conversation writer
 # discards rows (attachment blobs included) for an unregistered workstream, and
@@ -309,6 +338,105 @@ def _apply_tool_overrides(
 # ─── Headless session ────────────────────────────────────────────────────────
 
 
+class StablePrefixError(RuntimeError):
+    """A ``stable_prefix`` run was about to resend earlier context changed.
+
+    Raised before the request goes out, so a rewritten prompt is never sent.
+    """
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _same_json_value(a: Any, b: Any) -> bool:
+    """JSON equality that keeps ``true`` apart from ``1``.
+
+    A whole number is the same value however it is typed: a server may deliver
+    the ``1`` a model wrote for a number parameter as ``1.0``.
+    """
+    if _is_number(a) and _is_number(b):
+        return bool(a == b)
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return list(a) == list(b) and all(_same_json_value(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_same_json_value(x, y) for x, y in zip(a, b, strict=True))
+    return bool(a == b)
+
+
+# How a model may spell a typed value that JSON spells differently.
+_ALTERNATE_SPELLINGS: dict[str, Any] = {"True": True, "False": False, "None": None}
+
+
+def raw_argument_json(arguments: str, raw: Mapping[str, str] | None) -> str | None:
+    """The arguments of one tool call with every value as the text the model wrote.
+
+    *arguments* is the call's parsed arguments as a JSON object string; *raw*
+    maps each argument, in order, to the exact text the model generated for it.
+    The result is a JSON object whose values are all strings.  A template that
+    writes string values as they are then reproduces the model's own spelling of
+    a boolean, a null, a number or a nested value, which it cannot do from the
+    parsed value.
+
+    ``None`` when the text is not a faithful account of the call: *raw* is
+    missing, names other arguments or another order, or holds a text that does
+    not mean the parsed value.  A value that is not a string must be what its
+    text parses to, as JSON or in the spellings ``True``, ``False`` and
+    ``None``.
+
+    A string argument is sent back as the parsed string whatever its text says:
+    the template writes a string as it is, so the parsed value is already the
+    model's spelling, and a text that differs from it (a character the server
+    could not give back whole in the recorded bytes) costs that one argument
+    nothing and the other arguments of the call keep their text.
+    """
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(parsed, dict) or list(parsed) != list(raw):
+        return None
+    for name, value in parsed.items():
+        text = raw[name]
+        if not isinstance(text, str):
+            return None
+        if isinstance(value, str):
+            continue
+        if text in _ALTERNATE_SPELLINGS:
+            meant = _ALTERNATE_SPELLINGS[text]
+        else:
+            try:
+                meant = json.loads(text)
+            except (ValueError, RecursionError):
+                return None
+        if not _same_json_value(value, meant):
+            return None
+    replay = {
+        name: value if isinstance(value, str) else raw[name] for name, value in parsed.items()
+    }
+    text = json.dumps(replay, ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # Half of a surrogate pair, which a model can write as an escape: no
+        # request body can carry it as it is.
+        text = json.dumps(replay)
+    return text
+
+
+def tool_call_limit_result(total: int, limit: int) -> str:
+    """The result of a tool call a ``stable_prefix`` turn did not run."""
+    return (
+        f"Not executed: this turn made {total} tool calls and only the first {limit} run "
+        "in one turn. Nothing was done for this call; issue it again in a later turn if "
+        "it is still needed."
+    )
+
+
 class HeadlessSession(ChatSession):
     """ChatSession subclass for headless evaluation.
 
@@ -317,6 +445,71 @@ class HeadlessSession(ChatSession):
     - Tool calls are recorded into a structured log
     - All stdout output is suppressed
     - send_headless() drains the production streaming provider path
+
+    ``stable_prefix=True`` makes every request extend the previous one: the
+    message list of a request begins with the previous request's message list,
+    unchanged, followed by the assistant turn that request returned and
+    whatever came after it.  A caller that records each request's prompt
+    token by token then holds one growing sequence for the run.  Under it:
+
+    - earlier reasoning is sent back on every request, whatever the model
+      definition's replay flag says;
+    - the system messages, the offered tool list and the reasoning effort are
+      taken once, at the first request, and sent unchanged from then on;
+    - a turn with more tool calls than run in one turn keeps all of them: the
+      calls over the limit get a result saying they were not run, where the
+      default drops them from the stored turn together with its reasoning;
+    - a tool whose purpose is to change the system prompt or the tool list is
+      refused with a result that says so, and compaction does nothing;
+    - a reply cut at the token limit ends the run there: a cut turn cannot be
+      sent back the way it was generated, so nothing follows it;
+    - with ``raw_arguments``, each stored tool call carries its arguments as
+      the text the model wrote (see below), while the tool runs on the parsed
+      values;
+    - each request is compared with the previous one before it is sent, and
+      a request that would resend earlier context changed raises
+      :class:`StablePrefixError` instead.
+
+    The guarantee is about messages.  Whether the prompt *tokens* also extend
+    depends on the server rendering a replayed assistant turn exactly as it
+    was generated; ``prefix_events`` notes the turns where that cannot hold
+    (a tool call whose arguments had to be legalized).  With the option off
+    (the default) nothing here changes.
+
+    ``raw_arguments`` (used under ``stable_prefix`` only) is a callable that is
+    given the tool calls of the turn just received and returns, per call, a
+    mapping from each argument to the exact text the model generated for it, or
+    ``None`` for a call it cannot account for.  A server that parses tool calls
+    out of generated text delivers typed values, and its template writes them
+    back in one fixed spelling; a model that wrote ``True`` is then replayed as
+    ``true`` and the prompt tokens no longer extend.  Replaying each argument as
+    the text the model wrote avoids that (:func:`raw_argument_json`).  A call
+    whose text is missing or does not mean the parsed arguments is replayed
+    from the parsed values and noted in ``prefix_events``
+    (``raw_arguments_unrecovered``).  The caller supplies the text because only
+    it knows the server's format; the rollout package reads it from the token
+    bytes it records.
+
+    ``tool_names`` limits the run to those tools: only they are offered, and a
+    call to any other tool is refused before its preparer runs (dispatch is by
+    name, so a model can otherwise call a tool it was never offered).  The
+    limit holds for a task agent the run spawns: it is offered the named tools
+    a task agent may have, and nothing else.
+
+    ``exec_env`` (a ``ChatSession`` argument) moves the shell and file tools
+    to another execution environment.  A session given one offers, unless
+    ``tool_names`` says otherwise, only the tools that act through it
+    (``ENVIRONMENT_TOOL_NAMES``), so nothing the model does takes effect
+    anywhere else, and their descriptions name the environment's working
+    directory the way an interactive session's name the process's.
+
+    ``mcp_tools=True`` also offers the tools of the MCP client the session was
+    given (``mcp_client``, a ``ChatSession`` argument), as that client lists
+    them at construction.  Headless runs offer no MCP tool otherwise.  It is
+    for a run that brings its own servers: build the client from that run's
+    servers only, and the session can reach no others.  An MCP tool does not
+    act through the execution environment: with the option on, what the model
+    does also takes effect in those servers, wherever they run.
     """
 
     def __init__(
@@ -335,6 +528,11 @@ class HeadlessSession(ChatSession):
         agent_max_turns: int = -1,
         tool_truncation: int = 0,
         tool_overrides: dict[str, dict[str, Any]] | None = None,
+        stable_prefix: bool = False,
+        raw_arguments: Callable[[list[dict[str, Any]]], Sequence[Mapping[str, str] | None] | None]
+        | None = None,
+        tool_names: Collection[str] | None = None,
+        mcp_tools: bool = False,
         **session_kwargs: Any,
     ) -> None:
         # ``session_kwargs`` forwards straight to ``ChatSession`` so
@@ -360,14 +558,65 @@ class HeadlessSession(ChatSession):
         self.tool_call_log: list[dict[str, Any]] = []
         self.auto_approve = True
         self._cancelled = threading.Event()
+        # ``stable_prefix`` state, kept across ``send_headless`` calls: what
+        # the first request froze, and the wire of the latest request.
+        self._stable_prefix = stable_prefix
+        self._raw_arguments = raw_arguments if stable_prefix else None
+        self._prefix_system: list[dict[str, Any]] | None = None
+        self._prefix_tools: list[dict[str, Any]] | None = None
+        self._prefix_effort: str | None = None
+        self._prefix_wire: list[dict[str, Any]] | None = None
+        # Things a ``stable_prefix`` run did that its caller should know about.
+        self.prefix_events: list[dict[str, Any]] = []
         self._total_usage: dict[str, int] = {"prompt": 0, "completion": 0}
-        # Filter MCP-only tools that can't work in headless mode
-        base_tools = [t for t in TOOLS if t["function"]["name"] not in _MCP_ONLY_TOOLS]
-        self._eval_tools = (
-            _apply_tool_overrides(base_tools, tool_overrides) if tool_overrides else base_tools
-        )
+        try:
+            self._eval_tools = self._offered_tools(tool_names, tool_overrides, mcp_tools)
+        except BaseException:
+            # ``ChatSession.__init__`` registered this session with shared
+            # services (the MCP client's listeners).  A constructor that fails
+            # hands nobody a session to close, so it releases them itself.
+            self.close()
+            raise
         if system_prompt_override is not None:
             self._override_system_prompt(system_prompt_override)
+
+    def _offered_tools(
+        self,
+        tool_names: Collection[str] | None,
+        tool_overrides: dict[str, dict[str, Any]] | None,
+        mcp_tools: bool,
+    ) -> list[dict[str, Any]]:
+        """The tool definitions this run offers; sets the names it may call."""
+        # Filter MCP-only tools that can't work in headless mode
+        base_tools = [t for t in TOOLS if t["function"]["name"] not in _MCP_ONLY_TOOLS]
+        # The tools of the MCP client this session was given, read once: the
+        # offered list does not follow later catalog changes.
+        mcp_defs: list[dict[str, Any]] = []
+        if mcp_tools:
+            if self._mcp_client is None:
+                raise ValueError("mcp_tools needs the session's own mcp_client")
+            mcp_defs = self._mcp_client.get_tools(user_id=self._mcp_user_id)
+        mcp_names = {t["function"]["name"] for t in mcp_defs}
+        elsewhere = self._exec_env is not HOST_ENVIRONMENT
+        if tool_names is None and elsewhere:
+            tool_names = ENVIRONMENT_TOOL_NAMES | mcp_names
+        # The names this run may call, ``None`` for no restriction.
+        self._offered_tool_names: frozenset[str] | None = None
+        if tool_names is not None:
+            self._offered_tool_names = frozenset(tool_names)
+            known = {t["function"]["name"] for t in base_tools} | mcp_names
+            unknown = self._offered_tool_names - known
+            if unknown:
+                raise ValueError(f"tool_names holds unknown tools: {', '.join(sorted(unknown))}")
+            base_tools = [
+                t for t in base_tools if t["function"]["name"] in self._offered_tool_names
+            ]
+            mcp_defs = [t for t in mcp_defs if t["function"]["name"] in self._offered_tool_names]
+        if elsewhere:
+            # Tell the model where its commands run and relative paths resolve.
+            base_tools = apply_cwd_context(base_tools, self._exec_env.getcwd(), "")
+        base_tools = merge_mcp_tools(base_tools, mcp_defs)
+        return _apply_tool_overrides(base_tools, tool_overrides) if tool_overrides else base_tools
 
     @property
     def total_usage(self) -> dict[str, int]:
@@ -381,6 +630,151 @@ class HeadlessSession(ChatSession):
                 self.system_messages[i] = {"role": msg["role"], "content": content}
                 return
         self.system_messages.append({"role": "system", "content": content})
+
+    # -- stable prefix ------------------------------------------------------
+
+    def _full_messages(self) -> list[dict[str, Any]]:
+        """System messages + history; the frozen system messages once a
+        ``stable_prefix`` run has sent its first request."""
+        if self._prefix_system is None:
+            return super()._full_messages()
+        return [dict(m) for m in self._prefix_system] + dicts_from_turns(self.messages)
+
+    def _freeze_prefix(self) -> None:
+        """Take what a ``stable_prefix`` run sends unchanged with every request."""
+        if self._prefix_system is not None:
+            return
+        self._prefix_system = copy.deepcopy(self.system_messages)
+        self._prefix_tools = copy.deepcopy(self._eval_tools)
+        self._prefix_effort = self.reasoning_effort
+
+    def _check_stable_prefix(self, wire: list[dict[str, Any]], _lane: Any) -> None:
+        """Refuse a request that does not begin with the previous request.
+
+        ``model_turn`` calls this with the fully lowered wire immediately
+        before dispatch.
+        """
+        previous = self._prefix_wire
+        if previous is None:
+            return
+        for index, sent in enumerate(previous):
+            if index >= len(wire):
+                raise StablePrefixError(
+                    f"stable prefix broken: this request has {len(wire)} messages, "
+                    f"the previous one had {len(previous)}"
+                )
+            if sent != wire[index]:
+                now = wire[index]
+                fields = sorted(k for k in {*sent, *now} if sent.get(k) != now.get(k))
+                raise StablePrefixError(
+                    f"stable prefix broken at message {index} (role {sent.get('role')!r}): "
+                    f"it was sent earlier and would now be sent changed ({', '.join(fields)})"
+                )
+
+    def _with_raw_arguments(self, result: Any, turn: int) -> Turn:
+        """The turn to store: each tool call's arguments as the text the model wrote.
+
+        Without a source of that text, or for a call the text does not account
+        for, the parsed arguments stay.  Never raises: a source that fails is a
+        call that could not be recovered.
+        """
+        stored: Turn = result.turn
+        if self._raw_arguments is None or not result.tool_calls:
+            return stored
+        try:
+            texts = self._raw_arguments([dict(tc) for tc in result.tool_calls])
+        except Exception:
+            log.warning("eval.raw_arguments_failed", exc_info=True)
+            texts = None
+        calls = list(stored.tool_calls)
+        unrecovered: list[str] = []
+        if texts is None or len(texts) != len(calls) or len(calls) != len(result.tool_calls):
+            unrecovered = [tc["id"] for tc in result.tool_calls]
+        else:
+            for index, call in enumerate(calls):
+                replay = raw_argument_json(call.arguments, texts[index])
+                if replay is None:
+                    unrecovered.append(call.id)
+                else:
+                    calls[index] = dataclasses.replace(call, arguments=replay)
+            stored = dataclasses.replace(stored, tool_calls=tuple(calls))
+        if unrecovered:
+            self.prefix_events.append(
+                {"event": "raw_arguments_unrecovered", "turn": turn, "call_ids": unrecovered}
+            )
+        return stored
+
+    def _prefix_refusal(self, tc: dict[str, Any]) -> str | None:
+        """Why a ``stable_prefix`` run refuses this call, or ``None`` to run it."""
+        function = tc.get("function") or {}
+        name = str(function.get("name") or "").strip()
+        if name in _PREFIX_CHANGING_TOOLS:
+            return (
+                f"Tool {name!r} is not available in this session: the tool list is "
+                "fixed for the whole run. Use the tools already offered."
+            )
+        if name == "skills":
+            try:
+                args = json.loads(function.get("arguments") or "{}")
+            except (ValueError, RecursionError):
+                return None
+            action = str(args.get("action") or "").strip().lower() if isinstance(args, dict) else ""
+            if action in _PREFIX_CHANGING_SKILL_ACTIONS:
+                return (
+                    f"skills action {action!r} is not available in this session: the "
+                    "system prompt is fixed for the whole run, so a skill cannot be "
+                    "loaded into it. Read one with action 'get' instead."
+                )
+        return None
+
+    def _prepare_tool_item(self, tc: dict[str, Any]) -> dict[str, Any]:
+        name = str((tc.get("function") or {}).get("name") or "").strip()
+        refusal: str | None = None
+        header = ""
+        offered = self._offered_tool_names
+        if offered is not None and name not in offered:
+            # Dispatch is by name; without this a tool that was never offered
+            # would still run.
+            header = f"\u2717 {name}: not available"
+            refusal = (
+                f"Tool {name!r} is not available in this session. Tools offered: "
+                f"{', '.join(sorted(offered))}. To call one, use its name exactly as listed."
+            )
+        elif self._stable_prefix:
+            header = f"\u2717 {name}: fixed for this run"
+            refusal = self._prefix_refusal(tc)
+        if refusal is not None:
+            return {
+                "call_id": tc["id"],
+                "func_name": name,
+                "header": header,
+                "preview": "",
+                "needs_approval": False,
+                "error": ControllerText(refusal),
+            }
+        return super()._prepare_tool_item(tc)
+
+    def _apply_persona_visibility(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Also hide what this run does not offer.
+
+        A task agent's tool list is built through here when it is spawned, so a
+        sub-agent of a limited run is offered, and can call, only tools of that
+        run: its loop refuses a call outside its own list.
+        """
+        visible = super()._apply_persona_visibility(tools)
+        # Reached during construction too, before the names are set.
+        offered: frozenset[str] | None = getattr(self, "_offered_tool_names", None)
+        if offered is None:
+            return visible
+        return [t for t in visible if t.get("function", {}).get("name") in offered]
+
+    def _compact_messages(self, *args: Any, **kwargs: Any) -> bool:
+        if self._stable_prefix:
+            # Compaction replaces sent history with a summary.  The headless
+            # loop never asks for it; anything that does gets "not compacted".
+            self.prefix_events.append({"event": "compaction_skipped"})
+            return False
+        return super()._compact_messages(*args, **kwargs)
 
     def send_headless(
         self,
@@ -436,6 +830,9 @@ class HeadlessSession(ChatSession):
         # (house rule: relay, never pin).
         lane = self._primary_lane()
         lane_caps = require_lane_capabilities(lane)
+        stable = self._stable_prefix
+        if stable:
+            self._freeze_prefix()
 
         for turn in range(max_turns):
             if self._cancelled.is_set():
@@ -468,14 +865,22 @@ class HeadlessSession(ChatSession):
             result = model_turn(
                 lane,
                 turns,
-                tools=self._eval_tools,
+                tools=self._prefix_tools if stable else self._eval_tools,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
-                reasoning_effort=self.reasoning_effort,
+                reasoning_effort=self._prefix_effort if stable else self.reasoning_effort,
                 # By-reference attachment parts expand to the inline parts this
                 # lane's capabilities call for, via the send path's resolver.
                 resolve_attachments=functools.partial(self._resolve_attachments, caps=lane_caps),
+                # Stable prefix: refuse a request that does not begin with the
+                # previous one, and send earlier reasoning back with every one.
+                validate_wire=self._check_stable_prefix if stable else None,
+                replay_reasoning=stable,
             )
+            if stable and result.wire_msgs is not None:
+                # A copy of its own, so a later in-place change to stored data
+                # cannot make the check compare a message with itself.
+                self._prefix_wire = copy.deepcopy(result.wire_msgs)
             elapsed = time.monotonic() - t0
 
             if result.usage:
@@ -485,7 +890,34 @@ class HeadlessSession(ChatSession):
             # Cap parallel tool calls to prevent degenerate repetition
             # (shared guard — see model_turn.cap_tool_calls for the
             # native-lane-drop rationale on capped turns).
-            capped_calls, assistant_turn = cap_tool_calls(result, 10)
+            unrun_calls: list[dict[str, Any]] = []
+            if stable:
+                # The stored turn is what later requests replay, so it keeps
+                # every call and its reasoning; the calls over the limit are
+                # answered below instead of dropped.
+                assistant_turn = self._with_raw_arguments(result, turn)
+                capped_calls = result.tool_calls[:_MAX_TOOL_CALLS_PER_TURN]
+                unrun_calls = result.tool_calls[_MAX_TOOL_CALLS_PER_TURN:]
+                legalized = [
+                    tc["id"] for tc in result.tool_calls if legalize_tool_call_entry(tc) is not None
+                ]
+                if legalized:
+                    # Replayed in its legalized form, the same in every later
+                    # request; the server cannot render it as generated.
+                    self.prefix_events.append(
+                        {"event": "arguments_legalized", "turn": turn, "call_ids": legalized}
+                    )
+                if unrun_calls:
+                    self.prefix_events.append(
+                        {
+                            "event": "tool_calls_over_limit",
+                            "turn": turn,
+                            "calls": len(result.tool_calls),
+                            "limit": _MAX_TOOL_CALLS_PER_TURN,
+                        }
+                    )
+            else:
+                capped_calls, assistant_turn = cap_tool_calls(result, _MAX_TOOL_CALLS_PER_TURN)
 
             self.messages.append(assistant_turn)
             msg_len = len(result.content or "")
@@ -511,6 +943,13 @@ class HeadlessSession(ChatSession):
             if not capped_calls:
                 if verbose:
                     _log(f"{log_prefix}  turn {turn}: no tool calls, done", dim=True)
+                break
+
+            if stable and result.finish_reason == "length":
+                # Cut at the token limit, possibly inside a call or the
+                # reasoning.  Sent back, the server would close what the model
+                # left open; the run ends here and the calls do not run.
+                self.prefix_events.append({"event": "ended_at_length", "turn": turn})
                 break
 
             # Log tool calls
@@ -551,6 +990,10 @@ class HeadlessSession(ChatSession):
                         args = {pk: raw}
                     else:
                         args = {"_raw": raw}
+                # The log shows the arguments as the tool got them.  Arguments
+                # that are valid JSON and no object are logged as they came.
+                if isinstance(args, dict):
+                    apply_null_spellings(args, self._tool_definition(func_name))
 
                 self.tool_call_log.append(
                     {
@@ -593,6 +1036,26 @@ class HeadlessSession(ChatSession):
                 self.messages.append(turn_from_dict(tool_msg))
                 self._msg_tokens.append(max(1, int(len(output) / self._chars_per_token)))
 
+            for tc in unrun_calls:
+                not_run = tool_call_limit_result(len(result.tool_calls), _MAX_TOOL_CALLS_PER_TURN)
+                try:
+                    unrun_args = json.loads(tc["function"]["arguments"])
+                except (ValueError, RecursionError):
+                    unrun_args = {"_raw": tc["function"]["arguments"]}
+                self.tool_call_log.append(
+                    {
+                        "tool": tc["function"]["name"],
+                        "args": unrun_args
+                        if isinstance(unrun_args, dict)
+                        else {"_raw": unrun_args},
+                        "result": not_run,
+                        "ok": False,
+                        "turn": turn,
+                    }
+                )
+                self.messages.append(Turn.tool(tc["id"], ControllerText(not_run), is_error=True))
+                self._msg_tokens.append(max(1, int(len(not_run) / self._chars_per_token)))
+
         return self.tool_call_log
 
 
@@ -610,6 +1073,7 @@ def run_with_lifecycle(
     teardown_reset: Callable[[], None],
     on_cwd_restore_failed: Callable[[str], None],
     extra_close: Callable[[], None] | None = None,
+    attempts: int = 3,
 ) -> dict[str, Any]:
     """THE per-run lifecycle, shared by both harnesses.
 
@@ -644,12 +1108,17 @@ def run_with_lifecycle(
       wait, so the worker is still inside the drive, and ``close()``'s
       bounded shell-join would trade a bounded leak for a blocked
       teardown on exactly the run already over budget.
-    * transient failures retry up to 3 attempts with backoff.  Here the
-      future has already raised — the worker is DONE — so unlike the
-      timeout path the session is CLOSED before being replaced; the old
-      shape dropped it "for the timeout path's reason" on a path where
-      that reason does not hold, abandoning up to three fully-built
-      sessions (background shells included) per case.
+    * transient failures retry up to *attempts* attempts (3 unless the
+      caller says otherwise) with backoff.  Here the future has already
+      raised — the worker is DONE — so unlike the timeout path the
+      session is CLOSED before being replaced; the old shape dropped it
+      "for the timeout path's reason" on a path where that reason does
+      not hold, abandoning up to three fully-built sessions (background
+      shells included) per case.  A caller whose run must not be
+      repeated passes ``attempts=1``: a re-run samples the model again
+      and repeats every side effect of the first, and each attempt has
+      its own ``test_timeout``, so only a single attempt is bounded by
+      one ``test_timeout`` overall.
     * *finish(session, tool_log)* — the success extraction, run before
       teardown so the caller reads a live session.
 
@@ -683,6 +1152,8 @@ def run_with_lifecycle(
       the teardown path, once per run, i.e. the defect inside the fix
       for it.
     """
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
     workdir = tempfile.mkdtemp(prefix=workdir_prefix)
     original_cwd = os.getcwd()
     session: Any = None
@@ -690,7 +1161,7 @@ def run_with_lifecycle(
     try:
         setup(workdir)
         _last_err: Exception | None = None
-        for _attempt in range(3):
+        for _attempt in range(attempts):
             run_client = build_client()
             session, drive = build_session(run_client)
             executor: ThreadPoolExecutor | None = None
@@ -725,12 +1196,12 @@ def run_with_lifecycle(
                 with contextlib.suppress(Exception):
                     session.close()
                 session = None
-                if _attempt < 2:
+                if _attempt < attempts - 1:
                     time.sleep(2**_attempt)
             finally:
                 if executor is not None:
                     executor.shutdown(wait=False)
-        raise _last_err or RuntimeError("the generation chain failed after 3 attempts")
+        raise _last_err or RuntimeError(f"the generation chain failed after {attempts} attempts")
     finally:
         # The reasoning for every guard and its order is in the
         # docstring above — one essay, one implementation, two callers.
