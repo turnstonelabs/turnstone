@@ -422,6 +422,23 @@ started this way, because they mint from the credential captured at the user's
 last browser sign-in, not from the presented token. See
 [MCP authentication](mcp-oauth.md).
 
+### What a caller should expect
+
+- **Send a project when the deployment requires one.** With
+  `server.require_project` on, a create without `project_id` answers `400`
+  with `code: "require_project"`. `GET /v1/api/projects` works with the same
+  token and lists the projects the user can file into.
+- **A user with no permissions can do nothing.** Every request, `whoami`
+  included, answers `403 Forbidden: token lacks 'read' scope`.
+- **An account is not always a stored credential.** Sign-in passthrough tools
+  and model aliases that authenticate per user need the credential captured at
+  a completed browser sign-in. A user whose account exists without one (a first
+  sign-in that was refused, or a credential since revoked) can still create a
+  workstream: the create answers `200` and the run then fails with a missing
+  credential, visible only in the workstream's state. Have the user sign in to
+  Turnstone once, and read the workstream's state rather than trusting the
+  create response alone.
+
 ### Entra ID setup
 
 1. On Turnstone's app registration, under **Expose an API**, set the
@@ -435,6 +452,11 @@ last browser sign-in, not from the presented token. See
    permission with admin consent.
 4. Put the same client ID in `api_allowed_clients` and the scope's name (the
    part after the last `/`) in `api_required_scope`.
+
+If Turnstone's enterprise application has **Assignment required** turned on,
+Entra issues this token only for users assigned to Turnstone; for anyone else
+the calling application's token request fails with `AADSTS50105` before
+Turnstone is involved.
 
 The calling application then requests a token for the scope
 `<Application ID URI>/Workstreams.Run` as its signed-in user — through
