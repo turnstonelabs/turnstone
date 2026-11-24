@@ -440,6 +440,16 @@ last browser sign-in, not from the presented token. See
   Turnstone once, and read the workstream's state rather than trusting the
   create response alone.
 
+- **A later message may need the workstream reopened first.** A workstream is
+  unloaded when its node restarts or evicts it as idle, and
+  `POST /v1/api/route/workstreams/{ws_id}/send` then answers `404`; the
+  conversation is saved, not gone. `GET /v1/api/route/workstreams/{ws_id}/live`
+  says whether it is loaded. To continue it, reopen it on its node through the
+  console, `POST /node/{node_id}/v1/api/workstreams/{ws_id}/open` (the
+  `node_id` comes from the create response or `GET /v1/api/route?ws_id=`), and
+  send again. A caller that answers a `404` by creating a new workstream
+  starts a second conversation and loses the first one's history.
+
 ### Entra ID setup
 
 1. On Turnstone's app registration, under **Expose an API**, set the
