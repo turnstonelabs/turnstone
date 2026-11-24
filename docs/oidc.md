@@ -402,6 +402,17 @@ Turnstone user, gets `401`.
 
 The token is read from the `Authorization` header only, never from a cookie.
 
+The issuer's signing keys are cached. The cache is refreshed when a token names
+a key it does not hold (at most once a minute), and replaced once it is an hour
+old, so a key the provider withdraws stops being accepted within the hour. If
+that hourly refresh fails, the cached keys stay in use and the refresh is
+retried each minute. To drop a withdrawn key at once, restart the console (and
+any node that accepts these tokens).
+
+If the provider was unreachable when Turnstone started, the first access token
+presented afterwards retries discovery (at most once a minute), as a browser
+sign-in does.
+
 ### What the caller may do
 
 The request runs as that user, with the user's roles, capped:

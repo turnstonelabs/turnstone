@@ -977,6 +977,10 @@ async def exchange_code(
 # ---------------------------------------------------------------------------
 
 
+# JWK ``kty`` each allowed signature family verifies with.
+_KEY_TYPE_BY_ALG_PREFIX = {"RS": "RSA", "ES": "EC"}
+
+
 def _resolve_signing_key(raw_token: str, jwks_data: dict[str, Any], kind: str) -> Any:
     """Return the JWKS key that signed *raw_token*, resolved locally (no I/O).
 
@@ -1080,6 +1084,17 @@ def validate_api_access_token(
         raise OIDCError("Access-token sign-in is not enabled")
 
     signing_key = _resolve_signing_key(raw_token, jwks_data, "access token")
+    # The header is caller-chosen here, unlike an ID token's, which arrives from
+    # the IdP's token endpoint.  Its algorithm must belong to the key's family:
+    # PyJWT raises a bare TypeError, not an InvalidTokenError, when asked to
+    # verify an ES256 token with an RSA key (or the reverse).
+    alg = jwt.get_unverified_header(raw_token).get("alg")
+    family = _KEY_TYPE_BY_ALG_PREFIX.get(alg[:2]) if isinstance(alg, str) else None
+    if family is None or signing_key.key_type != family:
+        raise OIDCError(
+            f"Access token algorithm {_sanitize_log_text(str(alg), 16)!r} does not "
+            f"match its {signing_key.key_type} signing key"
+        )
     try:
         claims: dict[str, Any] = jwt.decode(
             raw_token,
@@ -1089,7 +1104,10 @@ def validate_api_access_token(
             issuer=config.issuer,
             options={"require": ["exp", "iat", "aud", "iss", "sub"]},
         )
-    except jwt.InvalidTokenError as exc:
+    except jwt.PyJWTError as exc:
+        # PyJWTError, not only InvalidTokenError: a key the algorithm cannot
+        # use (an EC key on another curve, say) raises InvalidKeyError, and a
+        # caller-made token must never turn into a 500.
         raise OIDCError(f"Access token validation failed: {exc}") from exc
 
     # Entra marks an app-only token (client credentials, no user) this way.

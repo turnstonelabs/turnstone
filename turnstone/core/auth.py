@@ -1464,6 +1464,12 @@ _OIDC_BEARER_SCOPES: frozenset[str] = frozenset({"read", "write"})
 # stream of forged ``kid`` values cannot turn into a stream of IdP requests.
 _OIDC_BEARER_JWKS_REFETCH_INTERVAL_S = 60.0
 
+# The cached key set is replaced once it is this old even when every token
+# names a key it holds, so a key the IdP withdrew stops being trusted within
+# the hour instead of at the next restart.  When the refresh fails the cached
+# set stays in use and the refresh is retried once per refetch window.
+_OIDC_BEARER_JWKS_MAX_AGE_S = 3600.0
+
 
 class OIDCBearerContext(NamedTuple):
     """What validating an IdP access token needs: the config and the cached key set."""
@@ -1752,7 +1758,10 @@ async def _oidc_bearer_context(
     ``None`` unless the deployment accepts access tokens and the header holds
     an asymmetrically signed JWT, so a session JWT or API token costs one
     header parse.  Refreshes the cached key set (rate-limited) when the token
-    names a key it lacks, which is how IdP key rotation is picked up.
+    names a key it lacks, which is how IdP key rotation is picked up, and when
+    the set has reached its maximum age, which is how a withdrawn key is
+    dropped.  A deployment whose discovery failed at startup retries it here
+    (cooldown-limited), so API callers recover without a browser sign-in.
     """
     token = _extract_bearer(auth_header)
     if not token or token.count(".") != 2:
@@ -1767,17 +1776,36 @@ async def _oidc_bearer_context(
         return None
     app_state = request.app.state
     config = oauth_context(app_state).oidc_config
+    if (
+        config is not None
+        and not config.enabled
+        and config.api_allowed_clients
+        and config.api_required_scope
+    ):
+        # Discovery failed at startup (IdP briefly unreachable).  The browser
+        # sign-in handlers heal that; do the same here, or a deployment whose
+        # only traffic is API callers answers 401 until someone restarts it.
+        await maybe_rediscover_oidc(app_state)
+        config = oauth_context(app_state).oidc_config
     if config is None or not config.api_bearer_enabled:
         return None
 
     jwks_data: dict[str, Any] | None = getattr(app_state, "jwks_data", None)
     kid = header.get("kid")
-    if not _resolve_kid(jwks_data, kid) and config.jwks_uri:
-        now = time.monotonic()
+    now = time.monotonic()
+    fresh_at: float | None = getattr(app_state, "oidc_bearer_jwks_fresh_monotonic", None)
+    if fresh_at is None:
+        # First access token since startup: the set was fetched at discovery.
+        fresh_at = app_state.oidc_bearer_jwks_fresh_monotonic = now
+    expired = now - fresh_at >= _OIDC_BEARER_JWKS_MAX_AGE_S
+    if (expired or not _resolve_kid(jwks_data, kid)) and config.jwks_uri:
         last: float | None = getattr(app_state, "oidc_bearer_jwks_refetch_monotonic", None)
         if last is None or now - last >= _OIDC_BEARER_JWKS_REFETCH_INTERVAL_S:
             app_state.oidc_bearer_jwks_refetch_monotonic = now
-            jwks_data = await _refetch_jwks_locked(request, config.jwks_uri, kid) or jwks_data
+            fetched = await _refetch_jwks_locked(request, config.jwks_uri, kid, force=expired)
+            if fetched is not None:
+                jwks_data = fetched
+                app_state.oidc_bearer_jwks_fresh_monotonic = now
     if jwks_data is None:
         return None
     return OIDCBearerContext(config, jwks_data)
@@ -2389,13 +2417,15 @@ def _resolve_kid(jwks: dict[str, Any] | None, kid: str | None) -> bool:
 
 
 async def _refetch_jwks_locked(
-    request: Request, jwks_uri: str, kid: str | None
+    request: Request, jwks_uri: str, kid: str | None, *, force: bool = False
 ) -> dict[str, Any] | None:
     """Acquire the per-app JWKS refetch lock, re-check the cache, and refetch on miss.
 
     Returns the JWKS dict on success or ``None`` if the fetch failed.  When
     another concurrent caller already refreshed the cache to include *kid*
     we return the existing snapshot without issuing another network call.
+    *force* skips that re-check and always fetches: the caller wants the
+    cached set replaced because of its age, not because a key is missing.
     """
     lock = getattr(request.app.state, "jwks_refetch_lock", None)
     if lock is None:
@@ -2404,7 +2434,7 @@ async def _refetch_jwks_locked(
     http_client = getattr(request.app.state, "oidc_http_client", None)
     async with lock:
         cached: dict[str, Any] | None = getattr(request.app.state, "jwks_data", None)
-        if _resolve_kid(cached, kid):
+        if not force and _resolve_kid(cached, kid):
             return cached
         try:
             fresh = await fetch_jwks(jwks_uri, client=http_client)

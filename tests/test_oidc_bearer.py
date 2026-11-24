@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from typing import Any
 
 import jwt as pyjwt
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from tests.conftest import make_oidc_test_config
 from turnstone.core import auth
@@ -385,6 +386,141 @@ def test_an_unknown_key_refreshes_the_key_set_once_per_window(
     context = _context(request, _token(kid="forged"))
     assert context is not None and context.jwks_data == rotated
     assert len(fetches) == 1
+
+
+def test_a_known_key_is_served_from_the_cache_until_the_set_is_an_hour_old(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key the IdP withdrew stops being trusted once the cached set expires."""
+    without_key1 = {"keys": [{**_JWKS["keys"][0], "kid": "successor"}]}
+    fetches: list[str] = []
+
+    async def fetch_jwks(uri: str, client: Any = None) -> dict[str, Any]:
+        fetches.append(uri)
+        return without_key1
+
+    monkeypatch.setattr(auth, "fetch_jwks", fetch_jwks)
+    request = _request(_config())
+    state = request.app.state
+
+    # Inside the hour a token naming a cached key never reaches the IdP.
+    context = _context(request, _token())
+    assert context is not None and context.jwks_data == _JWKS
+    assert fetches == []
+
+    state.oidc_bearer_jwks_fresh_monotonic -= auth._OIDC_BEARER_JWKS_MAX_AGE_S
+    context = _context(request, _token())
+    assert len(fetches) == 1
+    assert context is not None and context.jwks_data == without_key1
+    assert state.jwks_data == without_key1
+    with pytest.raises(OIDCKeyNotFoundError):
+        validate_api_access_token(_token(), context.jwks_data, _config())
+
+    # The refreshed set is fresh again: no fetch per request.
+    _context(request, _token(kid="successor"))
+    assert len(fetches) == 1
+
+
+def test_an_expired_key_set_survives_a_failed_refresh_and_retries_once_per_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fetches: list[str] = []
+
+    async def fetch_jwks(uri: str, client: Any = None) -> dict[str, Any]:
+        fetches.append(uri)
+        raise OSError("idp unreachable")
+
+    monkeypatch.setattr(auth, "fetch_jwks", fetch_jwks)
+    request = _request(_config())
+    state = request.app.state
+    _context(request, _token())
+    state.oidc_bearer_jwks_fresh_monotonic -= auth._OIDC_BEARER_JWKS_MAX_AGE_S
+
+    # The IdP is down: the cached set keeps working, and is still due.
+    for _ in range(3):
+        context = _context(request, _token())
+        assert context is not None and context.jwks_data == _JWKS
+    assert len(fetches) == 1
+
+    state.oidc_bearer_jwks_refetch_monotonic -= auth._OIDC_BEARER_JWKS_REFETCH_INTERVAL_S
+    _context(request, _token())
+    assert len(fetches) == 2
+
+
+def test_api_traffic_alone_recovers_from_a_failed_startup_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probes: list[Any] = []
+
+    async def maybe_rediscover_oidc(app_state: Any) -> None:
+        probes.append(app_state)
+        if len(probes) > 1:  # the IdP is back on the second probe
+            oauth_context(app_state).oidc_config = _config()
+
+    monkeypatch.setattr(auth, "maybe_rediscover_oidc", maybe_rediscover_oidc)
+    request = _request(_config(enabled=False, discovery_retryable=True))
+
+    assert _context(request, _token()) is None
+    context = _context(request, _token())
+    assert context is not None and context.config.enabled
+    assert len(probes) == 2
+
+    # Healthy, or never configured for access tokens: no probe.
+    _context(request, _token())
+    _context(_request(_config(enabled=False, api_allowed_clients=())), _token())
+    assert len(probes) == 2
+
+
+# ---------------------------------------------------------------------------
+# A header's algorithm against the key it names
+# ---------------------------------------------------------------------------
+
+_EC_KEY = ec.generate_private_key(ec.SECP256R1())
+_MIXED_JWKS = {
+    "keys": [
+        _JWKS["keys"][0],
+        {**json.loads(pyjwt.algorithms.ECAlgorithm.to_jwk(_EC_KEY.public_key())), "kid": "ec1"},
+    ]
+}
+
+
+def _relabelled(token: str, alg: str, kid: str) -> str:
+    """*token* with a caller-chosen header; the signature no longer matters."""
+    header = base64.urlsafe_b64encode(json.dumps({"alg": alg, "typ": "JWT", "kid": kid}).encode())
+    return header.rstrip(b"=").decode() + "." + token.split(".", 1)[1]
+
+
+@pytest.mark.parametrize(("alg", "kid"), [("ES256", "key1"), ("RS256", "ec1"), ("ES384", "key1")])
+def test_an_algorithm_the_named_key_cannot_verify_is_refused_not_raised(alg: str, kid: str) -> None:
+    with pytest.raises(OIDCError, match="does not match"):
+        validate_api_access_token(_relabelled(_token(), alg, kid), _MIXED_JWKS, _config())
+
+
+def test_a_key_on_another_curve_is_refused_not_raised() -> None:
+    token = pyjwt.encode(
+        pyjwt.decode(_token(), options={"verify_signature": False}),
+        ec.generate_private_key(ec.SECP384R1()),
+        algorithm="ES384",
+        headers={"kid": "ec1"},
+    )
+    with pytest.raises(OIDCError):
+        validate_api_access_token(token, _MIXED_JWKS, _config())
+
+
+def test_an_elliptic_curve_key_still_validates() -> None:
+    token = pyjwt.encode(
+        pyjwt.decode(_token(), options={"verify_signature": False}),
+        _EC_KEY,
+        algorithm="ES256",
+        headers={"kid": "ec1"},
+    )
+    assert validate_api_access_token(token, _MIXED_JWKS, _config())["azp"] == CALLER
+
+
+def test_a_mismatched_header_is_a_401_through_the_request_check() -> None:
+    storage = _Storage([_identity()], {"write"})
+    allowed, status, _, _ = _check(_relabelled(_token(), "ES256", "key1"), storage)
+    assert (allowed, status) == (False, 401)
 
 
 # ---------------------------------------------------------------------------
