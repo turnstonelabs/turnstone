@@ -545,18 +545,83 @@ Show the user rich content in a preview pane beside the conversation.
 
 ---
 
-## Agent
+## Sub-agents
 
-The tool name uses the `_agent` suffix — bare `task` collides with
-chat-template channel names on some local models.
+Delegate general-purpose tasks to autonomous sub-agents.
+
+### spawn_batch
+
+| Parameter  | Type   | Required | Description |
+|------------|--------|----------|-------------|
+| `children` | array  | yes      | Up to 10 child specs. Each spec mirrors spawn_workstream args. An empty `initial_message` creates an idle child that waits for send_to_workstream. |
+
+- **What it does**: Create up to 10 child workstreams in one call. The children
+  are created concurrently, so their creation order can differ from the input
+  order. Returns `{results: {idx: {child_ws_id, name, node_id}}, denied: [{idx, reason}]}`
+  — `results` keyed by stringified input-array index, `denied` collects
+  per-item validation / spawn failures. A `results` row for a child created
+  without its initial message adds `initial_message_status` and a
+  `note`: `queue_full` means the node had no room for the message, so send it
+  with send_to_workstream; `refused_closed` means the child was closed while it
+  was being created, so spawn it again if you still need it. Collect the
+  `child_ws_id` values and pass them as a list to
+  `wait_for_workstream(ws_ids=[...], mode='all')` to synthesise the N outputs
+  once every child has finished. For >10 children make multiple calls (the
+  batch hard-errors rather than truncating). Lifecycle state at spawn isn't
+  returned — call inspect_workstream if you need it.
+- **Auto-approve**: No -- requires user confirmation.
+- **Agent availability**: Coordinator only.
+
+---
+
+### spawn_workstream
+
+| Parameter         | Type   | Required | Description |
+|-------------------|--------|----------|-------------|
+| `initial_message` | string | no       | First user message to dispatch to the new workstream. If empty, the workstream is created idle and waits for send_to_workstream. |
+| `skill`           | string | no       | Skill name to apply to the new workstream. |
+| `name`            | string | no       | Display name for the new workstream. Auto-generated when empty. |
+| `model`           | string | no       | Model alias for the new workstream. Normally omitted by a coordinator unless explicitly requested by the user. |
+| `target_node`     | string | no       | A node_id. Execution stays bound to this identity after close, timeout, or restart. An unavailable node fails without fallback. Omit for flexible placement; select a node when its local files, devices, or environment are required. |
+| `project`         | string | no       | The project_id to attach the child to, overriding the project it would otherwise inherit from this coordinator. Omit to inherit the coordinator's project (the common case). The child only gains project access if its owning user can access the project. |
+| `persona`         | string | no       | Persona name for the child (children are always interactive-kind, so the persona must apply to interactive workstreams). The persona is resolved and snapshotted at spawn time. Omit for the interactive default persona — the child never inherits this coordinator's persona. |
+
+- **What it does**: Create a new child workstream, optionally dispatching an
+  initial message. Kick off a focused sub-task on a different skill or node
+  while the coordinator stays in charge. The child runs independently — drive
+  it with send_to_workstream / inspect_workstream / close_workstream. Returns
+  `{child_ws_id, name, node_id, routing_strategy}` — pass `child_ws_id` into
+  `wait_for_workstream(ws_ids=[...])` and the other `ws_id`-taking tools. When
+  the child was created without its initial message, the result adds
+  `initial_message_status` and a `note`: `queue_full` means the node had no
+  room for the message, so send it with send_to_workstream; `refused_closed`
+  means the child was closed while it was being created, so spawn it again if
+  you still need it. For this tool, `routing_strategy` is `rendezvous`
+  (default placement on the live-node set) or `target_node` (an explicit
+  execution requirement). An explicit target remains required after close or
+  restart; unavailable targets do not fall back. Automatic placement remains
+  flexible. The returned `node_id` describes placement at creation, not an
+  exclusive ownership lease. Don't cache `node_id` for long-running callbacks
+  — re-read with inspect_workstream. Lifecycle state (idle / running / etc.)
+  is not in this response — read it via inspect_workstream.
+- **Auto-approve**: No -- requires user confirmation.
+- **Agent availability**: Coordinator only.
+
+---
 
 ### task_agent
 
 Delegate a general-purpose task to an autonomous sub-agent.
 
+The tool name uses the `_agent` suffix — bare `task` collides with
+chat-template channel names on some local models.
+
 | Parameter | Type   | Required | Description |
 |-----------|--------|----------|-------------|
 | `prompt`  | string | yes      | Complete task description for the sub-agent. |
+| `skill`   | string | no       | Skill name providing capability and procedure (reference material) the sub-agent applies to the task — NOT its identity. Use `skills(action='find', query='...')` to discover available names. An empty value is acceptable and yields a competent general-purpose task helper. |
+| `persona` | string | no       | Persona name setting the sub-agent's identity (base system prompt), resolved against interactive-kind personas. Omit for the default autonomous task-agent identity. |
+| `model`   | string | no       | Model alias to run this task agent on. Omit to use the current session model. (No alternative aliases configured in this session. |
 
 - **What it does**: Spawns a sub-agent that inherits the production
   `TASK_AGENT_TOOLS` set (read, write, edit, search, bash, and web tools). The
