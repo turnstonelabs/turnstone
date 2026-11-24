@@ -212,6 +212,13 @@
 # capture_user_credential = false # Set true to capture refresh tokens at login
 # obo_grant_profile = "entra"     # "entra" or "rfc8693"
 
+# Optional: let other applications call the API with an access token your IdP
+# issued for this deployment, as the user signed in to them. Off unless both
+# are set. See docs/oidc.md#access-tokens-as-api-credentials.
+# api_allowed_clients = ["client-id-of-the-calling-app"]
+# api_required_scope = "Workstreams.Run"
+# api_audience = []               # Accepted "aud" values; default: client_id
+
 # --- Server (node, console) ---
 
 [server]

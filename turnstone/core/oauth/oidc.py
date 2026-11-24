@@ -96,7 +96,8 @@ class OIDCConfig:
         ``enabled``, ``issuer``, ``client_id``, ``client_secret``, ``scopes``,
         ``provider_name``, ``role_claim``, ``role_map``, ``password_enabled``,
         ``redirect_base``, ``trusted_endpoint_hosts``, ``allow_private_network``,
-        ``capture_user_credential``, ``obo_grant_profile``.
+        ``capture_user_credential``, ``obo_grant_profile``,
+        ``api_allowed_clients``, ``api_required_scope``, ``api_audiences``.
 
     Discovery-derived fields (set by :func:`discover_oidc`; empty before
     discovery completes):
@@ -129,6 +130,13 @@ class OIDCConfig:
     # or "rfc8693" (refresh grant + standard token exchange).  The IdP
     # determines the leg, so this is deployment-level, not per-server.
     obo_grant_profile: str = "entra"
+    # Opt-in API sign-in with an IdP access token (docs/oidc.md, "Access tokens
+    # as API credentials").  Off unless BOTH the calling-client allow-list and
+    # the required delegated scope are set.
+    api_allowed_clients: tuple[str, ...] = ()
+    api_required_scope: str = ""
+    # Accepted ``aud`` values; empty means ``client_id`` alone.
+    api_audiences: tuple[str, ...] = ()
     # Discovered from .well-known/openid-configuration
     authorization_endpoint: str = ""
     token_endpoint: str = ""
@@ -141,6 +149,11 @@ class OIDCConfig:
     # :func:`maybe_rediscover_oidc` — without it a node that boots during a
     # transient IdP outage can never mint oauth_obo tokens until restarted.
     discovery_retryable: bool = False
+
+    @property
+    def api_bearer_enabled(self) -> bool:
+        """True when IdP access tokens are accepted as API credentials."""
+        return bool(self.enabled and self.api_allowed_clients and self.api_required_scope)
 
 
 def _parse_role_map(raw: str) -> dict[str, str]:
@@ -164,6 +177,13 @@ def _parse_trusted_endpoint_hosts(raw: str) -> tuple[str, ...]:
         if host:
             hosts.append(host)
     return tuple(hosts)
+
+
+def _env_or_cfg_list(env_name: str, cfg: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    """Read a list setting: a comma-separated env var, else a TOML list or string."""
+    raw: Any = os.environ.get(env_name, "").strip() or cfg.get(key, "")
+    entries = raw if isinstance(raw, list) else str(raw).split(",")
+    return tuple(dict.fromkeys(e for e in (str(entry).strip() for entry in entries) if e))
 
 
 def _env_or_cfg_str(env_name: str, cfg: Mapping[str, Any], key: str, default: str = "") -> str:
@@ -330,6 +350,24 @@ def load_oidc_config() -> OIDCConfig:
                 redirect_base,
             )
 
+    api_allowed_clients = _env_or_cfg_list(
+        "TURNSTONE_OIDC_API_ALLOWED_CLIENTS", cfg, "api_allowed_clients"
+    )
+    api_required_scope = _env_or_cfg_str(
+        "TURNSTONE_OIDC_API_REQUIRED_SCOPE", cfg, "api_required_scope"
+    ).strip()
+    api_audiences = _env_or_cfg_list("TURNSTONE_OIDC_API_AUDIENCE", cfg, "api_audience")
+    if len(api_required_scope.split()) > 1:
+        log.warning("oidc: api_required_scope must name one scope; access-token sign-in stays off")
+        api_required_scope = ""
+    if bool(api_allowed_clients) != bool(api_required_scope):
+        # Half a configuration never turns the feature on: without the scope an
+        # ID token would qualify, and without the allow-list any client would.
+        log.warning(
+            "oidc: access-token sign-in needs both api_allowed_clients and "
+            "api_required_scope; it stays off"
+        )
+
     # OIDC is enabled when all three required fields are non-empty.
     enabled = bool(issuer and client_id and client_secret)
 
@@ -361,6 +399,9 @@ def load_oidc_config() -> OIDCConfig:
         allow_private_network=allow_private_network,
         capture_user_credential=capture_user_credential,
         obo_grant_profile=obo_grant_profile,
+        api_allowed_clients=api_allowed_clients,
+        api_required_scope=api_required_scope,
+        api_audiences=api_audiences,
     )
 
 
@@ -915,19 +956,11 @@ async def exchange_code(
 # ---------------------------------------------------------------------------
 
 
-def validate_id_token(
-    raw_token: str,
-    jwks_data: dict[str, Any],
-    config: OIDCConfig,
-    nonce: str,
-) -> dict[str, Any]:
-    """Validate and decode an OIDC ID token.  Returns decoded claims.
+def _resolve_signing_key(raw_token: str, jwks_data: dict[str, Any], kind: str) -> Any:
+    """Return the JWKS key that signed *raw_token*, resolved locally (no I/O).
 
-    *jwks_data* is the pre-fetched JWKS document (the ``{"keys": [...]}``
-    dict).  No network I/O happens here — the signing key is resolved
-    locally from the cached key set.
-
-    Raises :class:`OIDCError` on validation failure.
+    *kind* names the token in error text.  Raises :class:`OIDCKeyNotFoundError`
+    when the key set does not hold the key.
     """
     import jwt
     from jwt import PyJWK
@@ -936,7 +969,7 @@ def validate_id_token(
     try:
         header = jwt.get_unverified_header(raw_token)
     except jwt.DecodeError as exc:
-        raise OIDCError(f"Invalid ID token header: {exc}") from exc
+        raise OIDCError(f"Invalid {kind} header: {exc}") from exc
 
     kid = header.get("kid")  # None if absent, not ""
 
@@ -966,6 +999,27 @@ def validate_id_token(
     if signing_key is None:
         raise OIDCKeyNotFoundError(f"Signing key '{kid}' not found in JWKS")
 
+    return signing_key
+
+
+def validate_id_token(
+    raw_token: str,
+    jwks_data: dict[str, Any],
+    config: OIDCConfig,
+    nonce: str,
+) -> dict[str, Any]:
+    """Validate and decode an OIDC ID token.  Returns decoded claims.
+
+    *jwks_data* is the pre-fetched JWKS document (the ``{"keys": [...]}``
+    dict).  No network I/O happens here — the signing key is resolved
+    locally from the cached key set.
+
+    Raises :class:`OIDCError` on validation failure.
+    """
+    import jwt
+
+    signing_key = _resolve_signing_key(raw_token, jwks_data, "ID token")
+
     try:
         claims: dict[str, Any] = jwt.decode(
             raw_token,
@@ -980,4 +1034,52 @@ def validate_id_token(
     if claims.get("nonce") != nonce:
         raise OIDCError("ID token nonce mismatch")
 
+    return claims
+
+
+def validate_api_access_token(
+    raw_token: str,
+    jwks_data: dict[str, Any],
+    config: OIDCConfig,
+) -> dict[str, Any]:
+    """Validate an IdP access token presented as an API credential.  Returns its claims.
+
+    The token must be signed by the configured issuer, name this deployment as
+    its audience, be delegated (issued for a signed-in user), carry
+    ``config.api_required_scope``, and have been obtained by a client in
+    ``config.api_allowed_clients``.  An ID token shares this issuer, audience
+    and key set, and is told apart by having no ``scp``.
+
+    Raises :class:`OIDCKeyNotFoundError` when the signing key is not in
+    *jwks_data* and :class:`OIDCError` on any other failure.
+    """
+    import jwt
+
+    if not config.api_bearer_enabled:
+        raise OIDCError("Access-token sign-in is not enabled")
+
+    signing_key = _resolve_signing_key(raw_token, jwks_data, "access token")
+    try:
+        claims: dict[str, Any] = jwt.decode(
+            raw_token,
+            signing_key.key,
+            algorithms=_ALLOWED_ID_TOKEN_ALGS,
+            audience=list(config.api_audiences or (config.client_id,)),
+            issuer=config.issuer,
+            options={"require": ["exp", "iat", "aud", "iss", "sub"]},
+        )
+    except jwt.InvalidTokenError as exc:
+        raise OIDCError(f"Access token validation failed: {exc}") from exc
+
+    # Entra marks an app-only token (client credentials, no user) this way.
+    if claims.get("idtyp") == "app":
+        raise OIDCError("Access token is app-only, not issued for a user")
+    scopes = claims.get("scp")
+    if not isinstance(scopes, str) or config.api_required_scope not in scopes.split():
+        raise OIDCError(f"Access token lacks the '{config.api_required_scope}' scope")
+    client = claims.get("azp") or claims.get("client_id")
+    if not isinstance(client, str) or client not in config.api_allowed_clients:
+        raise OIDCError(
+            f"Access token client {_sanitize_log_text(str(client), 80)!r} is not allowed"
+        )
     return claims

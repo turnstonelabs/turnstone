@@ -698,3 +698,47 @@ class TestReplaceOIDCRoles:
         assert deleted
         assert db.get_user("u1") is None
         assert db.list_user_roles("u1") == []
+
+
+# ---------------------------------------------------------------------------
+# Lookup by Entra object id
+# ---------------------------------------------------------------------------
+
+
+class TestListOIDCIdentitiesByOid:
+    ISSUER = "https://idp.example.com"
+
+    def _user(self, db, user_id: str, subject: str, oid: str, tid: str, issuer: str = ISSUER):
+        db.create_oidc_user(
+            user_id,
+            user_id,
+            user_id,
+            "!oidc",
+            issuer,
+            subject,
+            f"{user_id}@example.com",
+            oid=oid,
+            tid=tid,
+        )
+
+    def test_matches_issuer_object_id_and_tenant_together(self, db):
+        self._user(db, "u1", "sub-1", "oid-1", "tid-1")
+        self._user(db, "u2", "sub-2", "oid-2", "tid-1")
+        self._user(db, "u3", "sub-3", "oid-1", "tid-2")
+        self._user(db, "u4", "sub-4", "oid-1", "tid-1", issuer="https://other.example.com")
+
+        rows = db.list_oidc_identities_by_oid(self.ISSUER, "oid-1", "tid-1")
+        assert [(row["user_id"], row["subject"]) for row in rows] == [("u1", "sub-1")]
+
+    def test_returns_every_identity_that_shares_the_pair(self, db):
+        self._user(db, "u1", "sub-old-app", "oid-1", "tid-1")
+        db.create_oidc_identity(self.ISSUER, "sub-new-app", "u1", "u1@example.com")
+        db.update_oidc_identity_login(self.ISSUER, "sub-new-app", oid="oid-1", tid="tid-1")
+
+        rows = db.list_oidc_identities_by_oid(self.ISSUER, "oid-1", "tid-1")
+        assert {row["subject"] for row in rows} == {"sub-old-app", "sub-new-app"}
+
+    def test_an_empty_object_id_or_tenant_matches_nothing(self, db):
+        self._user(db, "u1", "sub-1", "", "")
+        assert db.list_oidc_identities_by_oid(self.ISSUER, "", "") == []
+        assert db.list_oidc_identities_by_oid(self.ISSUER, "oid-1", "") == []
