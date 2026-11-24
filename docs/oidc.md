@@ -87,6 +87,7 @@ the installer does not copy OIDC variables from `.env` into the services.
 | `TURNSTONE_OIDC_API_ALLOWED_CLIENTS` | No | — | Comma-separated client IDs of the applications whose access tokens the API accepts (`api_allowed_clients`, a list, in TOML). See [Access tokens as API credentials](#access-tokens-as-api-credentials). |
 | `TURNSTONE_OIDC_API_REQUIRED_SCOPE` | No | — | The one delegated scope such a token must carry (`api_required_scope`). |
 | `TURNSTONE_OIDC_API_AUDIENCE` | No | client ID | Comma-separated `aud` values accepted on such a token (`api_audience`, a list, in TOML). |
+| `TURNSTONE_OIDC_PROMPT` | No | — | OIDC `prompt` sent with the sign-in redirect: `select_account` always shows the IdP's account picker (for people signed in to several accounts), `login` always re-authenticates. Unset leaves the IdP's default. Other values are ignored with a warning. |
 
 All four required fields — issuer, client ID, client secret, and
 `TURNSTONE_OIDC_REDIRECT_BASE` — must be set. If any are missing OIDC

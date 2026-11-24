@@ -91,6 +91,17 @@ class TestLoadOIDCConfig:
         assert cfg.scopes == "openid"
         assert cfg.provider_name == "Okta"
 
+    def test_load_oidc_config_prompt_env(self, monkeypatch):
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        with patch("turnstone.core.config.load_config", return_value={}):
+            assert load_oidc_config().prompt == ""
+            monkeypatch.setenv("TURNSTONE_OIDC_PROMPT", "select_account")
+            assert load_oidc_config().prompt == "select_account"
+            monkeypatch.setenv("TURNSTONE_OIDC_PROMPT", "none")
+            assert load_oidc_config().prompt == ""
+
     def test_load_oidc_config_allow_private_network_env(self, monkeypatch):
         monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.internal.example")
         monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
@@ -1171,6 +1182,20 @@ class TestBuildAuthorizeURL:
         assert "nonce=test-nonce" in url
         assert "code_challenge=" in url
         assert "code_challenge_method=S256" in url
+
+    def test_build_authorize_url_prompt_is_opt_in(self):
+        """No prompt by default; a configured one is sent as-is."""
+        from dataclasses import replace
+
+        args = {
+            "redirect_uri": "https://app.example.com/callback",
+            "state": "s",
+            "nonce": "n",
+            "code_verifier": generate_pkce_verifier(),
+        }
+        assert "prompt=" not in build_authorize_url(config=_make_config(), **args)
+        url = build_authorize_url(config=replace(_make_config(), prompt="select_account"), **args)
+        assert "prompt=select_account" in url
 
     def test_build_authorize_url_pkce(self):
         """code_challenge in URL should be correct S256 of the verifier."""

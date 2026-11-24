@@ -97,7 +97,8 @@ class OIDCConfig:
         ``provider_name``, ``role_claim``, ``role_map``, ``password_enabled``,
         ``redirect_base``, ``trusted_endpoint_hosts``, ``allow_private_network``,
         ``capture_user_credential``, ``obo_grant_profile``,
-        ``api_allowed_clients``, ``api_required_scope``, ``api_audiences``.
+        ``api_allowed_clients``, ``api_required_scope``, ``api_audiences``,
+        ``prompt``.
 
     Discovery-derived fields (set by :func:`discover_oidc`; empty before
     discovery completes):
@@ -137,6 +138,11 @@ class OIDCConfig:
     api_required_scope: str = ""
     # Accepted ``aud`` values; empty means ``client_id`` alone.
     api_audiences: tuple[str, ...] = ()
+    # Optional OIDC ``prompt`` sent with the authorization request:
+    # "select_account" always offers the IdP's account picker (for people
+    # signed in to several accounts), "login" always re-authenticates.
+    # Empty = the IdP's default (silent when one session exists).
+    prompt: str = ""
     # Discovered from .well-known/openid-configuration
     authorization_endpoint: str = ""
     token_endpoint: str = ""
@@ -279,6 +285,14 @@ def load_oidc_config() -> OIDCConfig:
             obo_grant_profile,
             ", ".join(sorted(oauth_grants.OBO_GRANT_PROFILES)),
         )
+    prompt = _env_or_cfg_str("TURNSTONE_OIDC_PROMPT", cfg, "prompt").strip()
+    if prompt not in OIDC_PROMPTS:
+        log.warning(
+            "oidc: unknown prompt %r (expected one of %s) — ignoring",
+            prompt,
+            ", ".join(sorted(p for p in OIDC_PROMPTS if p)),
+        )
+        prompt = ""
     if capture_user_credential and "offline_access" not in scopes.split():
         # The captured credential IS the offline_access refresh token; ask
         # for it at login so operators don't have to edit two keys in step.
@@ -402,6 +416,7 @@ def load_oidc_config() -> OIDCConfig:
         api_allowed_clients=api_allowed_clients,
         api_required_scope=api_required_scope,
         api_audiences=api_audiences,
+        prompt=prompt,
     )
 
 
@@ -878,6 +893,10 @@ def generate_pkce_verifier() -> str:
 # ---------------------------------------------------------------------------
 
 
+# Values accepted for the optional authorization-request ``prompt``.
+OIDC_PROMPTS = frozenset({"", "select_account", "login"})
+
+
 def build_authorize_url(
     config: OIDCConfig,
     redirect_uri: str,
@@ -899,6 +918,8 @@ def build_authorize_url(
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
     }
+    if config.prompt:
+        params["prompt"] = config.prompt
     return config.authorization_endpoint + "?" + urllib.parse.urlencode(params)
 
 
