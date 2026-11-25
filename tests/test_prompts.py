@@ -438,8 +438,11 @@ def test_interactive_kind_default_still_loads_ic_tools() -> None:
         _VALID_CTX,
         _ALL_TOOLS,
     )
-    assert "read_file" in result
-    assert "bash" in result
+    # _ALL_TOOLS has bash and web_search but not edit_file, so the patterns
+    # kept are the ones that need only those.
+    assert "bash(command=" in result
+    assert "web_search(query=" in result
+    assert "edit_file" not in result
 
 
 def test_tools_included_when_tools_available() -> None:
@@ -471,3 +474,93 @@ def test_session_kind_in_context_coordinator() -> None:
         kind="coordinator",
     )
     assert "Session kind:** coordinator" in result
+
+
+# ---------------------------------------------------------------------------
+# TOOLS module: patterns for tools the session does not have are left out
+# ---------------------------------------------------------------------------
+
+_IC_PATTERN_TOOLS = frozenset(
+    {
+        "read_file",
+        "edit_file",
+        "write_file",
+        "bash",
+        "search",
+        "web_fetch",
+        "open_preview",
+        "web_search",
+    }
+)
+
+
+def _patterns(tools: frozenset[str], kind: str = "interactive") -> str:
+    from turnstone.prompts import _load, _visible_tool_patterns
+
+    module = "tools_coordinator.md" if kind == "coordinator" else "tools.md"
+    return _visible_tool_patterns(_load(module), tools)
+
+
+def test_tool_patterns_are_unchanged_when_every_named_tool_is_available() -> None:
+    from turnstone.prompts import _load
+
+    assert _patterns(_IC_PATTERN_TOOLS | {"memory", "mcp__x__y"}) == _load("tools.md")
+
+
+def test_tool_patterns_drop_what_names_a_hidden_tool() -> None:
+    result = _patterns(frozenset({"read_file", "search", "web_fetch", "memory"}))
+
+    assert result.startswith("TOOL PATTERNS:\n\n")
+    # Kept: patterns whose every named tool is on offer.
+    assert "Find something across files → search:" in result
+    assert "Retrieve a URL → web_fetch:" in result
+    # Dropped: a hidden tool in an example call, or only in the heading or prose.
+    for gone in ("edit_file", "write_file", "bash", "open_preview", "web_search"):
+        assert gone not in result
+    assert "Find and modify" not in result
+    assert "User asks to READ/SEE" not in result
+    assert "\n\n\n" not in result
+
+
+def test_tool_patterns_vanish_when_none_of_the_named_tools_is_available() -> None:
+    hidden_all = frozenset({"tool_search", "call_tool", "memory", "recall"})
+    assert _patterns(hidden_all) == ""
+
+    result = compose_system_message(ClientType.CLI, _VALID_CTX, hidden_all)
+    assert "TOOL PATTERNS" not in result
+    for name in _IC_PATTERN_TOOLS:
+        assert f"{name}(" not in result
+
+
+def test_coordinator_patterns_follow_the_same_rule() -> None:
+    result = _patterns(frozenset({"spawn_workstream", "inspect_workstream"}), "coordinator")
+
+    assert "Delegate a task → spawn_workstream:" in result
+    assert "Check on a child → inspect_workstream:" in result
+    assert "spawn_batch" not in result
+    assert "list_nodes" not in result
+
+
+def test_tool_patterns_stay_out_when_only_unrelated_tools_join() -> None:
+    """A search that loads MCP tools recomposes the prompt; the block must not come back."""
+    after_a_search = frozenset(
+        {"tool_search", "memory", "recall", "mcp__logs__search", "mcp__x__y"}
+    )
+    assert _patterns(after_a_search) == ""
+
+
+def test_a_tool_name_used_as_an_ordinary_word_does_not_drop_a_pattern() -> None:
+    from turnstone.prompts import _visible_tool_patterns
+
+    module = (
+        "TOOL PATTERNS:\n\n"
+        "Find text in files \u2192 search:\n   search(query='x')\n\n"
+        "Make the model search the web for news \u2192 web_search:\n   web_search(query='y')\n"
+        "Plain note about how to search \u2192 web_search or search.\n"
+    )
+    result = _visible_tool_patterns(module, frozenset({"web_search"}))
+
+    # "search" before the arrow is prose; after it, or as a call, it is the tool.
+    assert "web_search(query='y')" in result
+    assert "search(query='x')" not in result
+    assert "Plain note" not in result

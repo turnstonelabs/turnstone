@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,51 @@ def _load(relpath: str) -> str:
         # persona-resolve time.
         _FILE_CACHE[path] = path.read_text(encoding="utf-8")
     return _FILE_CACHE[path]
+
+
+_PATTERN_CALL_RE = re.compile(r"\b([a-z][a-z0-9_]*)\(")
+
+
+def _visible_tool_patterns(module: str, available_tools: frozenset[str]) -> str:
+    """Return a tool-patterns module without the patterns for tools not on offer.
+
+    The module is paragraphs of patterns: an unindented heading line
+    (``what to do → tool then tool``) followed by indented example calls.  The
+    tool names are the ones the module itself calls (``name(``).  A pattern is
+    dropped when a tool missing from *available_tools* is called in it or
+    named after the heading's arrow; the words before the arrow are prose
+    ("Search the web for ..."), and several tool names are ordinary words.
+    The first paragraph is the title and goes when no pattern is left, so the
+    result is ``""`` then.  A session that has every tool the module names
+    gets the module back unchanged, byte for byte.
+    """
+    hidden = set(_PATTERN_CALL_RE.findall(module)) - available_tools
+    if not hidden:
+        return module
+    hidden_re = re.compile(
+        r"(?<![A-Za-z0-9_])(" + "|".join(sorted(map(re.escape, hidden))) + r")(?![A-Za-z0-9_])"
+    )
+
+    def names_hidden(pattern: list[str]) -> bool:
+        heading, *examples = pattern
+        named = heading.partition("\u2192")[2] if not heading[:1].isspace() else heading
+        return bool(hidden_re.search("\n".join([named, *examples])))
+
+    title, *paragraphs = module.strip("\n").split("\n\n")
+    kept: list[str] = []
+    for paragraph in paragraphs:
+        patterns: list[list[str]] = []
+        for line in paragraph.split("\n"):
+            if patterns and line[:1].isspace():
+                patterns[-1].append(line)
+            else:
+                patterns.append([line])
+        lines = [line for pattern in patterns if not names_hidden(pattern) for line in pattern]
+        if lines:
+            kept.append("\n".join(lines))
+    if not kept:
+        return ""
+    return "\n\n".join([title, *kept]) + ("\n" if module.endswith("\n") else "")
 
 
 def load_persona_prompt(filename: str) -> str:
@@ -346,9 +392,14 @@ def compose_system_message(
 
     # 4. TOOLS — kind-specific patterns.  Coordinators get the
     #    orchestrator block; interactive sessions get the IC block.
+    #    A pattern is left out when it names a tool this session does not
+    #    have (a persona visibility set, a trimmed tool directory), so the
+    #    prompt never describes a tool the model cannot call.
     if available_tools:
         tools_module = "tools_coordinator.md" if kind == WorkstreamKind.COORDINATOR else "tools.md"
-        parts.append(_load(tools_module))
+        patterns = _visible_tool_patterns(_load(tools_module), available_tools)
+        if patterns:
+            parts.append(patterns)
 
     # 5. POLICIES — resolve from DB first, fall back to files
     #    DB policies indexed by name for O(1) override lookup.
