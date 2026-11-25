@@ -2224,9 +2224,12 @@ expect(dispatchedTypes() === 'status' && !sync.inspect().quiesced, 'the queue st
 
 
 def test_a_server_error_frame_on_a_live_stream_then_a_trip_opens_nothing_early() -> None:
-    """A proxied upstream failure arrives as an ``error`` frame on an open stream (still
-    ``reconnecting``, not a refusal); a trip after it tears the stream down, and nothing opens
-    before the cooldown ends."""
+    """An in-band ``error`` frame on an open stream still reads as
+    ``reconnecting``, not a refusal — the defensive contract for any emitter
+    that sends one (the console proxy's pre-pass-through shape; it now passes
+    fatal upstream statuses through as non-2xx responses, which ES9 makes a
+    refusal).  A trip after the frame tears the stream down, and nothing
+    opens before the cooldown ends."""
     _run(
         r"""
 const es = await live();
