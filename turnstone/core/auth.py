@@ -8,6 +8,11 @@ Supports two token types:
    :class:`ServiceTokenManager`.  Validated locally via shared HMAC-SHA256
    secret.  Contain user_id and scopes in claims.
 
+A deployment can also opt in to a third: an **access token issued by its OIDC
+provider** to another application for a signed-in user, validated against the
+provider's keys and capped at the ``read`` and ``write`` scopes (see
+:func:`_authenticate_oidc_access_token`).
+
 Public paths (``/``, ``/static/*``, ``/shared/*``, ``/health``, ``/metrics``,
 ``/openapi.json``, ``/docs``, ``/api/auth/login``, ``/api/auth/logout``) are
 always accessible without authentication.
@@ -39,6 +44,7 @@ if TYPE_CHECKING:
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_client import try_prime_user_pools
 from turnstone.core.oauth.oidc import (
+    _ALLOWED_ID_TOKEN_ALGS,
     OIDC_STATE_TTL_SECONDS,
     OIDCError,
     OIDCKeyNotFoundError,
@@ -47,6 +53,7 @@ from turnstone.core.oauth.oidc import (
     fetch_jwks,
     generate_pkce_verifier,
     maybe_rediscover_oidc,
+    validate_api_access_token,
     validate_id_token,
 )
 from turnstone.core.oidc import oidc_identity_key, provision_oidc_user
@@ -1355,6 +1362,7 @@ def check_request(
     jwt_version: str = "",
     storage: Any = None,
     cookie_name: str,
+    oidc_bearer: OIDCBearerContext | None = None,
 ) -> tuple[bool, int, str, AuthResult | None]:
     """Validate a request.
 
@@ -1363,6 +1371,8 @@ def check_request(
 
     - Contains ``.`` → JWT (validated with *jwt_secret*)
     - Starts with ``ts_`` → API token (looked up in *storage* by hash)
+    - Any other JWT, sent in the header, when *oidc_bearer* is given → IdP
+      access token (never read from the cookie)
 
     Returns ``(allowed, status_code, message, auth_result)``.
     """
@@ -1373,6 +1383,7 @@ def check_request(
     raw_token = _extract_bearer(auth_header)
     if raw_token is None:
         raw_token = _extract_cookie(cookie_header, cookie_name)
+        oidc_bearer = None
 
     if not raw_token:
         return False, 401, "Unauthorized: missing or invalid token", None
@@ -1383,6 +1394,7 @@ def check_request(
         jwt_secret=jwt_secret,
         jwt_audience=jwt_audience,
         storage=storage,
+        oidc_bearer=oidc_bearer,
     )
     if result is None:
         return False, 401, "Unauthorized: missing or invalid token", None
@@ -1413,6 +1425,7 @@ def _authenticate_token(
     jwt_secret: str = "",
     jwt_audience: str = "",
     storage: Any = None,
+    oidc_bearer: OIDCBearerContext | None = None,
 ) -> AuthResult | None:
     """Identify token type and authenticate it."""
     # 1. JWT (contains dots) — attempt validation, fall through on failure
@@ -1428,7 +1441,92 @@ def _authenticate_token(
     if token.startswith(TOKEN_PREFIX) and storage is not None:
         return _authenticate_api_token(token, storage)
 
+    # 3. IdP access token — only when the deployment opted in
+    if oidc_bearer is not None and storage is not None and token.count(".") == 2:
+        return _authenticate_oidc_access_token(token, oidc_bearer, storage)
+
     return None
+
+
+# ---------------------------------------------------------------------------
+# IdP access tokens as API credentials
+# ---------------------------------------------------------------------------
+
+#: ``token_source`` of a request authenticated by an IdP access token.
+OIDC_BEARER_TOKEN_SOURCE = "oidc-bearer"
+
+# The most such a caller gets, whatever the user's roles allow in a browser:
+# another application acting for the user may run and read workstreams, and
+# may neither settle approvals nor administer the deployment.
+_OIDC_BEARER_SCOPES: frozenset[str] = frozenset({"read", "write"})
+
+# One JWKS refetch per window for access tokens naming an unknown key, so a
+# stream of forged ``kid`` values cannot turn into a stream of IdP requests.
+_OIDC_BEARER_JWKS_REFETCH_INTERVAL_S = 60.0
+
+# The cached key set is replaced once it is this old even when every token
+# names a key it holds, so a key the IdP withdrew stops being trusted within
+# the hour instead of at the next restart.  When the refresh fails the cached
+# set stays in use and the refresh is retried once per refetch window.
+_OIDC_BEARER_JWKS_MAX_AGE_S = 3600.0
+
+
+class OIDCBearerContext(NamedTuple):
+    """What validating an IdP access token needs: the config and the cached key set."""
+
+    config: OIDCConfig
+    jwks_data: dict[str, Any]
+
+
+def _authenticate_oidc_access_token(
+    token: str, oidc_bearer: OIDCBearerContext, storage: Any
+) -> AuthResult | None:
+    """Validate an IdP access token and resolve it to an existing user.
+
+    The user is matched by Entra ``oid``+``tid`` when the token carries them
+    (``sub`` differs per application there), else by ``(issuer, sub)``.  No
+    user is provisioned here: someone who never signed in through the browser
+    has no account, no roles and no captured credential, and is refused.
+    """
+    config = oidc_bearer.config
+    try:
+        claims = validate_api_access_token(token, oidc_bearer.jwks_data, config)
+    except OIDCError as exc:
+        log.info("oidc.bearer: token refused: %s", exc)
+        return None
+
+    oid = str(claims.get("oid") or "")
+    tid = str(claims.get("tid") or "")
+    if oid and tid:
+        identities = storage.list_oidc_identities_by_oid(config.issuer, oid, tid)
+    else:
+        identity = storage.get_oidc_identity(config.issuer, str(claims["sub"]))
+        identities = [identity] if identity is not None else []
+    user_ids = {identity["user_id"] for identity in identities}
+    if len(user_ids) != 1:
+        log.info(
+            "oidc.bearer: token refused: %s",
+            "no user has signed in with this identity"
+            if not user_ids
+            else "identity is linked to more than one user",
+        )
+        return None
+    user_id = user_ids.pop()
+    if storage.get_user(user_id) is None:
+        log.info("oidc.bearer: token refused: identity references a missing user")
+        return None
+
+    # Scopes come from the user's whole role authority, as a browser session's
+    # do, and are then capped; the permissions lose what the cap excludes.
+    perms = _load_user_permissions(storage, user_id)
+    return AuthResult(
+        user_id=user_id,
+        scopes=_permissions_to_scopes(perms) & _OIDC_BEARER_SCOPES,
+        token_source=OIDC_BEARER_TOKEN_SOURCE,
+        permissions=frozenset(
+            perm for perm in perms if perm != "approve" and not perm.startswith("admin.")
+        ),
+    )
 
 
 def _authenticate_api_token(token: str, storage: Any) -> AuthResult | None:
@@ -1652,6 +1750,67 @@ class ServiceTokenManager:
 # ---------------------------------------------------------------------------
 
 
+async def _oidc_bearer_context(
+    request: Request, auth_header: str | None
+) -> OIDCBearerContext | None:
+    """Return what validating this request's IdP access token needs, else ``None``.
+
+    ``None`` unless the deployment accepts access tokens and the header holds
+    an asymmetrically signed JWT, so a session JWT or API token costs one
+    header parse.  Refreshes the cached key set (rate-limited) when the token
+    names a key it lacks, which is how IdP key rotation is picked up, and when
+    the set has reached its maximum age, which is how a withdrawn key is
+    dropped.  A deployment whose discovery failed at startup retries it here
+    (cooldown-limited), so API callers recover without a browser sign-in.
+    """
+    token = _extract_bearer(auth_header)
+    if not token or token.count(".") != 2:
+        return None
+    import jwt
+
+    try:
+        header = jwt.get_unverified_header(token)
+    except jwt.InvalidTokenError:
+        return None
+    if header.get("alg") not in _ALLOWED_ID_TOKEN_ALGS:
+        return None
+    app_state = request.app.state
+    config = oauth_context(app_state).oidc_config
+    if (
+        config is not None
+        and not config.enabled
+        and config.api_allowed_clients
+        and config.api_required_scope
+    ):
+        # Discovery failed at startup (IdP briefly unreachable).  The browser
+        # sign-in handlers heal that; do the same here, or a deployment whose
+        # only traffic is API callers answers 401 until someone restarts it.
+        await maybe_rediscover_oidc(app_state)
+        config = oauth_context(app_state).oidc_config
+    if config is None or not config.api_bearer_enabled:
+        return None
+
+    jwks_data: dict[str, Any] | None = getattr(app_state, "jwks_data", None)
+    kid = header.get("kid")
+    now = time.monotonic()
+    fresh_at: float | None = getattr(app_state, "oidc_bearer_jwks_fresh_monotonic", None)
+    if fresh_at is None:
+        # First access token since startup: the set was fetched at discovery.
+        fresh_at = app_state.oidc_bearer_jwks_fresh_monotonic = now
+    expired = now - fresh_at >= _OIDC_BEARER_JWKS_MAX_AGE_S
+    if (expired or not _resolve_kid(jwks_data, kid)) and config.jwks_uri:
+        last: float | None = getattr(app_state, "oidc_bearer_jwks_refetch_monotonic", None)
+        if last is None or now - last >= _OIDC_BEARER_JWKS_REFETCH_INTERVAL_S:
+            app_state.oidc_bearer_jwks_refetch_monotonic = now
+            fetched = await _refetch_jwks_locked(request, config.jwks_uri, kid, force=expired)
+            if fetched is not None:
+                jwks_data = fetched
+                app_state.oidc_bearer_jwks_fresh_monotonic = now
+    if jwks_data is None:
+        return None
+    return OIDCBearerContext(config, jwks_data)
+
+
 class AuthMiddleware:
     """ASGI middleware that enforces bearer-token / cookie authentication.
 
@@ -1702,6 +1861,7 @@ class AuthMiddleware:
             jwt_version=self._jwt_version,
             storage=storage,
             cookie_name=self._cookie_name,
+            oidc_bearer=await _oidc_bearer_context(request, auth_header),
         )
         if not allowed:
             body: dict[str, Any] = {"error": msg}
@@ -2257,13 +2417,15 @@ def _resolve_kid(jwks: dict[str, Any] | None, kid: str | None) -> bool:
 
 
 async def _refetch_jwks_locked(
-    request: Request, jwks_uri: str, kid: str | None
+    request: Request, jwks_uri: str, kid: str | None, *, force: bool = False
 ) -> dict[str, Any] | None:
     """Acquire the per-app JWKS refetch lock, re-check the cache, and refetch on miss.
 
     Returns the JWKS dict on success or ``None`` if the fetch failed.  When
     another concurrent caller already refreshed the cache to include *kid*
     we return the existing snapshot without issuing another network call.
+    *force* skips that re-check and always fetches: the caller wants the
+    cached set replaced because of its age, not because a key is missing.
     """
     lock = getattr(request.app.state, "jwks_refetch_lock", None)
     if lock is None:
@@ -2272,7 +2434,7 @@ async def _refetch_jwks_locked(
     http_client = getattr(request.app.state, "oidc_http_client", None)
     async with lock:
         cached: dict[str, Any] | None = getattr(request.app.state, "jwks_data", None)
-        if _resolve_kid(cached, kid):
+        if not force and _resolve_kid(cached, kid):
             return cached
         try:
             fresh = await fetch_jwks(jwks_uri, client=http_client)

@@ -6949,6 +6949,43 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 for r in rows
             ]
 
+    def list_oidc_identities_by_oid(self, issuer: str, oid: str, tid: str) -> list[OIDCIdentity]:
+
+        if not oid or not tid:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(
+                    oidc_identities.c.issuer,
+                    oidc_identities.c.subject,
+                    oidc_identities.c.user_id,
+                    oidc_identities.c.email,
+                    oidc_identities.c.created,
+                    oidc_identities.c.last_login,
+                    oidc_identities.c.oid,
+                    oidc_identities.c.tid,
+                )
+                .where(
+                    (oidc_identities.c.issuer == issuer)
+                    & (oidc_identities.c.oid == oid)
+                    & (oidc_identities.c.tid == tid)
+                )
+                .order_by(oidc_identities.c.created.desc())
+            ).fetchall()
+            return [
+                OIDCIdentity(
+                    issuer=r[0],
+                    subject=r[1],
+                    user_id=r[2],
+                    email=r[3],
+                    created=r[4],
+                    last_login=r[5],
+                    oid=r[6],
+                    tid=r[7],
+                )
+                for r in rows
+            ]
+
     def unlink_oidc_identity(
         self, issuer: str, subject: str, *, model_token_prefix: str
     ) -> OIDCUnlinkResult | None:

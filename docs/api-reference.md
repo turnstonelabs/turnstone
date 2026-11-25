@@ -68,12 +68,17 @@ Include a token in one of two ways:
   automatically by the login endpoint). The names differ so the two surfaces,
   when co-hosted on one origin, don't overwrite each other's session.
 
-The server accepts two token types:
+The server accepts two token types, and a third when the deployment enables it:
 
 | Type | Format | Example |
 |------|--------|---------|
 | JWT | Base64 segments separated by dots | `eyJhbG...` |
 | API token | `ts_` prefix + 64 hex chars | `ts_a1b2c3d4...` |
+| IdP access token (opt-in) | JWT signed by the configured identity provider, `Authorization` header only | `eyJhbG...` |
+
+An IdP access token lets another application call the API as its signed-in
+user, capped at the `read` and `write` scopes. See
+[Access tokens as API credentials](oidc.md#access-tokens-as-api-credentials).
 
 JWTs are the recommended credential for browser sessions. API tokens are suitable for programmatic access and CI/CD.
 

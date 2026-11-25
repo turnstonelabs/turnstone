@@ -1774,6 +1774,16 @@ class StorageBackend(Protocol):
         """List all OIDC identities linked to a turnstone user."""
         ...
 
+    def list_oidc_identities_by_oid(self, issuer: str, oid: str, tid: str) -> list[OIDCIdentity]:
+        """List the identities carrying an Entra object id + tenant id under *issuer*.
+
+        ``oid``+``tid`` name one directory user whichever application the token
+        was issued to, where ``subject`` is pairwise per application.  Several
+        rows can share the pair (one per application the user signed in
+        through); an empty ``oid`` or ``tid`` matches nothing.
+        """
+        ...
+
     def unlink_oidc_identity(
         self, issuer: str, subject: str, *, model_token_prefix: str
     ) -> OIDCUnlinkResult | None:

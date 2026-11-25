@@ -84,6 +84,10 @@ the installer does not copy OIDC variables from `.env` into the services.
 | `TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK` | No | `false` | Allow the issuer (and its discovered endpoints) to resolve to private/internal addresses — needed for a self-hosted IdP on an internal network. See [Self-hosted and internal IdPs](#self-hosted-and-internal-idps). |
 | `TURNSTONE_OIDC_CAPTURE_USER_CREDENTIAL` | No | `false` | Capture an encrypted refresh credential at SSO login for delegated MCP/model access; requires the shared token encryption key. |
 | `TURNSTONE_OIDC_OBO_GRANT_PROFILE` | No | `entra` | Token minting profile supported by the IdP: `entra` or `rfc8693`. See [MCP delegation](mcp-oauth.md#deployment-configuration-oidc-in-configtoml). |
+| `TURNSTONE_OIDC_API_ALLOWED_CLIENTS` | No | — | Comma-separated client IDs of the applications whose access tokens the API accepts (`api_allowed_clients`, a list, in TOML). See [Access tokens as API credentials](#access-tokens-as-api-credentials). |
+| `TURNSTONE_OIDC_API_REQUIRED_SCOPE` | No | — | The one delegated scope such a token must carry (`api_required_scope`). |
+| `TURNSTONE_OIDC_API_AUDIENCE` | No | client ID | Comma-separated `aud` values accepted on such a token (`api_audience`, a list, in TOML). |
+| `TURNSTONE_OIDC_PROMPT` | No | — | OIDC `prompt` sent with the sign-in redirect: `select_account` always shows the IdP's account picker (for people signed in to several accounts), `login` always re-authenticates. Unset leaves the IdP's default. Other values are ignored with a warning. |
 
 All four required fields — issuer, client ID, client secret, and
 `TURNSTONE_OIDC_REDIRECT_BASE` — must be set. If any are missing OIDC
@@ -345,6 +349,154 @@ role_map = {admin = "builtin-admin", operator = "builtin-operator"}
 
 ---
 
+## Access tokens as API credentials
+
+Another application your users sign in to can call the Turnstone API as the
+signed-in user, by sending an access token your identity provider issued for
+Turnstone:
+
+```
+Authorization: Bearer <access token>
+```
+
+The user needs no Turnstone API token, and the calling application stores no
+long-lived Turnstone credential. This is off by default.
+
+### Configuration
+
+Set both keys in `[oidc]` on the console (and on the nodes if clients call them
+directly), then restart:
+
+```toml
+[oidc]
+api_allowed_clients = ["<client id of the calling application>"]
+api_required_scope = "Workstreams.Run"
+```
+
+Setting only one of the two leaves the feature off and logs a warning.
+`api_audience` lists the `aud` values to accept; it defaults to this
+deployment's `client_id`.
+
+### What is accepted
+
+A token is accepted only when all of this holds:
+
+- it is signed by a key in the configured issuer's JWKS, with an asymmetric
+  algorithm, and its `iss` is exactly the configured issuer
+- its `aud` is this deployment's client ID (or one of `api_audience`)
+- it is not expired
+- its `scp` claim contains `api_required_scope` — this is what tells a
+  delegated access token from an ID token, which has the same issuer, audience
+  and signing key
+- its `azp` claim (or `client_id`, when there is no `azp`) is in
+  `api_allowed_clients`
+- it is not an app-only token (`idtyp` is not `app`)
+- it names a user who has already signed in to Turnstone through the browser
+
+The user is matched by the `oid` and `tid` claims when the token has them, and
+by `sub` otherwise. Entra's `sub` is different for every application, so a
+token another application obtained never carries the `sub` Turnstone stored at
+login; `oid` and `tid` are the same everywhere. No account is created on this
+path. A user who has never signed in, or an `oid` linked to more than one
+Turnstone user, gets `401`.
+
+The token is read from the `Authorization` header only, never from a cookie.
+
+The issuer's signing keys are cached. The cache is refreshed when a token names
+a key it does not hold (at most once a minute), and replaced once it is an hour
+old, so a key the provider withdraws stops being accepted within the hour. If
+that hourly refresh fails, the cached keys stay in use and the refresh is
+retried each minute. To drop a withdrawn key at once, restart the console (and
+any node that accepts these tokens).
+
+If the provider was unreachable when Turnstone started, the first access token
+presented afterwards retries discovery (at most once a minute), as a browser
+sign-in does.
+
+### What the caller may do
+
+The request runs as that user, with the user's roles, capped:
+
+- scopes are at most `read` and `write`, so the caller can create, message,
+  read and close workstreams, and cannot settle approvals or reach
+  `/v1/api/admin/`
+- the `approve` permission and every `admin.*` permission are dropped
+- the token cannot be turned into a browser session (`/v1/api/auth/refresh`
+  refuses it)
+
+A user whose roles grant nothing can do nothing through this path either.
+`auto_approve` in a create request is honoured for these callers as it is for
+any caller with `write`, so tool policies remain the control on what a run may
+execute.
+
+Tools that use sign-in passthrough (`auth_type=oauth_obo`) work in a run
+started this way, because they mint from the credential captured at the user's
+last browser sign-in, not from the presented token. See
+[MCP authentication](mcp-oauth.md).
+
+### What a caller should expect
+
+- **Send a project when the deployment requires one.** With
+  `server.require_project` on, a create without `project_id` answers `400`
+  with `code: "require_project"`. `GET /v1/api/projects` works with the same
+  token and lists the projects the user can file into.
+- **A user with no permissions can do nothing.** Every request, `whoami`
+  included, answers `403 Forbidden: token lacks 'read' scope`.
+- **An account is not always a stored credential.** Sign-in passthrough tools
+  and model aliases that authenticate per user need the credential captured at
+  a completed browser sign-in. A user whose account exists without one (a first
+  sign-in that was refused, or a credential since revoked) can still create a
+  workstream: the create answers `200` and the run then fails with a missing
+  credential, visible only in the workstream's state. Have the user sign in to
+  Turnstone once, and read the workstream's state rather than trusting the
+  create response alone.
+
+- **A later message may need the workstream reopened first.** A workstream is
+  unloaded when its node restarts or evicts it as idle, and
+  `POST /v1/api/route/workstreams/{ws_id}/send` then answers `404`; the
+  conversation is saved, not gone. `GET /v1/api/route/workstreams/{ws_id}/live`
+  says whether it is loaded. To continue it, reopen it on its node through the
+  console, `POST /node/{node_id}/v1/api/workstreams/{ws_id}/open` (the
+  `node_id` comes from the create response or `GET /v1/api/route?ws_id=`), and
+  send again. A caller that answers a `404` by creating a new workstream
+  starts a second conversation and loses the first one's history.
+
+### Entra ID setup
+
+1. On Turnstone's app registration, under **Expose an API**, set the
+   Application ID URI and add a scope (for example `Workstreams.Run`) that
+   admins and users can consent to.
+2. In the app registration's manifest, set `requestedAccessTokenVersion`
+   (`api.requestedAccessTokenVersion`) to `2`. A version 1 token has a
+   different issuer and is refused.
+3. Under **Expose an API** > **Authorized client applications**, add the
+   calling application's client ID for that scope, or grant it the delegated
+   permission with admin consent.
+4. Put the same client ID in `api_allowed_clients` and the scope's name (the
+   part after the last `/`) in `api_required_scope`.
+
+If Turnstone's enterprise application has **Assignment required** turned on,
+Entra issues this token only for users assigned to Turnstone; for anyone else
+the calling application's token request fails with `AADSTS50105` before
+Turnstone is involved.
+
+The calling application then requests a token for the scope
+`<Application ID URI>/Workstreams.Run` as its signed-in user — through
+its own sign-in when it is a web or single-page application, or through the
+on-behalf-of flow when it is itself an API — and sends it to Turnstone.
+
+### Troubleshooting
+
+Every refusal is a plain `401 Unauthorized: missing or invalid token`. The
+reason is in the console log at `INFO`, on a line starting
+`oidc.bearer: token refused:`. No such line for a request means the feature is
+off, OIDC discovery has not completed, or the header did not hold an
+asymmetrically signed JWT. `403 Forbidden: token lacks '<scope>' scope` means
+the token was accepted and the route needs more than the cap or the user's
+roles allow.
+
+---
+
 ## Role Mapping
 
 OIDC role mapping assigns Turnstone roles to users based on claims in the
@@ -556,6 +708,10 @@ callback validation. Entries are automatically cleaned up after 5 minutes.
 - **ID token validation**: all tokens are validated using the provider's
   JWKS public keys (RS256 or ES256). The signature, issuer, audience,
   and expiry are all checked.
+- **Access tokens**: accepted as API credentials only when configured, only
+  from allow-listed clients, only with the required delegated scope, and only
+  for users who already have an account. See
+  [Access tokens as API credentials](#access-tokens-as-api-credentials).
 - **State parameter**: a cryptographically random state token prevents
   CSRF attacks on the callback endpoint. The state is stored server-side
   and verified on callback.
