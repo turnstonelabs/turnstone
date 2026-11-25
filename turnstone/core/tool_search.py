@@ -8,6 +8,7 @@ models (vLLM, llama.cpp) use the client-side BM25 fallback here.
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from typing import TYPE_CHECKING, Any
@@ -107,7 +108,12 @@ class ToolSearchManager:
         max_results: int = 5,
         reranker: Reranker | None = None,
         status_provider: Callable[[], dict[str, dict[str, Any]]] | None = None,
+        delivery: str = "expand",
     ) -> None:
+        # "expand" (default): a search adds the tools it found to the wire
+        # list.  "dispatch": the wire list is fixed; a search returns schemas
+        # as text and the model calls the tool through ``call_tool``.
+        self.delivery = "dispatch" if delivery == "dispatch" else "expand"
         self._always_on: list[dict[str, Any]] = []
         self._deferred: list[dict[str, Any]] = []
         self._deferred_by_name: dict[str, dict[str, Any]] = {}
@@ -138,8 +144,14 @@ class ToolSearchManager:
         self._server_hint = _mcp_server_summary(self._deferred)
 
     def get_visible_tools(self) -> list[dict[str, Any]]:
-        """Return always-on tools + any expanded (discovered) tools."""
+        """Return always-on tools + any expanded (discovered) tools.
+
+        In dispatch delivery discovered tools never join the wire list, so
+        this is the always-on tools alone.
+        """
         result = list(self._always_on)
+        if self.delivery == "dispatch":
+            return result
         for name in self._expanded:
             tool = self._deferred_by_name.get(name)
             if tool:
@@ -163,11 +175,11 @@ class ToolSearchManager:
         # Indices map 1:1 to self._deferred (the index was built over it in
         # order). Cheap: the tool corpus is small (tens, not thousands).
         indices = self._index.search(query, k=max(len(self._deferred), 1))
-        matched = [
-            self._deferred[i]
-            for i in indices
-            if _tool_name(self._deferred[i]) not in self._expanded
-        ]
+        # In dispatch delivery a found tool's schema lives only in the
+        # transcript, where compaction can drop it, so a repeated search must
+        # be able to return the tool again.
+        skip: Any = () if self.delivery == "dispatch" else self._expanded
+        matched = [self._deferred[i] for i in indices if _tool_name(self._deferred[i]) not in skip]
         self._last_total_matched = len(matched)
         return matched[: self._max_results]
 
@@ -179,6 +191,10 @@ class ToolSearchManager:
         """O(1) membership check for the discovered set — the per-tool
         visibility filter runs per LLM turn, so no list construction."""
         return name in self._expanded
+
+    def deferred_tool(self, name: str) -> dict[str, Any] | None:
+        """The definition of a deferred (searchable) tool, or ``None``."""
+        return self._deferred_by_name.get(name)
 
     def expand_visible(self, tool_names: list[str]) -> list[dict[str, Any]]:
         """Promote discovered tools to the visible set.
@@ -199,13 +215,23 @@ class ToolSearchManager:
         The description includes a dynamic hint listing available MCP
         server names and tool counts so the model can craft specific queries.
         """
-        desc = (
-            "Search for available tools by keyword. Returns matching tool "
-            "names and descriptions. Use this when you need a capability "
-            "not available in your current tool set."
-        )
-        if self._server_hint:
-            desc += f" Available tool servers: {self._server_hint}."
+        if self.delivery == "dispatch":
+            # Byte-identical for the life of the session: the server summary,
+            # which changes as MCP pools prime, goes in the results instead.
+            desc = (
+                "Search for available tools by keyword. Returns matching tool "
+                "names, descriptions and argument schemas. Use this when you "
+                "need a capability not available in your current tool set, then "
+                "call the tool you found with call_tool."
+            )
+        else:
+            desc = (
+                "Search for available tools by keyword. Returns matching tool "
+                "names and descriptions. Use this when you need a capability "
+                "not available in your current tool set."
+            )
+            if self._server_hint:
+                desc += f" Available tool servers: {self._server_hint}."
         return {
             "type": "function",
             "function": {
@@ -262,6 +288,8 @@ class ToolSearchManager:
         mistaken for a missing capability.
         """
         unavailable = self._unavailable_servers()
+        dispatch = self.delivery == "dispatch"
+        servers = f" Tool servers: {self._server_hint}." if dispatch and self._server_hint else ""
         if not tools:
             if unavailable:
                 return (
@@ -271,20 +299,30 @@ class ToolSearchManager:
                     "tools until it recovers, so this may be an outage rather "
                     "than a missing capability."
                 )
-            return "No matching tools found. Try a different search query."
+            return "No matching tools found. Try a different search query." + servers
         lines = []
         for tool in tools:
             fn = tool.get("function", {})
             name = fn.get("name", "")
             desc = fn.get("description", "")
-            lines.append(f"- **{name}**: {desc}")
+            line = f"- **{name}**: {desc}"
+            if dispatch:
+                schema = fn.get("parameters") or {"type": "object", "properties": {}}
+                line += "\n  arguments schema: " + json.dumps(schema, separators=(",", ":"))
+            lines.append(line)
         out = f"Found {len(tools)} matching tool(s):\n" + "\n".join(lines)
         if self._last_total_matched > len(tools):
             out += (
                 f"\n\n(Showing the top {len(tools)} of {self._last_total_matched} "
                 "matches — narrow your query to surface the rest.)"
             )
-        out += "\n\nThese tools are now available for use."
+        if dispatch:
+            out += (
+                "\n\nTo use one, call call_tool with its exact name and an arguments "
+                "object that matches its schema." + servers
+            )
+        else:
+            out += "\n\nThese tools are now available for use."
         if unavailable:
             out += (
                 "\n\n⚠ Some tool servers are currently unavailable, so their "

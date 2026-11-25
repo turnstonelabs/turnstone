@@ -927,6 +927,7 @@ Tool search is configured in `config.toml` under the `[tools]` section:
 search = "auto"           # "auto", "on", or "off"
 search_threshold = 20     # minimum total tool count to activate
 search_max_results = 5    # max tools returned per search call
+search_delivery = "expand"  # "expand" or "dispatch" (see below)
 ```
 
 CLI flags override the config file:
@@ -935,6 +936,37 @@ CLI flags override the config file:
   decide based on threshold (default: `auto`).
 - `--tool-search-threshold N` -- minimum tool count to activate (default: 20).
 - `--tool-search-max-results N` -- max results per search (default: 5).
+- `--tool-search-delivery {expand,dispatch}` -- how a found tool reaches the model
+  (default: `expand`).
+
+### Dispatch delivery (experimental)
+
+By default a client-side search *expands* the request's tool list with the tools
+it found. `search_delivery = "dispatch"` keeps the tool list fixed instead:
+
+- The model is sent the always-on tools, `tool_search`, and one generic
+  `call_tool(name, arguments)`. Neither definition contains catalog data, so
+  the tool list is byte-identical for the life of the session, and the system
+  prompt is not recomposed after a search.
+- A search result lists each match's argument schema as text. The model calls a
+  found tool as `call_tool(name="<tool>", arguments={...})`.
+- `call_tool` is unwrapped before anything keys on the tool name: tool
+  policies, approval, the judge, audit and the UI see the real tool. The stored
+  transcript keeps the `call_tool` call as it went over the wire.
+- `call_tool` reaches MCP tools only, never a built-in, and under a persona
+  visibility set only tools a search has returned in the session.
+- Because no provider checks the inner arguments against a declared schema,
+  Turnstone does: a value sent as a string where the schema declares an
+  integer, number, boolean, array or object is converted when that is
+  lossless (`"3600"` to `3600`), then the arguments are validated. A failure
+  goes back to the model with the field, the reason and the schema, and never
+  reaches approval or the MCP server.
+- With this setting on, provider-native deferred loading (tiers 1 and 2) is not
+  used: every provider gets the same static list.
+
+Use it where a changing tool list is costly: prompt-prefix caching, and
+providers that bind replayed reasoning to the tool list of the request that
+produced it. The setting applies to new workstreams.
 
 ### How it works
 

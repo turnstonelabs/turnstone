@@ -1776,6 +1776,13 @@ def main() -> None:
         help="Max tools returned per tool search query (default: 5)",
     )
     parser.add_argument(
+        "--tool-search-delivery",
+        choices=["expand", "dispatch"],
+        default="expand",
+        help="How a found tool reaches the model: expand (add it to the tool list) or "
+        "dispatch (fixed tool list, call it through call_tool) (default: expand)",
+    )
+    parser.add_argument(
         "--web-search-backend",
         default="",
         metavar="BACKEND",
@@ -2085,6 +2092,7 @@ def main() -> None:
             tool_search=args.tool_search,
             tool_search_threshold=args.tool_search_threshold,
             tool_search_max_results=args.tool_search_max_results,
+            tool_search_delivery=args.tool_search_delivery,
             web_search_backend=args.web_search_backend,
             skill=skill or args.skill or None,
             judge_config=judge_config,
