@@ -96,6 +96,7 @@ all = ["turnstone[discord,slack]"]
 turnstone = "turnstone.cli:main"
 turnstone-eval = "turnstone.eval.cli:main"
 turnstone-optimizer = "turnstone.optimizer:main"
+turnstone-rollout = "turnstone.rollout.cli:main"
 turnstone-server = "turnstone.server:main"
 turnstone-console = "turnstone.console.server:main"
 turnstone-admin = "turnstone.admin:main"
@@ -107,6 +108,7 @@ include = [
   "turnstone/**/*.py",
   "turnstone/prompts/**/*.md",
   "turnstone/tools/*.json",
+  "turnstone/rollout/*.json",
   "turnstone/ui/static/*.html",
   "turnstone/ui/static/*.css",
   "turnstone/ui/static/*.js",

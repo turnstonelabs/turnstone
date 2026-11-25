@@ -16,6 +16,7 @@
     "required": ["query"]
   },
   "task_agent": true,
+  "environment": true,
   "auto_approve": true,
   "primary_key": "query",
   "cwd_note": "Relative paths resolve against {working_dir}.",

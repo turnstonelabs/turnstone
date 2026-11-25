@@ -1,0 +1,157 @@
+{
+  "name": "rollout-sandbox",
+  "about": "What a rollout refuses or notes in its own throwaway container. A rule that says deny refuses the call; one that says review lets it run and records it. Rules are tried in this order and the first that matches decides.",
+  "rules": [
+    {
+      "name": "wipe-root",
+      "arg_patterns": [
+        "(?:(\\b(?:ba|da|z|k)?sh\\s{1,8}(?:-[A-Za-z]{1,8}\\s{1,8}){1,4}['\"](?:[^'\"]{0,200}[;&|\\n])?)|^|[;&|{\\n]|\\$\\()[ \\t]{0,8}(?:(?:(?:sudo|exec|time|nohup|xargs|command|env|nice|timeout)(?:\\s{1,8}(?:-{1,2}[A-Za-z0-9][A-Za-z0-9=,.:_-]{0,30}(?:\\s{1,8}[A-Za-z0-9_.:=/-]{1,40})?|[0-9][0-9.]{0,10}[smhd]?)){0,3}|[A-Za-z_][A-Za-z0-9_]{0,40}=[^\\s;&|()<>'\"`$]{0,80}|(?:then|do|else|elif|if|while|until|!))\\s{1,8}|\\(\\s{0,8}){0,4}(?:/(?:usr/(?:local/)?)?s?bin/)?rm\\s{1,8}(?:-[A-Za-z]{1,16}\\s{1,8}|--[a-z][a-z-]{0,30}\\s{1,8}){0,8}/\\*?(?(1)(?:\\s|$|[;&|)'\"])|(?:\\s|$|[;&|)]))",
+        "(?:(\\b(?:ba|da|z|k)?sh\\s{1,8}(?:-[A-Za-z]{1,8}\\s{1,8}){1,4}['\"](?:[^'\"]{0,200}[;&|\\n])?)|^|[;&|{\\n]|\\$\\()[ \\t]{0,8}(?:(?:(?:sudo|exec|time|nohup|xargs|command|env|nice|timeout)(?:\\s{1,8}(?:-{1,2}[A-Za-z0-9][A-Za-z0-9=,.:_-]{0,30}(?:\\s{1,8}[A-Za-z0-9_.:=/-]{1,40})?|[0-9][0-9.]{0,10}[smhd]?)){0,3}|[A-Za-z_][A-Za-z0-9_]{0,40}=[^\\s;&|()<>'\"`$]{0,80}|(?:then|do|else|elif|if|while|until|!))\\s{1,8}|\\(\\s{0,8}){0,4}(?:/(?:usr/(?:local/)?)?s?bin/)?rm\\b[^\\n;&|]{0,200}--no-preserve-root",
+        "(?:(\\b(?:ba|da|z|k)?sh\\s{1,8}(?:-[A-Za-z]{1,8}\\s{1,8}){1,4}['\"](?:[^'\"]{0,200}[;&|\\n])?)|^|[;&|{\\n]|\\$\\()[ \\t]{0,8}(?:(?:(?:sudo|exec|time|nohup|xargs|command|env|nice|timeout)(?:\\s{1,8}(?:-{1,2}[A-Za-z0-9][A-Za-z0-9=,.:_-]{0,30}(?:\\s{1,8}[A-Za-z0-9_.:=/-]{1,40})?|[0-9][0-9.]{0,10}[smhd]?)){0,3}|[A-Za-z_][A-Za-z0-9_]{0,40}=[^\\s;&|()<>'\"`$]{0,80}|(?:then|do|else|elif|if|while|until|!))\\s{1,8}|\\(\\s{0,8}){0,4}(?:/(?:usr/(?:local/)?)?s?bin/)?rm\\s{1,8}(?:-[A-Za-z]{1,16}\\s{1,8}|--[a-z][a-z-]{0,30}\\s{1,8}){0,8}/(?:etc|usr|var|home|boot|lib|lib64|bin|sbin|root)/?(?(1)(?:\\s|$|[;&|)'\"])|(?:\\s|$|[;&|)]))"
+      ],
+      "intent_template": "Delete the file system or a whole system directory: {arg_snippet}",
+      "reasoning_template": "it deletes the root of the file system or a whole system directory",
+      "risk_level": "critical",
+      "confidence": 0.95,
+      "recommendation": "deny",
+      "tool_pattern": "bash",
+      "tier": "critical",
+      "priority": 0
+    },
+    {
+      "name": "block-device-write",
+      "arg_patterns": [
+        "\\bof=/dev/(?:sd|nvme|vd|xvd|hd|dm-|md|loop|disk/)",
+        ">\\s{0,8}/dev/(?:sd|nvme|vd|xvd|hd|dm-|md|disk/)",
+        "(?:^|[;&|(\\n]\\s{0,8}|\\bsudo\\s{1,8})(?:mkfs(?:\\.\\w{1,16})?|wipefs)\\b[^\\n;&|]{0,200}\\s/dev/(?:sd|nvme|vd|xvd|hd|dm-|md|loop|disk/|mapper/)"
+      ],
+      "intent_template": "Write to a block device: {arg_snippet}",
+      "reasoning_template": "it writes to a block device or makes a file system on one",
+      "risk_level": "critical",
+      "confidence": 0.95,
+      "recommendation": "deny",
+      "tool_pattern": "bash",
+      "tier": "critical",
+      "priority": 0
+    },
+    {
+      "name": "fork-bomb",
+      "arg_patterns": [
+        ":\\(\\)\\s{0,8}\\{\\s{0,8}:\\s{0,8}\\|\\s{0,8}:\\s{0,8}&\\s{0,8}\\}\\s{0,8};\\s{0,8}:"
+      ],
+      "intent_template": "Start processes without end: {arg_snippet}",
+      "reasoning_template": "it starts processes without end",
+      "risk_level": "critical",
+      "confidence": 0.95,
+      "recommendation": "deny",
+      "tool_pattern": "bash",
+      "tier": "critical",
+      "priority": 0
+    },
+    {
+      "name": "signal-every-process",
+      "arg_patterns": [
+        "(?:(\\b(?:ba|da|z|k)?sh\\s{1,8}(?:-[A-Za-z]{1,8}\\s{1,8}){1,4}['\"](?:[^'\"]{0,200}[;&|\\n])?)|^|[;&|{\\n]|\\$\\()[ \\t]{0,8}(?:(?:(?:sudo|exec|time|nohup|xargs|command|env|nice|timeout)(?:\\s{1,8}(?:-{1,2}[A-Za-z0-9][A-Za-z0-9=,.:_-]{0,30}(?:\\s{1,8}[A-Za-z0-9_.:=/-]{1,40})?|[0-9][0-9.]{0,10}[smhd]?)){0,3}|[A-Za-z_][A-Za-z0-9_]{0,40}=[^\\s;&|()<>'\"`$]{0,80}|(?:then|do|else|elif|if|while|until|!))\\s{1,8}|\\(\\s{0,8}){0,4}(?:/(?:usr/(?:local/)?)?s?bin/)?kill\\s{1,8}(?:-s\\s{1,8}['\"]?[A-Za-z0-9+]{1,16}['\"]?\\s{1,8}|-[A-Za-z0-9]{1,16}\\s{1,8}){1,4}(?:--\\s{1,8})?(?:-1|'-1'|\"-1\")(?(1)(?:\\s|$|[;&|)'\"])|(?:\\s|$|[;&|)]))",
+        "(?:(\\b(?:ba|da|z|k)?sh\\s{1,8}(?:-[A-Za-z]{1,8}\\s{1,8}){1,4}['\"](?:[^'\"]{0,200}[;&|\\n])?)|^|[;&|{\\n]|\\$\\()[ \\t]{0,8}(?:(?:(?:sudo|exec|time|nohup|xargs|command|env|nice|timeout)(?:\\s{1,8}(?:-{1,2}[A-Za-z0-9][A-Za-z0-9=,.:_-]{0,30}(?:\\s{1,8}[A-Za-z0-9_.:=/-]{1,40})?|[0-9][0-9.]{0,10}[smhd]?)){0,3}|[A-Za-z_][A-Za-z0-9_]{0,40}=[^\\s;&|()<>'\"`$]{0,80}|(?:then|do|else|elif|if|while|until|!))\\s{1,8}|\\(\\s{0,8}){0,4}(?:/(?:usr/(?:local/)?)?s?bin/)?kill\\s{1,8}--\\s{1,8}(?:-1|'-1'|\"-1\")(?(1)(?:\\s|$|[;&|)'\"])|(?:\\s|$|[;&|)]))",
+        "(?:(\\b(?:ba|da|z|k)?sh\\s{1,8}(?:-[A-Za-z]{1,8}\\s{1,8}){1,4}['\"](?:[^'\"]{0,200}[;&|\\n])?)|^|[;&|{\\n]|\\$\\()[ \\t]{0,8}(?:(?:(?:sudo|exec|time|nohup|xargs|command|env|nice|timeout)(?:\\s{1,8}(?:-{1,2}[A-Za-z0-9][A-Za-z0-9=,.:_-]{0,30}(?:\\s{1,8}[A-Za-z0-9_.:=/-]{1,40})?|[0-9][0-9.]{0,10}[smhd]?)){0,3}|[A-Za-z_][A-Za-z0-9_]{0,40}=[^\\s;&|()<>'\"`$]{0,80}|(?:then|do|else|elif|if|while|until|!))\\s{1,8}|\\(\\s{0,8}){0,4}(?:/(?:usr/(?:local/)?)?s?bin/)?killall5\\b"
+      ],
+      "intent_template": "Send a signal to every process: {arg_snippet}",
+      "reasoning_template": "it sends a signal to every process there is",
+      "risk_level": "critical",
+      "confidence": 0.95,
+      "recommendation": "deny",
+      "tool_pattern": "bash",
+      "tier": "critical",
+      "priority": 0
+    },
+    {
+      "name": "power-state",
+      "arg_patterns": [
+        "(?:^|[;&|(][ \\t]{0,8}|\\bsudo\\s{1,8}|\\bexec\\s{1,8})(?:shutdown|reboot|halt|poweroff)(?:\\s{1,8}(?:-[A-Za-z0-9=-]{1,16}|now|\\+\\d{1,5}|\\d\\d:\\d\\d)){0,6}[ \\t]{0,8}(?:$|[;&\\n]|\\|(?![A-Za-z0-9_*?|-]{1,40}\\)))",
+        "^(?:[^'\"<]|<(?!<)|'[^']{0,2000}'|\"[^\"]{0,2000}\"){0,2000}\\n[ \\t]{0,8}(?:shutdown|reboot|halt|poweroff)(?:\\s{1,8}(?:-[A-Za-z0-9=-]{1,16}|now|\\+\\d{1,5}|\\d\\d:\\d\\d)){0,6}[ \\t]{0,8}(?:$|[;&\\n]|\\|(?![A-Za-z0-9_*?|-]{1,40}\\)))",
+        "\\((?:[^()\\n]{0,200}[;&|])?[ \\t]{0,8}(?:sudo\\s{1,8}|exec\\s{1,8})?(?:shutdown|reboot|halt|poweroff)(?:\\s{1,8}(?:-[A-Za-z0-9=-]{1,16}|now|\\+\\d{1,5}|\\d\\d:\\d\\d)){0,6}[ \\t]{0,8}\\)",
+        "\\bsystemctl\\s{1,8}(?:poweroff|reboot|halt)\\b",
+        "(?:^|[;&|(\\n]\\s{0,8}|\\bsudo\\s{1,8})(?:tel)?init\\s{1,8}[06]\\s{0,8}(?:$|[;&|)\\n])"
+      ],
+      "intent_template": "Turn the machine off or restart it: {arg_snippet}",
+      "reasoning_template": "it turns the machine off or restarts it",
+      "risk_level": "critical",
+      "confidence": 0.95,
+      "recommendation": "deny",
+      "tool_pattern": "bash",
+      "tier": "critical",
+      "priority": 0
+    },
+    {
+      "name": "move-root",
+      "arg_patterns": [
+        "(?:(\\b(?:ba|da|z|k)?sh\\s{1,8}(?:-[A-Za-z]{1,8}\\s{1,8}){1,4}['\"](?:[^'\"]{0,200}[;&|\\n])?)|^|[;&|{\\n]|\\$\\()[ \\t]{0,8}(?:(?:(?:sudo|exec|time|nohup|xargs|command|env|nice|timeout)(?:\\s{1,8}(?:-{1,2}[A-Za-z0-9][A-Za-z0-9=,.:_-]{0,30}(?:\\s{1,8}[A-Za-z0-9_.:=/-]{1,40})?|[0-9][0-9.]{0,10}[smhd]?)){0,3}|[A-Za-z_][A-Za-z0-9_]{0,40}=[^\\s;&|()<>'\"`$]{0,80}|(?:then|do|else|elif|if|while|until|!))\\s{1,8}|\\(\\s{0,8}){0,4}(?:/(?:usr/(?:local/)?)?s?bin/)?mv\\s{1,8}(?:-(?![A-Za-z]{0,15}t\\s)[A-Za-z]{1,16}\\s{1,8}|--(?!target-directory\\s)[a-z][a-z-]{0,30}\\s{1,8}){0,8}/\\s"
+      ],
+      "intent_template": "Move the root of the file system: {arg_snippet}",
+      "reasoning_template": "it moves the root of the file system",
+      "risk_level": "critical",
+      "confidence": 0.95,
+      "recommendation": "deny",
+      "tool_pattern": "bash",
+      "tier": "critical",
+      "priority": 0
+    },
+    {
+      "name": "chmod-root",
+      "arg_patterns": [
+        "(?:(\\b(?:ba|da|z|k)?sh\\s{1,8}(?:-[A-Za-z]{1,8}\\s{1,8}){1,4}['\"](?:[^'\"]{0,200}[;&|\\n])?)|^|[;&|{\\n]|\\$\\()[ \\t]{0,8}(?:(?:(?:sudo|exec|time|nohup|xargs|command|env|nice|timeout)(?:\\s{1,8}(?:-{1,2}[A-Za-z0-9][A-Za-z0-9=,.:_-]{0,30}(?:\\s{1,8}[A-Za-z0-9_.:=/-]{1,40})?|[0-9][0-9.]{0,10}[smhd]?)){0,3}|[A-Za-z_][A-Za-z0-9_]{0,40}=[^\\s;&|()<>'\"`$]{0,80}|(?:then|do|else|elif|if|while|until|!))\\s{1,8}|\\(\\s{0,8}){0,4}(?:/(?:usr/(?:local/)?)?s?bin/)?chmod\\s{1,8}(?:-[A-Za-z]{1,16}\\s{1,8}|--[a-z][a-z-]{0,30}\\s{1,8}){0,8}[0-7]?777\\s{1,8}/(?(1)(?:\\s|$|[;&|)'\"])|(?:\\s|$|[;&|)]))"
+      ],
+      "intent_template": "Open the whole file system to everyone: {arg_snippet}",
+      "reasoning_template": "it opens the whole file system to everyone",
+      "risk_level": "critical",
+      "confidence": 0.95,
+      "recommendation": "deny",
+      "tool_pattern": "bash",
+      "tier": "critical",
+      "priority": 0
+    },
+    {
+      "name": "pipe-to-shell",
+      "arg_patterns": [
+        "\\b(?:curl|wget)\\b(?:[^\\n|]{0,200}\\|){1,3}\\s{0,8}(?:sudo\\s{1,8})?(?:ba|da|z)?sh\\b"
+      ],
+      "intent_template": "Run what a download sends: {arg_snippet}",
+      "reasoning_template": "it runs what a download sends without looking at it",
+      "risk_level": "high",
+      "confidence": 0.8,
+      "recommendation": "review",
+      "tool_pattern": "bash",
+      "tier": "high",
+      "priority": 0
+    },
+    {
+      "name": "download-exec",
+      "arg_patterns": [
+        "\\b(?:curl|wget)\\b(?=[^\\n&]{0,300}\\s-o\\s)[^\\n&]{0,300}&&[^\\n&]{0,100}(?:chmod\\s{1,8}\\+x|bash|sh|python3?|node)(?:\\s|$)",
+        "\\b(?:curl|wget)\\s{1,8}\\S[^\\n&]{0,300}&&\\s{0,8}(?:bash|sh|python3?|node)(?:\\s|$)"
+      ],
+      "intent_template": "Download and run: {arg_snippet}",
+      "reasoning_template": "it downloads a program and runs it",
+      "risk_level": "high",
+      "confidence": 0.8,
+      "recommendation": "review",
+      "tool_pattern": "bash",
+      "tier": "high",
+      "priority": 0
+    },
+    {
+      "name": "destructive-git",
+      "arg_patterns": [
+        "\\bgit\\s{1,8}(?:reset\\s{1,8}--hard|push\\s{1,8}--force|push\\s{1,8}-f|clean\\s{1,8}-[a-z]{0,16}f)"
+      ],
+      "intent_template": "Discard work kept by git: {arg_snippet}",
+      "reasoning_template": "it discards work that git kept",
+      "risk_level": "high",
+      "confidence": 0.8,
+      "recommendation": "review",
+      "tool_pattern": "bash",
+      "tier": "high",
+      "priority": 0
+    }
+  ]
+}
