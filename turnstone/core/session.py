@@ -3960,7 +3960,11 @@ class ChatSession:
         self._tool_search_max_results = tool_search_max_results
         # "dispatch" keeps the wire tool list fixed and routes found tools
         # through ``call_tool`` (turnstone.core.tool_dispatch); anything else
-        # is today's expand-on-search.
+        # is today's expand-on-search.  A persona opts in by itself, whatever
+        # the deployment setting, by listing ``call_tool`` in its visible
+        # tools beside ``tool_search``.
+        if self._persona_tools is not None and CALL_TOOL_NAME in self._persona_tools:
+            tool_search_delivery = "dispatch"
         self._tool_search_delivery = tool_search_delivery
         # Identical failing ``call_tool`` calls, counted so the error can say so.
         self._call_tool_failures: dict[str, int] = {}

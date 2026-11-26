@@ -964,6 +964,10 @@ it found. `search_delivery = "dispatch"` keeps the tool list fixed instead:
 - With this setting on, provider-native deferred loading (tiers 1 and 2) is not
   used: every provider gets the same static list.
 
+A persona can opt in by itself, whatever the deployment setting: list
+`call_tool` in its visible tools beside `tool_search`. That makes it possible
+to run the two deliveries side by side, one persona each, on one deployment.
+
 Use it where a changing tool list is costly: prompt-prefix caching, and
 providers that bind replayed reasoning to the tool list of the request that
 produced it. The setting applies to new workstreams.

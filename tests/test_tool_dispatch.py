@@ -346,3 +346,45 @@ def test_a_hard_persona_set_has_neither_tool(tmp_db) -> None:
     assert "tool_search" not in names and CALL_TOOL_NAME not in names
     item = session._prepare_tool(_call(CALL_TOOL_NAME, {"name": DOCS, "arguments": {}}))
     assert "is not available now" in item["error"]
+
+
+def test_a_persona_opts_in_by_listing_call_tool(tmp_db) -> None:
+    """With the deployment on expand, a persona that lists call_tool gets dispatch."""
+    persona = PersonaSnapshot(
+        name="meta",
+        prompt="",
+        tools=frozenset({"tool_search", CALL_TOOL_NAME, "memory"}),
+        mcp=True,
+        memory=True,
+    )
+    session = make_session(mcp_client=_mcp(), persona_snapshot=persona)
+
+    before = json.dumps(_wire(session))
+    session._exec_tool_search({"call_id": "s", "query": "logs"})
+    assert json.dumps(_wire(session)) == before
+    assert _names(json.loads(before))[-2:] == ["tool_search", CALL_TOOL_NAME]
+    item = session._prepare_tool(
+        _call(CALL_TOOL_NAME, {"name": LOGS, "arguments": {"source": "fw", "since_seconds": 5}})
+    )
+    assert item["func_name"] == LOGS and "error" not in item
+
+
+def test_a_persona_without_call_tool_follows_the_deployment(tmp_db) -> None:
+    persona = PersonaSnapshot(
+        name="plain", prompt="", tools=frozenset({"tool_search", "memory"}), mcp=True, memory=True
+    )
+    session = make_session(mcp_client=_mcp(), persona_snapshot=persona)
+
+    assert CALL_TOOL_NAME not in _names(_wire(session))
+    session._exec_tool_search({"call_id": "s", "query": "logs"})
+    assert LOGS in _names(_wire(session))
+
+
+def test_call_tool_without_tool_search_is_still_a_hard_set(tmp_db) -> None:
+    persona = PersonaSnapshot(
+        name="odd", prompt="", tools=frozenset({CALL_TOOL_NAME, "memory"}), mcp=True, memory=True
+    )
+    session = make_session(mcp_client=_mcp(), persona_snapshot=persona)
+
+    names = _names(_wire(session))
+    assert "tool_search" not in names and CALL_TOOL_NAME not in names
