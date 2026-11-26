@@ -282,6 +282,13 @@ from turnstone.core.tool_advisory import (
     output_guard_advisory,
     render_user_interjection,
 )
+from turnstone.core.tool_dispatch import (
+    CALL_TOOL_NAME,
+    call_tool_definition,
+    repair_arguments,
+    unwrap_call,
+    validation_error,
+)
 from turnstone.core.tool_search import ToolSearchManager
 from turnstone.core.tools import (
     BUILTIN_TOOL_NAMES,
@@ -3227,6 +3234,7 @@ class ChatSession:
         tool_search: str = "auto",
         tool_search_threshold: int = 20,
         tool_search_max_results: int = 5,
+        tool_search_delivery: str = "expand",
         skill: str | None = None,
         skill_arguments: str = "",
         judge_config: JudgeConfig | None = None,
@@ -3950,6 +3958,16 @@ class ChatSession:
         self._tool_search_setting = tool_search
         self._tool_search_threshold = tool_search_threshold
         self._tool_search_max_results = tool_search_max_results
+        # "dispatch" keeps the wire tool list fixed and routes found tools
+        # through ``call_tool`` (turnstone.core.tool_dispatch); anything else
+        # is today's expand-on-search.  A persona opts in by itself, whatever
+        # the deployment setting, by listing ``call_tool`` in its visible
+        # tools beside ``tool_search``.
+        if self._persona_tools is not None and CALL_TOOL_NAME in self._persona_tools:
+            tool_search_delivery = "dispatch"
+        self._tool_search_delivery = tool_search_delivery
+        # Identical failing ``call_tool`` calls, counted so the error can say so.
+        self._call_tool_failures: dict[str, int] = {}
         self._tool_search: ToolSearchManager | None = None
         if self._persona_tool_search_blocked():
             # Persona visibility set without ``tool_search`` = a HARD set
@@ -3982,6 +4000,7 @@ class ChatSession:
                 max_results=tool_search_max_results,
                 reranker=self._bm25_reranker(),
                 status_provider=self._mcp_status_snapshot,
+                delivery=tool_search_delivery,
             )
         # Converge with any MCP catalog change that fired during
         # construction: a listener callback landing between the
@@ -5757,6 +5776,7 @@ class ChatSession:
                 max_results=self._tool_search_max_results,
                 reranker=self._bm25_reranker(),
                 status_provider=self._mcp_status_snapshot,
+                delivery=self._tool_search_delivery,
             )
             # Restore previously expanded tools that still exist
             if old_expanded:
@@ -10102,6 +10122,10 @@ class ChatSession:
             return False
         if self._persona_tools is None:
             return True
+        if name == CALL_TOOL_NAME:
+            # The dispatcher is the other half of tool search, not a tool an
+            # author lists: it is visible exactly when ``tool_search`` is.
+            name = "tool_search"
         if name in self._persona_tools:
             return True
         ts = self._tool_search
@@ -10147,6 +10171,14 @@ class ChatSession:
         tool_search = self._tool_search
         if not tool_search:
             tools = self._tools
+        elif tool_search.delivery == "dispatch":
+            # Static list: the always-on tools, the search tool and the
+            # dispatcher.  A search adds nothing here, so the request prefix
+            # is the same before and after it, on every provider.
+            tools = tool_search.get_visible_tools() + [
+                tool_search.get_search_tool_definition(),
+                call_tool_definition(),
+            ]
         else:
             if caps.supports_tool_search and self._persona_tools is None:
                 # Provider handles defer_loading — send all tools
@@ -10220,6 +10252,9 @@ class ChatSession:
         if self._persona_tools is not None:
             # Persona visibility sets force client-side tool search — see
             # _get_active_tools — so never hand the provider deferred names.
+            return None
+        if self._tool_search_delivery == "dispatch":
+            # Deferred tools are not on the wire at all in dispatch delivery.
             return None
         caps = caps if caps is not None else self._get_capabilities()
         if not caps.supports_tool_search:
@@ -19935,6 +19970,10 @@ class ChatSession:
                 ),
             }
 
+        if func_name == CALL_TOOL_NAME and self._call_tool_active():
+            assert args is not None  # guaranteed by the early return on args is None above
+            return self._prepare_call_tool(call_id, args)
+
         preparers = {
             "bash": self._prepare_bash,
             "bash_output": self._prepare_bash_output,
@@ -20956,7 +20995,13 @@ class ChatSession:
                 ):
                     continue
                 newly_added = tool_search.expand_visible(names)
-                recompose = bool(newly_added and self._persona_tools is not None)
+                # Dispatch delivery records the discovery (the persona filter
+                # and call_tool read it) and leaves the prefix alone.
+                recompose = bool(
+                    newly_added
+                    and self._persona_tools is not None
+                    and tool_search.delivery != "dispatch"
+                )
                 break
         if recompose:
             # Under a soft persona set the prompt was composed against the
@@ -25441,6 +25486,78 @@ class ChatSession:
         }
 
     # -- skill prepare/execute -------------------------------------------------
+
+    def _call_tool_active(self) -> bool:
+        """Whether this session offers the ``call_tool`` dispatcher."""
+        tool_search = self._tool_search
+        return tool_search is not None and tool_search.delivery == "dispatch"
+
+    def _prepare_call_tool(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Unwrap a ``call_tool`` call into the MCP tool it names.
+
+        The item returned is the inner tool's own, so everything that keys on
+        the tool name (policy, approval, the judge, audit, the output guard,
+        the UI) sees the real tool.  Only MCP tools can be reached this way,
+        and only ones the persona would let a search load.  The arguments are
+        repaired and validated here because no provider checked them against
+        the tool's schema.
+        """
+
+        def refuse(name: str, header: str, error: str | ControllerText) -> dict[str, Any]:
+            return {
+                "call_id": call_id,
+                "func_name": name,
+                "header": f"\u2717 {name}: {header}",
+                "preview": "",
+                "needs_approval": False,
+                "error": error,
+            }
+
+        inner, inner_args, problem = unwrap_call(args)
+        if problem or inner_args is None:
+            return refuse(inner or CALL_TOOL_NAME, "malformed call", problem)
+        if inner in self._revoked_tools:
+            return refuse(inner, "revoked", f"Tool '{inner}' has been revoked on this session.")
+        tool_search = self._tool_search
+        definition = tool_search.deferred_tool(inner) if tool_search is not None else None
+        prepare_user_id = self._tool_prepare_principal_id() or None
+        reachable = (
+            definition is not None
+            and self._mcp_client is not None
+            and self._mcp_client.is_mcp_tool(inner, user_id=prepare_user_id)
+            and self._persona_tool_visible(inner)
+        )
+        if not reachable:
+            self.ui.on_error(f"Model called a tool that is not available now: {inner!r}")
+            return refuse(
+                inner,
+                "not available",
+                ControllerText(
+                    f"Tool {inner!r} cannot be called through call_tool now. call_tool reaches "
+                    "only tools that tool_search returned in this session; search again and "
+                    "use a name exactly as listed. Built-in tools are called directly."
+                ),
+            )
+        assert definition is not None
+        schema = definition.get("function", {}).get("parameters")
+        notes: list[str] = []
+        inner_args = repair_arguments(schema, inner_args, notes)
+        if notes:
+            log.info("call_tool.arguments_repaired", tool=inner, repairs=notes)
+        invalid = validation_error(inner, schema, inner_args)
+        if invalid:
+            key = hashlib.sha256(
+                json.dumps([inner, inner_args, invalid], sort_keys=True, default=str).encode()
+            ).hexdigest()
+            seen = self._call_tool_failures[key] = self._call_tool_failures.get(key, 0) + 1
+            if seen > 1:
+                invalid += (
+                    f"\nThis exact call has now failed {seen} times with the same error. "
+                    "Do not send it again unchanged: change the arguments as the schema "
+                    "requires, or stop and tell the user what is blocking you."
+                )
+            return refuse(inner, "invalid arguments", invalid)
+        return self._prepare_mcp_tool(call_id, inner, inner_args)
 
     def _prepare_mcp_tool(
         self, call_id: str, func_name: str, args: dict[str, Any]

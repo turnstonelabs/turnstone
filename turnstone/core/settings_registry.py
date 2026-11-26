@@ -344,6 +344,21 @@ def _build_registry() -> dict[str, SettingDef]:
             max_value=50,
         ),
         SettingDef(
+            "tools.search_delivery",
+            "str",
+            "expand",
+            "How a found tool reaches the model (expand = add it to the tool list)",
+            "tools",
+            choices=["expand", "dispatch"],
+            help="expand: a tool search adds the tools it found to the request's tool list. "
+            "dispatch: the tool list never changes; a search returns each tool's argument "
+            "schema as text and the model calls the tool through one generic call_tool. "
+            "Dispatch keeps the prompt prefix stable across a search (prompt caching, and "
+            "replayed reasoning on providers that bind it to the tool list), at the cost of "
+            "the provider no longer checking arguments against a declared schema; Turnstone "
+            "validates them instead. Applies to new workstreams.",
+        ),
+        SettingDef(
             "tools.searxng_url",
             "str",
             "http://searxng:8080",

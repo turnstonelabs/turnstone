@@ -210,6 +210,7 @@ def build_console_session_factory(
             tool_search=config_store.get("tools.search"),
             tool_search_threshold=config_store.get("tools.search_threshold"),
             tool_search_max_results=config_store.get("tools.search_max_results"),
+            tool_search_delivery=config_store.get("tools.search_delivery"),
             web_search_backend=config_store.get("tools.web_search_backend"),
             skill=skill or None,
             judge_config=live_judge_config,

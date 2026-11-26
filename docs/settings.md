@@ -438,7 +438,7 @@ initialization:
 |---------|----------|
 | `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort, hide_utility_aliases |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
-| `tools` | timeout, approval_timeout_seconds, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
+| `tools` | timeout, approval_timeout_seconds, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results, search_delivery |
 | `audio` | stt_model_alias, stt_prompt, tts_model_alias, tts_voice |
 | `server` | workstream_idle_timeout, max_workstreams |
 | `cluster` | node_fan_out_limit, mcp_max_servers |
