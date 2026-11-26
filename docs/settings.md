@@ -436,7 +436,7 @@ initialization:
 
 | Section | Settings |
 |---------|----------|
-| `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort, hide_utility_aliases |
+| `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort, reasoning_replay_scope, hide_utility_aliases |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, approval_timeout_seconds, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `audio` | stt_model_alias, stt_prompt, tts_model_alias, tts_voice |

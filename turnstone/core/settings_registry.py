@@ -165,6 +165,21 @@ def _build_registry() -> dict[str, SettingDef]:
             "never listed for agents, since they can't hold a chat.",
         ),
         SettingDef(
+            "model.reasoning_replay_scope",
+            "str",
+            "all",
+            "Which earlier reasoning is replayed to a model that has replay on",
+            "model",
+            choices=["all", "turn"],
+            help="Applies only to model aliases with \u2018Replay reasoning to model\u2019 on. "
+            "all: reasoning from the whole conversation is sent back on every request. "
+            "turn: only reasoning from the turn in progress (the assistant steps since the "
+            "last user message, i.e. the current tool loop) is sent back; reasoning from "
+            "turns already answered is left out, which saves context. A message queued "
+            "while the model is working does not end the turn. OpenAI Responses reasoning "
+            "items are always replayed whole.",
+        ),
+        SettingDef(
             "model.task_effort",
             "str",
             "",

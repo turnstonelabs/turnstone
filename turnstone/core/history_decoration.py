@@ -412,6 +412,64 @@ def attach_vllm_chat_reasoning_field(
     return out
 
 
+# Reasoning blocks that can be left out of an earlier turn without breaking
+# what is left: Anthropic thinking (the API accepts earlier turns without it)
+# and the harness's own ``reasoning_text`` capture (vLLM and other Chat
+# Completions servers).  OpenAI Responses ``reasoning`` items are not in this
+# set: other items of the same response refer to them.
+_TURN_SCOPED_REASONING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking", "reasoning_text"})
+
+
+def limit_reasoning_to_current_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep replayable reasoning only on the turn in progress.
+
+    The turn in progress is everything after the last ``user`` message: the
+    assistant steps of the current tool loop.  A model needs its own reasoning
+    from those steps; reasoning from turns already answered only costs context
+    on every later request.  Assistant messages before the last ``user``
+    message are returned as copies without their reasoning blocks; everything
+    else passes through by reference, and the input is never mutated.
+
+    Mid-turn operator context (a queued user interjection, an advisory) is a
+    ``system`` row at this point, so it does not end the turn.  Run this
+    before any pass that folds such rows into another role.
+
+    The caller decides whether reasoning is replayed at all
+    (``replay_reasoning_to_model``) and whether this narrowing applies
+    (``model.reasoning_replay_scope``).
+    """
+    last_user = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            last_user = index
+            break
+    if last_user <= 0:
+        return messages
+    out: list[dict[str, Any]] = []
+    changed = False
+    for index, msg in enumerate(messages):
+        blocks = msg.get("_provider_content") if index < last_user else None
+        if msg.get("role") != "assistant" or not isinstance(blocks, list):
+            out.append(msg)
+            continue
+        kept = [
+            block
+            for block in blocks
+            if not (
+                isinstance(block, dict) and block.get("type") in _TURN_SCOPED_REASONING_BLOCK_TYPES
+            )
+        ]
+        if len(kept) == len(blocks):
+            out.append(msg)
+            continue
+        changed = True
+        trimmed = {key: value for key, value in msg.items() if key != "_provider_content"}
+        if kept:
+            trimmed["_provider_content"] = kept
+        out.append(trimmed)
+    return out if changed else messages
+
+
 def decorate_history_messages(
     messages: list[dict[str, Any]],
     verdicts_by_call_id: dict[str, dict[str, Any]],

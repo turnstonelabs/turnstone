@@ -102,6 +102,7 @@ from turnstone.core.completion_recovery import (
 from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.history_decoration import limit_reasoning_to_current_turn
 from turnstone.core.http_failures import UPSTREAM_NO_REPLY_CODE
 from turnstone.core.images import flatten_image
 from turnstone.core.ip_classify import AddressLane
@@ -9271,9 +9272,32 @@ class ChatSession:
         legalized and unanswered calls repaired.  This is the full composition
         for inputs that have not crossed ``model_turn``'s canonical lowering.
         """
-        structured = self._prepare_wire_structure(messages, caps=caps)
+        structured = self._prepare_wire_structure(
+            self._scope_replayed_reasoning(messages), caps=caps
+        )
         legalized = sanitize_tool_call_arguments(structured)
         return repair_wire_messages(legalized)
+
+    def _scope_replayed_reasoning(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Apply ``model.reasoning_replay_scope`` before the structural passes.
+
+        With ``turn``, reasoning blocks on assistant messages before the last
+        user message are left off the wire.  Runs first, while mid-turn
+        operator context is still ``system`` rows, so it cannot be mistaken
+        for a new user turn.  A no-op for ``all`` (the default), for a
+        session without a settings store, and when the store cannot be read.
+        """
+        store = self._config_store
+        if store is None:
+            return messages
+        try:
+            scope = store.get("model.reasoning_replay_scope")
+        except Exception:
+            log.debug("reasoning replay scope lookup failed", exc_info=True)
+            return messages
+        if scope != "turn":
+            return messages
+        return limit_reasoning_to_current_turn(messages)
 
     def _prepare_lowered_wire_messages(
         self,
@@ -9288,7 +9312,9 @@ class ChatSession:
         and empty-user dropping cannot alter tool arguments; orphan repair is the
         only remaining call/result pass.
         """
-        structured = self._prepare_wire_structure(messages, caps=caps)
+        structured = self._prepare_wire_structure(
+            self._scope_replayed_reasoning(messages), caps=caps
+        )
         return repair_wire_messages(structured)
 
     def _prepare_task_agent_wire(
