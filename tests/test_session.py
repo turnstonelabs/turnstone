@@ -10139,7 +10139,9 @@ class TestMemoryIndexSnapshotLifecycle:
         from turnstone.core.personas import PersonaSnapshot
         from turnstone.core.storage import get_storage
 
-        for index in range(20):
+        # Sized so the memory index alone overflows the 4096-token window used
+        # below: a memory-only persona's prompt carries no tool patterns.
+        for index in range(26):
             self._save(
                 f"oversized_{index}",
                 "private body",
@@ -10207,7 +10209,7 @@ class TestMemoryIndexSnapshotLifecycle:
         assert admitted_user.text.startswith("Use the available context.")
         assert admitted_user.meta.extra["sender"] == "owner"
 
-        for index in range(18):
+        for index in range(24):
             assert delete_structured_memory_returning_strict(f"oversized_{index}") is not None
         session.send("Retry after remediation.", acting_user_id="owner")
 
@@ -10425,7 +10427,9 @@ class TestMemoryIndexSnapshotLifecycle:
         from turnstone.core.personas import PersonaSnapshot
         from turnstone.core.storage import get_storage
 
-        for index in range(20):
+        # Sized so the memory index alone overflows the 4096-token window used
+        # below: a memory-only persona's prompt carries no tool patterns.
+        for index in range(26):
             self._save(
                 f"raced_{index}",
                 "private body",
